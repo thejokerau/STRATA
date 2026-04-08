@@ -482,17 +482,23 @@ def compute_indicators(df: pd.DataFrame, timeframe: str) -> Optional[pd.DataFram
     out = df.copy()
     out["RSI"] = ta.rsi(out["Close"], length=14)
     macd = ta.macd(out["Close"], fast=12, slow=26, signal=9)
+    if macd is None or macd.empty:
+        return None
     out["MACD"] = macd.get("MACD_12_26_9")
     out["MACD_Signal"] = macd.get("MACDs_12_26_9")
     out["MACD_Hist"] = macd.get("MACDh_12_26_9")
 
     bb = ta.bbands(out["Close"], length=20, std=2)
+    if bb is None or bb.empty:
+        return None
     out["BB_Upper"] = bb.get("BBU_20_2.0")
     out["BB_Middle"] = bb.get("BBM_20_2.0")
     out["BB_Lower"] = bb.get("BBL_20_2.0")
 
     out["ATR"] = ta.atr(out["High"], out["Low"], out["Close"], length=14)
     adx = ta.adx(out["High"], out["Low"], out["Close"], length=14)
+    if adx is None or adx.empty:
+        return None
     out["ADX"] = adx.get("ADX_14")
 
     out["OBV"] = ta.obv(out["Close"], out["Volume"])
@@ -521,7 +527,14 @@ def compute_indicators(df: pd.DataFrame, timeframe: str) -> Optional[pd.DataFram
     for k, v in fib.items():
         out[k] = float(v)
 
-    out = out.dropna(subset=["RSI", "MACD", "MACD_Signal", "BB_Middle", "ATR", "ADX", "CMF"])
+    # Traditional indices frequently have sparse/missing volume fields.
+    # Keep CMF/OBV as neutral when not computable instead of dropping whole assets.
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out["CMF"] = pd.to_numeric(out["CMF"], errors="coerce").fillna(0.0)
+    out["OBV"] = pd.to_numeric(out["OBV"], errors="coerce").ffill().fillna(0.0)
+    out["ADX"] = pd.to_numeric(out["ADX"], errors="coerce").ffill().fillna(0.0)
+
+    out = out.dropna(subset=["RSI", "MACD", "MACD_Signal", "BB_Middle", "ATR"])
     return out if len(out) >= 30 else None
 
 
@@ -738,6 +751,7 @@ def simulate_backtest(
         return {"equity": [], "dates": [], "trades": [], "final": cfg.initial_capital, "return_pct": 0.0}
 
     enriched = {}
+    dropped_assets = 0
     for t, df in raw_data.items():
         use = df.copy()
         if start_date is not None:
@@ -747,14 +761,37 @@ def simulate_backtest(
         use_ind = compute_indicators(use, timeframe)
         if use_ind is not None and len(use_ind) >= 30:
             enriched[t] = use_ind
+        else:
+            dropped_assets += 1
 
     if not enriched:
-        return {"equity": [], "dates": [], "trades": [], "final": cfg.initial_capital, "return_pct": 0.0}
+        if verbose:
+            print(
+                f"No indicator-ready assets for backtest window "
+                f"(kept 0/{len(raw_data)}, dropped {dropped_assets})."
+            )
+        # Return flat equity instead of empty result so caller can diagnose safely.
+        flat_date = end_date if end_date is not None else pd.Timestamp.utcnow().tz_localize(None)
+        return {
+            "equity": [cfg.initial_capital],
+            "dates": [flat_date],
+            "trades": [],
+            "final": cfg.initial_capital,
+            "return_pct": 0.0,
+        }
 
     anchor = list(enriched.keys())[0]
     test_dates = enriched[anchor].index
     if len(test_dates) < 30:
-        return {"equity": [], "dates": [], "trades": [], "final": cfg.initial_capital, "return_pct": 0.0}
+        if verbose:
+            print(f"Not enough post-indicator bars in backtest window ({len(test_dates)} bars).")
+        return {
+            "equity": [cfg.initial_capital],
+            "dates": [test_dates[-1] if len(test_dates) else pd.Timestamp.utcnow().tz_localize(None)],
+            "trades": [],
+            "final": cfg.initial_capital,
+            "return_pct": 0.0,
+        }
 
     equity = [cfg.initial_capital]
     equity_dates = [test_dates[0]]
@@ -928,7 +965,11 @@ def run_walk_forward_optuna(
             test_start = cursor
             test_end = cursor + pd.Timedelta(days=test_days)
             res = simulate_backtest(raw_data, timeframe, cfg, is_crypto, start_date=test_start, end_date=test_end, verbose=False)
-            fold_returns.append(float(res["return_pct"]))
+            # Penalize parameter sets that do not produce trades during walk-forward.
+            if len(res.get("trades", [])) == 0:
+                fold_returns.append(-0.25)
+            else:
+                fold_returns.append(float(res["return_pct"]))
             cursor += pd.Timedelta(days=test_days)
 
         if not fold_returns:
