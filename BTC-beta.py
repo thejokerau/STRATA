@@ -38,7 +38,7 @@ def reset_table():
 
 init_db()
 
-COINGECKO_KEY = "CG-bYEnN8RhYBJiP9JBahcJAp6f"
+COINGECKO_KEY = ""
 
 # ====================== INTERVAL CONFIG ======================
 # Maps user-friendly label → (binance_interval, yfinance_interval,
