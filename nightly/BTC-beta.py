@@ -4,6 +4,7 @@ import re
 import os
 import sqlite3
 import warnings
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -89,6 +90,27 @@ class BacktestConfig:
 
 
 conn = sqlite3.connect(DB_PATH)
+
+CUDA_AVAILABLE = False
+CUDA_BACKEND = "cpu"
+cp = None
+
+
+def detect_cuda_backend() -> Tuple[bool, str, Optional[object]]:
+    """
+    Detect whether CUDA can be used through CuPy.
+    Falls back cleanly to CPU if unavailable.
+    """
+    if importlib.util.find_spec("cupy") is None:
+        return False, "cpu", None
+    try:
+        import cupy as _cp
+        devs = _cp.cuda.runtime.getDeviceCount()
+        if devs and devs > 0:
+            return True, f"cuda (cupy, devices={devs})", _cp
+        return False, "cpu", None
+    except Exception:
+        return False, "cpu", None
 
 
 def ensure_table() -> None:
@@ -584,7 +606,18 @@ def score_asset(df: pd.DataFrame, tuned: TunedParams) -> Tuple[int, Dict[str, fl
         x = np.arange(len(obv), dtype=float)
         y = obv.values.astype(float)
         if np.std(y) > 0:
-            obv_slope = float(np.polyfit(x, y, 1)[0] / (np.mean(np.abs(y)) + 1e-9))
+            # Optional CUDA acceleration for numeric fit when CuPy is available.
+            if CUDA_AVAILABLE and cp is not None:
+                try:
+                    xg = cp.asarray(x)
+                    yg = cp.asarray(y)
+                    m = cp.polyfit(xg, yg, 1)[0]
+                    denom = cp.mean(cp.abs(yg)) + 1e-9
+                    obv_slope = float((m / denom).get())
+                except Exception:
+                    obv_slope = float(np.polyfit(x, y, 1)[0] / (np.mean(np.abs(y)) + 1e-9))
+            else:
+                obv_slope = float(np.polyfit(x, y, 1)[0] / (np.mean(np.abs(y)) + 1e-9))
 
     bb_mid = float(latest.get("BB_Middle", close))
     bb_up = float(latest.get("BB_Upper", close))
@@ -1197,7 +1230,10 @@ def prompt_backtest_months() -> int:
 
 
 def main() -> None:
+    global CUDA_AVAILABLE, CUDA_BACKEND, cp
     ensure_table()
+    CUDA_AVAILABLE, CUDA_BACKEND, cp = detect_cuda_backend()
+    print(f"Runtime acceleration backend: {CUDA_BACKEND}")
 
     while True:
         print("\n" + "=" * 100)
