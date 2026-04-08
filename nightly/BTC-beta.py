@@ -90,6 +90,7 @@ class BacktestConfig:
     min_hold_bars: int = 2
     cooldown_bars: int = 1
     same_asset_cooldown_bars: int = 3
+    max_consecutive_same_asset_entries: int = 3
     max_drawdown_limit_pct: float = 35.0
     max_exposure_pct: float = 0.40
     tuned: TunedParams = field(default_factory=TunedParams)
@@ -759,13 +760,125 @@ def action_emoji(rec: str) -> str:
     return "?? HOLD"
 
 
-def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned: TunedParams) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned: TunedParams, timeframe: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def regime_tag_series(adx_s: pd.Series, atr_vol_s: pd.Series) -> pd.Series:
+        conds = [
+            (adx_s >= 25) & (atr_vol_s < 4.0),
+            (adx_s < 18),
+            (atr_vol_s >= 5.0),
+        ]
+        vals = ["Trending", "Choppy", "High-Vol"]
+        return pd.Series(np.select(conds, vals, default="Transitional"), index=adx_s.index)
+
+    def setup_stats_for_asset(df: pd.DataFrame, raw_score: int, timeframe: str) -> Dict[str, float]:
+        n = len(df)
+        if n < 80:
+            return {
+                "win_rate": 50.0,
+                "expectancy": 0.0,
+                "median_outcome": 0.0,
+                "false_signal_rate": 50.0,
+                "avg_post_entry_dd": -2.0,
+                "avg_hold_days": 5.0,
+                "risk_cone_10": -4.0,
+                "risk_cone_90": 4.0,
+                "reliability": 0.0,
+                "regime": "Transitional",
+            }
+
+        close = df["Close"].astype(float)
+        low = df["Low"].astype(float)
+        atr_vol = (df["ATR"].astype(float) / close.replace(0, np.nan) * 100.0).fillna(0.0)
+        reg_s = regime_tag_series(df["ADX"].astype(float), atr_vol)
+        current_regime = str(reg_s.iloc[-1])
+
+        obv_slope_proxy = df["OBV"].pct_change().rolling(5).mean().fillna(0.0)
+        score_s = pd.Series(0, index=df.index, dtype="float64")
+        score_s += np.where(atr_vol < 2.0, 1, np.where(atr_vol > 5.0, -1, 0))
+        score_s += np.where(df["RSI"] < 35, 1, np.where(df["RSI"] > 68, -1, 0))
+        score_s += df["MACD_Crossover"].fillna(0).astype(float)
+        score_s += np.where(close <= df["BB_Lower"] * 1.01, 1, np.where(close >= df["BB_Upper"] * 0.99, -1, 0))
+        score_s += np.where(df["ADX"] > tuned.adx_threshold, 1, np.where(df["ADX"] < 20, -1, 0))
+        score_s += np.where((df["CMF"] > tuned.cmf_threshold) & (obv_slope_proxy > tuned.obv_slope_threshold), 1, 0)
+        score_s += np.where((df["CMF"] < -abs(tuned.cmf_threshold)) & (obv_slope_proxy < -abs(tuned.obv_slope_threshold)), -1, 0)
+        score_s += np.where(close <= df["Fib_Support"] * 1.01, 1, np.where(close >= df["Fib_Resistance"] * 0.99, -1, 0))
+        score_s = score_s.clip(-5, 5)
+
+        horizon = max(2, int(round(5.0 * bars_per_day(timeframe))))
+        future_ret = (close.shift(-horizon) / close - 1.0) * 100.0
+
+        lows_np = low.values
+        close_np = close.values
+        fut_dd = np.full(n, np.nan, dtype=float)
+        for i in range(0, max(0, n - horizon)):
+            mlow = np.min(lows_np[i + 1 : i + horizon + 1]) if (i + horizon + 1) <= n else np.min(lows_np[i + 1 :])
+            if close_np[i] > 0:
+                fut_dd[i] = (mlow / close_np[i] - 1.0) * 100.0
+
+        mask = (score_s >= (raw_score - 1)) & (score_s <= (raw_score + 1)) & (reg_s == current_regime)
+        mask = mask & future_ret.notna()
+        sample = future_ret[mask]
+
+        if sample.empty:
+            win = 50.0
+            exp = 0.0
+            med = 0.0
+            fsr = 50.0
+            ddm = -2.0
+            avg_hold_d = 5.0
+            q10, q90 = -4.0, 4.0
+        else:
+            win = float((sample > 0).mean() * 100.0)
+            exp = float(sample.mean())
+            med = float(sample.median())
+            buy_mask = mask & (score_s >= tuned.buy_threshold)
+            buy_sample = future_ret[buy_mask]
+            fsr = float((buy_sample <= 0).mean() * 100.0) if not buy_sample.empty else float((sample <= 0).mean() * 100.0)
+            dd_vals = pd.Series(fut_dd, index=df.index)[mask].dropna()
+            ddm = float(dd_vals.mean()) if not dd_vals.empty else -2.0
+            q10 = float(sample.quantile(0.10))
+            q90 = float(sample.quantile(0.90))
+
+            # Approximate hold duration: bars until signal crosses below sell threshold.
+            idxs = np.where(buy_mask.values)[0]
+            hold_bars = []
+            for j in idxs[:150]:
+                end = min(n - 1, j + horizon)
+                nxt = score_s.iloc[j + 1 : end + 1]
+                hit = nxt[nxt <= tuned.sell_threshold]
+                hb = int(hit.index[0] in nxt.index and (nxt.index.get_loc(hit.index[0]) + 1) if not hit.empty else max(1, end - j))
+                hold_bars.append(hb)
+            avg_hold_d = float(np.mean(hold_bars) / max(1e-9, bars_per_day(timeframe))) if hold_bars else (horizon / max(1e-9, bars_per_day(timeframe)))
+
+        reliability = (
+            np.clip((win - 50.0) / 25.0, -1.5, 1.5)
+            + np.clip(exp / 6.0, -1.5, 1.5)
+            - np.clip(fsr / 60.0, 0.0, 1.5)
+            + np.clip(ddm / 15.0, -1.0, 0.5)
+        )
+
+        return {
+            "win_rate": win,
+            "expectancy": exp,
+            "median_outcome": med,
+            "false_signal_rate": fsr,
+            "avg_post_entry_dd": ddm,
+            "avg_hold_days": avg_hold_d,
+            "risk_cone_10": q10,
+            "risk_cone_90": q90,
+            "reliability": float(reliability),
+            "regime": current_regime,
+        }
+
     rows = []
     risk_rows = []
 
     for ticker, df in enriched.items():
         score, comp, latest = score_asset(df, tuned)
-        rec = score_to_rec(score, tuned)
+        setup = setup_stats_for_asset(df, score, timeframe)
+        rel_adj = float(np.clip(setup["reliability"], -2.0, 2.0))
+        adj_score = int(np.clip(round(score + 0.8 * rel_adj), -5, 5))
+        rec = score_to_rec(adj_score, tuned)
         close = float(latest.get("Close", 0))
         fib_s = float(latest.get("Fib_Support", close))
         fib_r = float(latest.get("Fib_Resistance", close))
@@ -778,12 +891,22 @@ def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned:
                 "_Ticker": ticker,
                 "Asset": ticker.replace("-USD", "") if is_crypto else ticker,
                 "Action": action_emoji(rec),
-                "Score": f"{score}/5",
+                "Score": f"{adj_score}/5",
+                "Raw Score": f"{score}/5",
+                "Reliability": round(rel_adj, 2),
+                "Regime": setup["regime"],
                 "Price": round(close, 4),
                 "Fib Support": round(fib_s, 4),
                 "Fib Resistance": round(fib_r, 4),
                 "Upside %": round(upside, 2),
                 "Downside %": round(downside, 2),
+                "Setup Exp %": round(setup["expectancy"], 2),
+                "Setup Win %": round(setup["win_rate"], 1),
+                "Median Out %": round(setup["median_outcome"], 2),
+                "False Sig %": round(setup["false_signal_rate"], 1),
+                "Avg Post-Entry DD %": round(setup["avg_post_entry_dd"], 2),
+                "Avg Hold (d)": round(setup["avg_hold_days"], 1),
+                "Risk Cone 10/90 %": f"{setup['risk_cone_10']:.2f}/{setup['risk_cone_90']:.2f}",
                 "Doji": latest.get("Doji", "") or "",
                 "RSI": round(float(latest.get("RSI", 0)), 2),
             }
@@ -801,13 +924,19 @@ def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned:
                 "ADX Trend Strength": f"{comp['ADX Trend Strength']:.2f}",
                 "Volume Confirmation": f"{vol_confirm_txt} (CMF {comp['CMF']:.3f}, OBV slope {comp['OBV Slope']:.5f})",
                 "Fib Zone": f"S {comp['Fib Support']:.4f} / R {comp['Fib Resistance']:.4f}",
+                "Regime": setup["regime"],
+                "Setup Quality": f"Exp {setup['expectancy']:.2f}% | Win {setup['win_rate']:.1f}% | False {setup['false_signal_rate']:.1f}%",
             }
         )
 
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
 
-    table = pd.DataFrame(rows).sort_values("Score", key=lambda s: s.str.split("/").str[0].astype(int), ascending=False).reset_index(drop=True)
+    table = pd.DataFrame(rows).sort_values(
+        ["Score", "Reliability", "Setup Exp %"],
+        key=lambda s: s.str.split("/").str[0].astype(int) if s.dtype == object and s.str.contains("/").all() else s,
+        ascending=False,
+    ).reset_index(drop=True)
     table.index += 1
     table.index.name = "Rank"
 
@@ -816,6 +945,55 @@ def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned:
     risk.index.name = "Rank"
 
     return table, risk
+
+
+def build_portfolio_insights(enriched: Dict[str, pd.DataFrame], table: pd.DataFrame) -> List[str]:
+    """
+    Portfolio-aware live suggestions:
+    - concentration warnings
+    - low-correlation alternatives versus top-ranked asset
+    """
+    notes: List[str] = []
+    if table is None or table.empty or len(table) < 2:
+        return notes
+
+    top_ticker = str(table.iloc[0]["_Ticker"])
+    top_asset = str(table.iloc[0]["Asset"])
+
+    rets = {}
+    for t, df in enriched.items():
+        r = df["Close"].pct_change().dropna().tail(180)
+        if len(r) >= 30:
+            rets[t] = r
+    if top_ticker not in rets:
+        return notes
+
+    ret_df = pd.DataFrame(rets).dropna(how="all")
+    if ret_df.empty or top_ticker not in ret_df.columns:
+        return notes
+
+    corr = ret_df.corr()
+    top_corr = corr[top_ticker].drop(index=top_ticker, errors="ignore").dropna()
+    if top_corr.empty:
+        return notes
+
+    avg_corr = float(top_corr.mean())
+    if avg_corr > 0.70:
+        notes.append(f"Concentration warning: {top_asset} is highly correlated with this basket (avg corr {avg_corr:.2f}).")
+
+    candidates = []
+    for _, row in table.iloc[1:].iterrows():
+        t = str(row["_Ticker"])
+        if t in corr.columns and top_ticker in corr.index:
+            c = float(corr.loc[t, top_ticker]) if pd.notna(corr.loc[t, top_ticker]) else 1.0
+            if c < 0.45:
+                candidates.append((str(row["Asset"]), c, float(row.get("Reliability", 0.0)), str(row.get("Score", ""))))
+    candidates = sorted(candidates, key=lambda x: (-x[2], x[1]))[:3]
+    if candidates:
+        alts = ", ".join([f"{a} (corr {c:.2f}, rel {r:+.2f}, score {s})" for a, c, r, s in candidates])
+        notes.append(f"Lower-correlation alternatives to {top_asset}: {alts}")
+
+    return notes
 
 
 def build_indicator_cache(
@@ -1027,6 +1205,8 @@ def simulate_backtest(
     bars_held = 0
     cooldown_remaining = 0
     same_asset_cooldown_until: Dict[str, int] = {}
+    last_entry_asset = ""
+    consecutive_same_asset_entries = 0
     capital = cfg.initial_capital
     max_hold_bars = max(1, int(np.ceil(cfg.max_hold_days * bars_per_day(timeframe))))
 
@@ -1085,12 +1265,16 @@ def simulate_backtest(
             exit_now, reason = False, ""
 
         same_asset_ready = i >= int(same_asset_cooldown_until.get(top_ticker, -1))
-        if position == 0 and cooldown_remaining == 0 and same_asset_ready and top_rec in ["BUY", "STRONG BUY"]:
+        next_streak = (consecutive_same_asset_entries + 1) if top_ticker == last_entry_asset else 1
+        streak_ok = next_streak <= max(1, int(cfg.max_consecutive_same_asset_entries))
+        if position == 0 and cooldown_remaining == 0 and same_asset_ready and streak_ok and top_rec in ["BUY", "STRONG BUY"]:
             position = 1
             entry_price = top_price * (1.0 + cfg.slippage_pct / 100.0)
             entry_date = d
             entry_ts = pd.Timestamp(d)
             entry_asset = top_ticker
+            last_entry_asset = top_ticker
+            consecutive_same_asset_entries = next_streak
             entry_asset_label = top["Asset"]
             entry_capital = capital * cfg.tuned.position_size
             entry_fee = entry_capital * (cfg.fee_pct / 100.0)
@@ -1098,6 +1282,12 @@ def simulate_backtest(
             bars_held = 0
             if verbose:
                 print(f"BUY {entry_asset_label} {d.date()} @ {entry_price:.4f}")
+        elif position == 0 and cooldown_remaining == 0 and same_asset_ready and (not streak_ok) and top_rec in ["BUY", "STRONG BUY"]:
+            if verbose:
+                print(
+                    f"SKIP {top_ticker} on {d.date()} due to max consecutive same-asset entries "
+                    f"({cfg.max_consecutive_same_asset_entries})."
+                )
 
         elif position == 1 and exit_now:
             exited_ticker = entry_asset
@@ -1210,6 +1400,7 @@ def run_walk_forward_optuna(
             min_hold_bars=base_cfg.min_hold_bars,
             cooldown_bars=base_cfg.cooldown_bars,
             same_asset_cooldown_bars=base_cfg.same_asset_cooldown_bars,
+            max_consecutive_same_asset_entries=base_cfg.max_consecutive_same_asset_entries,
             max_drawdown_limit_pct=base_cfg.max_drawdown_limit_pct,
             max_exposure_pct=base_cfg.max_exposure_pct,
             fee_pct=base_cfg.fee_pct,
@@ -1273,7 +1464,12 @@ def run_walk_forward_optuna(
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, n_jobs=max(1, int(n_jobs)), show_progress_bar=False)
 
-    bp = study.best_params
+    complete_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not complete_trials:
+        print("Auto-Tune produced no valid completed trials under current constraints; using base config.")
+        return base_cfg, None
+    best_trial = max(complete_trials, key=lambda t: float(t.value) if t.value is not None else -1e18)
+    bp = best_trial.params
     tuned = TunedParams(
         position_size=float(bp["position_size"]),
         atr_multiplier=float(bp["atr_multiplier"]),
@@ -1292,6 +1488,7 @@ def run_walk_forward_optuna(
         min_hold_bars=base_cfg.min_hold_bars,
         cooldown_bars=base_cfg.cooldown_bars,
         same_asset_cooldown_bars=base_cfg.same_asset_cooldown_bars,
+        max_consecutive_same_asset_entries=base_cfg.max_consecutive_same_asset_entries,
         max_drawdown_limit_pct=base_cfg.max_drawdown_limit_pct,
         max_exposure_pct=base_cfg.max_exposure_pct,
         fee_pct=base_cfg.fee_pct,
@@ -1423,7 +1620,7 @@ def load_assets(is_crypto: bool) -> List[str]:
     return list(dict.fromkeys(out))
 
 
-def prompt_backtest_config() -> BacktestConfig:
+def prompt_backtest_config(timeframe: str) -> BacktestConfig:
     try:
         init = input("Initial Capital USD (default 10000): $").strip()
         initial = float(init) if init else 10000.0
@@ -1447,9 +1644,13 @@ def prompt_backtest_config() -> BacktestConfig:
     sl = read_float("Stop-loss % (default 8): ", 8.0)
     tp = read_float("Take-profit % (default 20): ", 20.0)
     mh = read_int("Max hold days (default 45): ", 45)
-    min_hold_bars = read_int("Minimum hold bars before signal-exit (default 2): ", 2)
-    cooldown_bars = read_int("Cooldown bars after exit (default 1): ", 1)
-    same_asset_cd = read_int("Same-asset re-entry cooldown bars (default 3): ", 3)
+    default_min_hold = 4 if timeframe == "8h" else 2
+    default_cooldown = 2 if timeframe == "8h" else 1
+    default_same_asset_cd = 6 if timeframe == "8h" else 3
+    min_hold_bars = read_int(f"Minimum hold bars before signal-exit (default {default_min_hold}): ", default_min_hold)
+    cooldown_bars = read_int(f"Cooldown bars after exit (default {default_cooldown}): ", default_cooldown)
+    same_asset_cd = read_int(f"Same-asset re-entry cooldown bars (default {default_same_asset_cd}): ", default_same_asset_cd)
+    max_consecutive_same = read_int("Max consecutive same-asset entries (default 3): ", 3)
     max_dd_limit = read_float("Max drawdown target % for optimizer (default 35): ", 35.0)
     max_exposure = read_float("Max exposure % for optimizer (default 40): ", 40.0) / 100.0
     fee = read_float("Fee % per trade leg (default 0.10): ", 0.10)
@@ -1479,6 +1680,7 @@ def prompt_backtest_config() -> BacktestConfig:
         min_hold_bars=max(0, min_hold_bars),
         cooldown_bars=max(0, cooldown_bars),
         same_asset_cooldown_bars=max(0, same_asset_cd),
+        max_consecutive_same_asset_entries=max(1, max_consecutive_same),
         max_drawdown_limit_pct=max(1.0, max_dd_limit),
         max_exposure_pct=float(np.clip(max_exposure, 0.20, 1.0)),
         fee_pct=fee,
@@ -1573,7 +1775,7 @@ def main() -> None:
                 print("No indicator-ready data.")
                 continue
 
-            table, risk = build_live_tables(enriched, is_crypto, tuned)
+            table, risk = build_live_tables(enriched, is_crypto, tuned, timeframe)
             if table.empty:
                 print("No scored assets.")
                 continue
@@ -1588,29 +1790,39 @@ def main() -> None:
             print("=" * 170)
             print(risk.to_string())
 
+            portfolio_notes = build_portfolio_insights(enriched, table)
+            if portfolio_notes:
+                print("\n" + "=" * 170)
+                print("PORTFOLIO CONTEXT")
+                print("=" * 170)
+                for n in portfolio_notes:
+                    print(f"- {n}")
+
             top_ticker = table.iloc[0]["_Ticker"]
             chart_top_asset(enriched[top_ticker], top_ticker.replace("-USD", "") if is_crypto else top_ticker)
 
         else:
-            cfg = prompt_backtest_config()
+            cfg = prompt_backtest_config(timeframe)
             holdout_result = None
             bt_workers = prompt_cpu_workers("Backtest indicator cache")
             indicator_cache = build_indicator_cache(raw_data, timeframe, max_workers=bt_workers, verbose=True)
             if not indicator_cache:
                 print("No indicator-ready data for backtest.")
                 continue
+            auto_tune_used = False
+            n_trials = 30
+            n_jobs = max(1, min(8, (os.cpu_count() or 1)))
             if input("Enable Auto-Tune + Walk-Forward? (y/n): ").strip().lower() == "y":
                 try:
                     n_trials_in = input("Optuna trials (default 30): ").strip()
-                    n_trials = int(n_trials_in) if n_trials_in else 30
+                    n_trials = int(n_trials_in) if n_trials_in else n_trials
                 except ValueError:
-                    n_trials = 30
+                    n_trials = n_trials
                 try:
-                    default_jobs = max(1, min(8, (os.cpu_count() or 1)))
-                    n_jobs_in = input(f"Optuna parallel jobs (default {default_jobs}): ").strip()
-                    n_jobs = int(n_jobs_in) if n_jobs_in else default_jobs
+                    n_jobs_in = input(f"Optuna parallel jobs (default {n_jobs}): ").strip()
+                    n_jobs = int(n_jobs_in) if n_jobs_in else n_jobs
                 except ValueError:
-                    n_jobs = max(1, min(8, (os.cpu_count() or 1)))
+                    n_jobs = n_jobs
                 cfg, holdout_result = run_walk_forward_optuna(
                     raw_data,
                     timeframe,
@@ -1620,6 +1832,7 @@ def main() -> None:
                     n_jobs=n_jobs,
                     indicator_cache=indicator_cache,
                 )
+                auto_tune_used = True
 
             if backtest_months is None:
                 backtest_months = 12
@@ -1638,6 +1851,70 @@ def main() -> None:
                 indicator_cache=indicator_cache,
                 verbose=True,
             )
+            metrics = result.get("metrics", {})
+            final_dd = float(metrics.get("max_drawdown_pct", 0.0))
+            if auto_tune_used and final_dd > cfg.max_drawdown_limit_pct:
+                print(
+                    f"Final backtest drawdown {final_dd:.2f}% breached target {cfg.max_drawdown_limit_pct:.2f}%; "
+                    f"running one constrained re-tune pass."
+                )
+                constrained_cfg = BacktestConfig(
+                    initial_capital=cfg.initial_capital,
+                    stop_loss_pct=cfg.stop_loss_pct,
+                    take_profit_pct=cfg.take_profit_pct,
+                    max_hold_days=cfg.max_hold_days,
+                    min_hold_bars=cfg.min_hold_bars,
+                    cooldown_bars=cfg.cooldown_bars,
+                    same_asset_cooldown_bars=cfg.same_asset_cooldown_bars,
+                    max_consecutive_same_asset_entries=cfg.max_consecutive_same_asset_entries,
+                    max_drawdown_limit_pct=cfg.max_drawdown_limit_pct,
+                    max_exposure_pct=float(np.clip(cfg.max_exposure_pct * 0.90, 0.20, cfg.max_exposure_pct)),
+                    fee_pct=cfg.fee_pct,
+                    slippage_pct=cfg.slippage_pct,
+                    tuned=TunedParams(
+                        position_size=float(np.clip(cfg.tuned.position_size * 0.90, 0.20, 0.40)),
+                        atr_multiplier=float(np.clip(cfg.tuned.atr_multiplier * 0.98, 2.0, 2.5)),
+                        adx_threshold=float(np.clip(cfg.tuned.adx_threshold + 1.0, 20.0, 30.0)),
+                        cmf_threshold=cfg.tuned.cmf_threshold,
+                        obv_slope_threshold=cfg.tuned.obv_slope_threshold,
+                        buy_threshold=cfg.tuned.buy_threshold,
+                        sell_threshold=cfg.tuned.sell_threshold,
+                    ),
+                )
+                cfg_retry, holdout_retry = run_walk_forward_optuna(
+                    raw_data,
+                    timeframe,
+                    is_crypto,
+                    constrained_cfg,
+                    n_trials=max(10, int(max(10, n_trials // 2))),
+                    n_jobs=n_jobs,
+                    indicator_cache=indicator_cache,
+                )
+                retry_result = simulate_backtest(
+                    raw_data,
+                    timeframe,
+                    cfg_retry,
+                    is_crypto,
+                    start_date=start_date,
+                    end_date=end_date,
+                    indicator_cache=indicator_cache,
+                    verbose=True,
+                )
+                retry_metrics = retry_result.get("metrics", {})
+                retry_dd = float(retry_metrics.get("max_drawdown_pct", 0.0))
+                if retry_dd <= cfg.max_drawdown_limit_pct or (
+                    retry_dd < final_dd and float(retry_result.get("return_pct", -1e9)) >= float(result.get("return_pct", -1e9)) - 5.0
+                ):
+                    print(
+                        f"Using constrained re-tuned config (DD {retry_dd:.2f}% vs {final_dd:.2f}%)."
+                    )
+                    cfg = cfg_retry
+                    holdout_result = holdout_retry
+                    result = retry_result
+                    metrics = retry_metrics
+                    final_dd = retry_dd
+                else:
+                    print("Keeping original tuned config; constrained retry did not improve risk/return balance.")
             eq = result["equity"]
             dts = result["dates"]
             trades = result["trades"]
@@ -1671,7 +1948,6 @@ def main() -> None:
                 print("No closed trades.")
                 win_rate = 0.0
 
-            metrics = result.get("metrics", {})
             contrib = metrics.get("asset_contrib", {})
             top_contrib = list(contrib.items())[:5] if isinstance(contrib, dict) else []
 

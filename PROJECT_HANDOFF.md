@@ -43,10 +43,26 @@
 - Added post-backtest risk report:
   - max drawdown, Sharpe, Sortino, turnover/year, avg hold days
   - top per-asset PnL contribution
+- Added richer live-dashboard intelligence:
+  - regime classification (`Trending`, `Choppy`, `High-Vol`, `Transitional`)
+  - setup reliability model (expectancy, win rate, false-signal %, risk cone, post-entry DD, avg hold)
+  - adjusted live score from raw score + reliability
+- Added portfolio-aware live context notes:
+  - concentration warning from rolling cross-asset correlations
+  - lower-correlation alternatives vs top-ranked asset
+- Added anti-concentration entry streak limiter:
+  - `max_consecutive_same_asset_entries`
+- Wired timeframe into backtest prompt defaults:
+  - 8h defaults now use stricter anti-churn values
+- Added auto-tune robustness/fail-safe:
+  - handles all-pruned Optuna runs by safely reverting to base config
+- Added post-tune drawdown guard in main flow:
+  - if final-window DD breaches target, runs one constrained re-tune attempt and adopts it when risk/return improves
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
 - `README.md`
+- `PROJECT_HANDOFF.md`
 
 ## Known Issues / Risks
 - Some CoinGecko symbols still may not be usable across all data providers; filtering now favors Binance tradability for crypto.
@@ -55,6 +71,8 @@
 - Walk-forward objective uses a no-trade penalty heuristic; may need tuning depending on strategy goals.
 - Current ranking remains single-position top-asset rotation; portfolio-level multi-asset allocation is not yet implemented.
 - Hard constraints are now active for optimization folds; final full-window backtest can still exceed constraints if market regime shifts after tuning.
+- Live setup reliability statistics are heuristic and sample-size-sensitive for thin-history assets/timeframes.
+- Correlation-based live diversification notes use recent rolling history and may change quickly across volatile regimes.
 
 ## Run / Validate
 - Syntax check:
@@ -68,7 +86,7 @@
    - assets requested/loaded/dropped + reasons
    - trades count by exit type
    - average hold days and bars
-3. Add optional export of backtest trades/equity/metrics to CSV for external analysis.
+3. Add optional export of backtest trades/equity/metrics/live setup-quality table to CSV for external analysis.
 
 ## Process Rule (Required)
 - For every future code change in this project, update this file in the same change set:

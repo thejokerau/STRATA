@@ -59,10 +59,20 @@ python nightly/BTC-beta.py
 - Accurate period math using `365.25` days/year
 - Dynamic Fibonacci swing detection with support/resistance guards
 - ATR/ADX/OBV/CMF risk-scoring integration
+- Live setup analytics and reliability scoring:
+  - regime tagging (`Trending`, `Choppy`, `High-Vol`, `Transitional`)
+  - setup expectancy/win-rate/false-signal estimates
+  - risk-cone and post-entry drawdown context
+- Portfolio-aware live context:
+  - concentration warning based on rolling correlations
+  - lower-correlation alternatives to top-ranked asset
 - Walk-forward auto-tuning with Optuna
 - Hard risk constraints in tuning:
   - validation fold drawdown constraint (trials are pruned when exceeded)
   - position-size search bounded by configured max exposure
+  - safe fallback when all trials are pruned (uses base config)
+- Optional post-tune constrained retry in backtest mode:
+  - if final-window drawdown exceeds target, a tighter exposure re-tune pass is attempted
 - CPU parallelism:
   - Indicator cache build worker selection
   - Optuna trial parallel jobs
@@ -72,6 +82,7 @@ python nightly/BTC-beta.py
   - `min_hold_bars` before signal exits
   - `cooldown_bars` after exits
   - same-asset re-entry cooldown bars
+  - max consecutive same-asset entries
 
 ## Notes
 
