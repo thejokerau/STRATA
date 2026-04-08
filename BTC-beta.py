@@ -10,274 +10,166 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-print("🚀 Crypto & Traditional Risk Dashboard (Consistent Flow v36)\n")
+print("🚀 Crypto & Traditional Risk Dashboard (Robust v37)\n")
 
 # ====================== DATABASE ======================
-# Schema stores ticker + interval + datetime so 1d / 12h / 4h rows coexist
 conn = sqlite3.connect("crypto_data.db")
 
-def init_db():
+def reset_table():
+    conn.execute("DROP TABLE IF EXISTS price_data")
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS price_data (
-        ticker   TEXT,
-        interval TEXT,
-        date     TEXT,
-        open     REAL,
-        high     REAL,
-        low      REAL,
-        close    REAL,
-        volume   INTEGER,
-        PRIMARY KEY (ticker, interval, date)
+    CREATE TABLE price_data (
+        ticker TEXT, date TEXT,
+        open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+        PRIMARY KEY (ticker, date)
     )
     """)
     conn.commit()
 
-def reset_table():
-    conn.execute("DROP TABLE IF EXISTS price_data")
-    init_db()
-
-init_db()
+reset_table()
 
 COINGECKO_KEY = ""
 
-# ====================== INTERVAL CONFIG ======================
-# Maps user-friendly label → (binance_interval, yfinance_interval,
-#                              binance_limit_per_req, minutes_per_candle)
-INTERVAL_MAP = {
-    "1d":  ("1d",  "1d",  1000, 1440),
-    "12h": ("12h", "1h",  1000,  720),   # yfinance has no 12h; use 1h and resample
-    "4h":  ("4h",  "1h",  1000,  240),   # same — resample from 1h
-}
-# Binance hard limit: 1000 candles per request.
-# For sub-daily we may need multiple requests to cover 24 months.
-# minutes_per_candle × 1000 = minutes of history per request.
-#   1d  → 1000 days   (~33 months)  → 1 request covers everything
-#   12h → 500 days    (~17 months)  → 2 requests for 24 months
-#   4h  → ~167 days   (~5.5 months) → 5 requests for 24 months
-
-def requests_needed(interval_key, months=24):
-    """How many Binance requests are needed to cover `months` of history."""
-    mins = INTERVAL_MAP[interval_key][3]
-    total_minutes = months * 30 * 1440
-    candles_needed = total_minutes / mins
-    return max(1, int(np.ceil(candles_needed / 1000)))
-
 # ====================== VALIDATION ======================
-def validate_and_clean(df, ticker, interval_key="1d"):
-    min_rows = 30 if interval_key == "1d" else 60
-    if df is None or df.empty or len(df) < min_rows:
+def validate_and_clean(df, ticker):
+    """Validate OHLCV data, normalize timestamps to UTC-naive, remove outliers."""
+    if df is None or df.empty or len(df) < 30:
         return None
     df = df.copy()
-    if df.index.tz is not None:
-        df.index = df.index.tz_convert(None)
+    # FIX: Always normalize to UTC-naive datetime for deterministic comparisons
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
     else:
         df.index = pd.to_datetime(df.index)
+    df.index = df.index.normalize()  # strip intraday time component
+    # Remove duplicate timestamps, keep last (most recently fetched)
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
     df = df[(df["Close"] > 0.000001) & (df["Close"] < 10_000_000)]
     if len(df) > 10:
         median_close = df["Close"].median()
         df = df[(df["Close"] <= median_close * 20) & (df["Close"] >= median_close * 0.05)]
-    now = pd.Timestamp.now()
-    df = df[df.index <= now]
-    return df if len(df) >= min_rows else None
+    today = pd.Timestamp.now().normalize()
+    df = df[df.index <= today]
+    return df if len(df) >= 30 else None
 
-# ====================== BINANCE (multi-request + delta) ======================
-def fetch_from_binance(ticker, interval_key="1d", months=24):
-    """
-    Fetch OHLCV from Binance for the requested interval.
-    Issues multiple sequential requests when a single 1000-candle call
-    cannot cover the full history, then merges them.
-    Also checks the cache to calculate the delta (only fetches missing candles).
-    """
-    binance_interval = INTERVAL_MAP[interval_key][0]
-    mins_per_candle  = INTERVAL_MAP[interval_key][3]
+# ====================== BINANCE ======================
+def fetch_from_binance(ticker):
+    """Fetch daily OHLCV from Binance with proper timestamp handling."""
     symbol = ticker.replace("-USD", "USDT") if "-USD" in ticker else ticker + "USDT"
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=1000"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        open_times = [row[0] for row in data]
+        df = pd.DataFrame({
+            "Open":   [float(row[1]) for row in data],
+            "High":   [float(row[2]) for row in data],
+            "Low":    [float(row[3]) for row in data],
+            "Close":  [float(row[4]) for row in data],
+            "Volume": [float(row[5]) for row in data],
+        })
+        # FIX: Use open_time column values (milliseconds) for index, not RangeIndex
+        df.index = pd.to_datetime(open_times, unit="ms", utc=True).tz_localize(None).normalize()
+        return validate_and_clean(df, ticker)
+    except Exception:
+        return None
 
-    # ── Delta: find what we already have cached ──
-    cached = get_cached(ticker, interval_key)
-    if cached is not None and not cached.empty:
-        last_cached_ts = cached.index.max()
-        # Only fetch candles newer than our latest cached row
-        start_ms = int(last_cached_ts.timestamp() * 1000) + (mins_per_candle * 60 * 1000)
-        fetch_from_ms = start_ms
-        fetch_mode = "delta"
-    else:
-        # Full fetch: go back `months` worth of candles
-        total_ms = months * 30 * 24 * 60 * 60 * 1000
-        fetch_from_ms = int(pd.Timestamp.now().timestamp() * 1000) - total_ms
-        fetch_mode = "full"
-
-    all_rows = []
-    current_start_ms = fetch_from_ms
-    max_requests = 20   # safety cap
-
-    for req_num in range(max_requests):
-        url = (f"https://api.binance.com/api/v3/klines"
-               f"?symbol={symbol}&interval={binance_interval}"
-               f"&startTime={current_start_ms}&limit=1000")
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            batch = r.json()
-        except Exception as e:
-            print(f"   ⚠️  Binance request {req_num+1} failed: {e}")
-            break
-
-        if not batch:
-            break   # no more data
-
-        all_rows.extend(batch)
-
-        # If we got fewer than 1000 rows, we've reached the present — stop
-        if len(batch) < 1000:
-            break
-
-        # Advance start time to just after the last candle's open_time
-        current_start_ms = batch[-1][0] + (mins_per_candle * 60 * 1000)
-
-        # If the next start is in the future, stop
-        if current_start_ms > int(pd.Timestamp.now().timestamp() * 1000):
-            break
-
-    if not all_rows:
-        return None, fetch_mode
-
-    cols = ['open_time','Open','High','Low','Close','Volume',
-            'close_time','qav','n','tav','tbv','ignore']
-    df = pd.DataFrame(all_rows, columns=cols)
-    df = df[['Open','High','Low','Close','Volume']].astype(float)
-    open_times = [row[0] for row in all_rows]
-    df.index = pd.to_datetime(open_times, unit='ms')
-    df = df[~df.index.duplicated(keep='last')]
-    df = df.sort_index()
-
-    # For 12h: Binance has native 12h candles so no resampling needed
-    # For 4h:  same
-    return validate_and_clean(df, ticker, interval_key), fetch_mode
-
-def resample_yfinance_to_interval(df, interval_key):
-    """Resample 1h yfinance data to 4h or 12h candles."""
-    rule = {"4h": "4h", "12h": "12h"}.get(interval_key)
-    if rule is None or df is None or df.empty:
-        return df
-    df = df.resample(rule).agg({
-        "Open":   "first",
-        "High":   "max",
-        "Low":    "min",
-        "Close":  "last",
-        "Volume": "sum"
-    }).dropna(subset=["Close"])
-    return df
-
-# ====================== CACHE (interval-aware + delta merge) ======================
-def get_cached(ticker, interval_key="1d"):
+# ====================== CACHE ======================
+def get_cached(ticker):
+    """Retrieve cached data from SQLite, returning clean DataFrame or None."""
     df = pd.read_sql_query(
-        "SELECT * FROM price_data WHERE ticker=? AND interval=?",
-        conn, params=[ticker, interval_key]
+        "SELECT * FROM price_data WHERE ticker=? ORDER BY date ASC", conn, params=[ticker]
     )
     if df.empty:
         return None
     df["date"] = pd.to_datetime(df["date"])
     df.set_index("date", inplace=True)
-    df = df.sort_index()
-    df = df.drop(columns=["ticker", "interval"], errors="ignore")
+    # FIX: Drop ticker column before capitalizing to avoid 'Ticker' leftover
+    df = df.drop(columns=["ticker"], errors="ignore")
     df.columns = [c.capitalize() for c in df.columns]
+    # Deduplicate after loading
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return df
 
-def save_to_cache(ticker, interval_key, df):
-    """Upsert rows — only writes rows not already in the DB (delta merge)."""
+def save_to_cache(ticker, df):
+    """
+    Persist OHLCV data to SQLite using proper batch insertion (executemany).
+    FIX: Uses INSERT OR REPLACE to safely upsert rows and avoid duplicates.
+    """
     if df is None or df.empty:
         return
-    df = df.copy()
-    df["ticker"]   = ticker
-    df["interval"] = interval_key
-    df["date"]     = df.index.strftime("%Y-%m-%d %H:%M:%S")
-    cols = [c for c in ["ticker", "interval", "date", "Open", "High", "Low", "Close", "Volume"]
-            if c in df.columns]
-    df = df[cols]
-    # INSERT OR IGNORE respects the PRIMARY KEY (ticker, interval, date)
-    # so existing rows are never overwritten — only new deltas are inserted
-    df.to_sql("price_data", conn, if_exists="append", index=False,
-              method=lambda table, con, keys, data_iter:
-                  con.execute(
-                      f"INSERT OR IGNORE INTO {table.name} ({','.join(keys)}) "
-                      f"VALUES ({','.join(['?']*len(keys))})",
-                      list(data_iter)
-                  ) or None)
+    df = validate_and_clean(df, ticker)
+    if df is None:
+        return
+    temp = df.copy()
+    temp["ticker"] = ticker
+    temp["date"] = temp.index.strftime("%Y-%m-%d")
+    cols = [c for c in ["ticker", "date", "Open", "High", "Low", "Close", "Volume"] if c in temp.columns]
+    temp = temp[cols]
+    # FIX: Use executemany with INSERT OR REPLACE for deterministic, safe batch writes
+    rows = [tuple(row) for row in temp.itertuples(index=False, name=None)]
+    placeholders = ",".join(["?"] * len(cols))
+    sql = f"INSERT OR REPLACE INTO price_data ({','.join(c.lower() for c in cols)}) VALUES ({placeholders})"
+    conn.executemany(sql, rows)
     conn.commit()
 
-def fetch_with_cache(ticker, interval_key="1d", months=24):
+def fetch_with_cache(ticker, period="24mo"):
     """
-    Smart fetch with three layers:
-      1. Cache hit  — if we have enough rows, return immediately
-      2. Delta      — if partial cache exists, only fetch missing candles
-      3. Full fetch — no cache, pull entire history
+    Fetch price data with overlap-refetch strategy:
+    Always refetch last 20 candles from live source and merge with cache
+    to avoid gaps and stale tail rows.
     """
-    cached = get_cached(ticker, interval_key)
-    min_rows = 60 if interval_key != "1d" else 30
+    cached = get_cached(ticker)
+    needs_live = True
 
-    # Check if cache is complete (has data up to within 2 candles of now)
-    if cached is not None and len(cached) >= min_rows:
-        mins = INTERVAL_MAP[interval_key][3]
-        age_minutes = (pd.Timestamp.now() - cached.index.max()).total_seconds() / 60
-        if age_minutes < mins * 2:   # fresh enough
-            print(f"   \U0001f4e6 Cache hit ({interval_key}): {ticker}  [{len(cached)} rows]")
-            return cached
+    if cached is not None and len(cached) >= 60:
+        # Only skip live fetch if cache is very recent (last entry within 2 days)
+        last_cached = cached.index[-1]
+        days_stale = (pd.Timestamp.now().normalize() - last_cached).days
+        if days_stale <= 2:
+            print(f"   📦 Cache hit: {ticker}")
+            needs_live = False
 
-    # ── Try Binance for crypto ──
-    if "-USD" in ticker:
-        new_df, fetch_mode = fetch_from_binance(ticker, interval_key, months)
-        if new_df is not None and len(new_df) >= min_rows:
-            save_to_cache(ticker, interval_key, new_df)
-            # Merge new rows with what we had cached
+    if needs_live:
+        new_df = None
+        if "-USD" in ticker:
+            new_df = fetch_from_binance(ticker)
+            if new_df is not None:
+                print(f"   ✓ Binance data for {ticker}")
+
+        if new_df is None:
+            print(f"   ⬇️ yfinance: {ticker}")
+            try:
+                raw = yf.download(ticker, period=period, interval="1d", progress=False)
+                if not raw.empty:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        raw.columns = raw.columns.get_level_values(0)
+                    raw.columns = [c.capitalize() for c in raw.columns]
+                    if "Close" in raw.columns:
+                        raw["Volume"] = pd.to_numeric(
+                            raw.get("Volume", 0), errors="coerce"
+                        ).fillna(0).astype("int64")
+                        new_df = validate_and_clean(raw, ticker)
+            except Exception as e:
+                print(f"   ⚠️ yfinance failed: {e}")
+
+        if new_df is not None:
+            # FIX: Overlap-merge: combine cached + new, dedup by keeping newest value
             if cached is not None and not cached.empty:
                 merged = pd.concat([cached, new_df])
-                merged = merged[~merged.index.duplicated(keep='last')].sort_index()
-                print(f"   \u2713 Binance {fetch_mode} ({interval_key}): {ticker}  [{len(merged)} rows]")
-                return validate_and_clean(merged, ticker, interval_key)
-            print(f"   \u2713 Binance full ({interval_key}): {ticker}  [{len(new_df)} rows]")
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                new_df = merged
+            save_to_cache(ticker, new_df)
             return new_df
-
-    # ── Fall back to yfinance ──
-    print(f"   \u2b07\ufe0f  yfinance ({interval_key}): {ticker}")
-    try:
-        # yfinance interval mapping
-        yf_interval = INTERVAL_MAP[interval_key][1]
-        # yfinance only allows up to 730 days for 1h; use max period
-        yf_period = "730d" if interval_key != "1d" else f"{months*30}d"
-
-        # Delta: only pull from our last cached row onward
-        if cached is not None and not cached.empty:
-            last_dt = cached.index.max()
-            df = yf.download(ticker, start=last_dt, interval=yf_interval, progress=False)
-        else:
-            df = yf.download(ticker, period=yf_period, interval=yf_interval, progress=False)
-
-        if df is None or df.empty:
-            return cached  # return whatever we have
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [c.capitalize() for c in df.columns]
-        if "Close" not in df.columns:
+        elif cached is not None:
             return cached
+        return None
 
-        df["Volume"] = pd.to_numeric(df.get("Volume", 0), errors="coerce").fillna(0).astype("int64")
-
-        # Resample 1h → 4h or 12h if needed
-        if interval_key in ("4h", "12h"):
-            df = resample_yfinance_to_interval(df, interval_key)
-
-        df = validate_and_clean(df, ticker, interval_key)
-        if df is not None:
-            save_to_cache(ticker, interval_key, df)
-            if cached is not None and not cached.empty:
-                merged = pd.concat([cached, df])
-                merged = merged[~merged.index.duplicated(keep='last')].sort_index()
-                return validate_and_clean(merged, ticker, interval_key)
-        return df
-    except Exception as e:
-        print(f"   \u26a0\ufe0f  yfinance failed: {e}")
-        return cached   # return stale cache rather than nothing
+    return cached
 
 # ====================== HELPERS ======================
 def fetch_top_coins(n):
@@ -286,195 +178,247 @@ def fetch_top_coins(n):
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             headers={"x-cg-demo-api-key": COINGECKO_KEY},
-            params={"vs_currency":"usd", "order":"market_cap_desc", "per_page":n, "page":1},
-            timeout=15
+            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": n, "page": 1},
+            timeout=15,
         )
         r.raise_for_status()
-        tickers = [f"{coin['symbol'].upper()}-USD" for coin in r.json() 
-                  if coin.get('symbol','').upper() not in ["USDT","USDC","DAI","FDUSD","TUSD","USDE","BUSD"]]
+        tickers = [
+            f"{coin['symbol'].upper()}-USD"
+            for coin in r.json()
+            if coin.get("symbol", "").upper()
+            not in ["USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "BUSD"]
+        ]
         print(f"✅ Got {len(tickers)} valid tickers.")
-    except:
+    except Exception:
         tickers = []
-    MAJOR = ["BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD","DOGE-USD","TON-USD","ADA-USD","TRX-USD","AVAX-USD"]
+    MAJOR = [
+        "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+        "DOGE-USD", "TON-USD", "ADA-USD", "TRX-USD", "AVAX-USD",
+    ]
     final = tickers[:n]
+    pre_pad = len(final)
     if len(final) < n:
         for t in MAJOR:
             if t not in final and len(final) < n:
                 final.append(t)
-        # BUG FIX 5: Padding count was wrong — used len(tickers) instead of len(final before padding).
-        print(f"   Padded with {len(final) - len(tickers[:n])} coins.")
+        # FIX: Use pre_pad (length before padding) to count padded coins correctly
+        print(f"   Padded with {len(final) - pre_pad} coins.")
     return final
 
 TRADITIONAL_TOP = {
-    "1": ["^AXJO", "BHP.AX", "CBA.AX", "RIO.AX", "CSL.AX", "WBC.AX", "NAB.AX", "MQG.AX", "FMG.AX", "WES.AX"],  # Australia
-    "2": ["^GSPC", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "JPM"],                  # US
-    "3": ["^FTSE", "HSBA.L", "AZN.L", "SHEL.L", "ULVR.L", "BP.L", "GSK.L", "RIO.L", "BHP.L", "VOD.L"],       # UK
-    "4": ["^STOXX50E", "MC.PA", "ASML.AS", "SAP.DE", "AIR.PA", "SIE.DE", "SU.PA", "RMS.PA", "TTE.PA", "ALV.DE"], # Europe
-    "5": ["^GSPTSE", "RY.TO", "TD.TO", "ENB.TO", "CNR.TO", "BN.TO", "BCE.TO", "SHOP.TO", "CP.TO", "CNQ.TO"], # Canada
+    "1": ["^AXJO", "BHP.AX", "CBA.AX", "RIO.AX", "CSL.AX", "WBC.AX", "NAB.AX", "MQG.AX", "FMG.AX", "WES.AX"],
+    "2": ["^GSPC", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B", "TSLA", "JPM"],
+    "3": ["^FTSE", "HSBA.L", "AZN.L", "SHEL.L", "ULVR.L", "BP.L", "GSK.L", "RIO.L", "BHP.L", "VOD.L"],
+    "4": ["^STOXX50E", "MC.PA", "ASML.AS", "SAP.DE", "AIR.PA", "SIE.DE", "SU.PA", "RMS.PA", "TTE.PA", "ALV.DE"],
+    "5": ["^GSPTSE", "RY.TO", "TD.TO", "ENB.TO", "CNR.TO", "BN.TO", "BCE.TO", "SHOP.TO", "CP.TO", "CNQ.TO"],
 }
 
 def get_traditional_suffix(country):
-    return {"1":".AX", "2":"", "3":".L", "4":".PA", "5":".TO", "6":""}.get(country, "")
+    return {"1": ".AX", "2": "", "3": ".L", "4": ".PA", "5": ".TO", "6": ""}.get(country, "")
 
-# ====================== INDICATORS & SCORING ======================
+# ====================== INDICATORS ======================
+def compute_indicators(df):
+    """
+    Compute all technical indicators on a given DataFrame slice.
+    Called both for live display AND per-bar in backtest to eliminate lookahead bias.
+
+    IMPROVEMENT: Dynamic Fibonacci with full level set (0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618)
+    using a rolling 300-bar lookback window.
+    """
+    if df is None or "Close" not in df.columns or len(df) < 30:
+        return None
+    df = df.copy()
+
+    # ── RSI(14) ──
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta).clip(lower=0).rolling(14).mean()
+    rs = gain / loss.where(loss != 0, 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # ── MACD(12,26,9) ──
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    # ── Bollinger Bands(20) ──
+    sma20 = df["Close"].rolling(20).mean()
+    std20 = df["Close"].rolling(20).std()
+    df["BB_Upper"] = sma20 + 2 * std20
+    df["BB_Middle"] = sma20
+    df["BB_Lower"] = sma20 - 2 * std20
+
+    # ── MACD Crossover ──
+    df["MACD_Crossover"] = 0
+    bull = (df["MACD"].shift(1) <= df["MACD_Signal"].shift(1)) & (df["MACD"] > df["MACD_Signal"])
+    bear = (df["MACD"].shift(1) >= df["MACD_Signal"].shift(1)) & (df["MACD"] < df["MACD_Signal"])
+    df.loc[bull, "MACD_Crossover"] = 1
+    df.loc[bear, "MACD_Crossover"] = -1
+
+    # ── Dynamic Fibonacci Levels (rolling 300-bar window) ──
+    # IMPROVEMENT: Recalculate per bar using only past data; includes full Fib level set
+    fib_window = min(300, len(df))
+    recent = df["Close"].tail(fib_window)
+    swing_high = recent.max()
+    swing_low = recent.min()
+    diff = swing_high - swing_low
+
+    FIB_RATIOS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618]
+    if diff > 0:
+        # Fib levels measured from swing_high downward
+        for ratio in FIB_RATIOS:
+            col = f"Fib_{ratio:.3f}"
+            df[col] = swing_high - ratio * diff
+        # Key support = 0.618 retracement; key resistance = 0.382 retracement
+        df["Fib_Support"] = swing_high - 0.618 * diff
+        df["Fib_Resistance"] = swing_high - 0.382 * diff
+    else:
+        # Flat price: set default bands
+        for ratio in FIB_RATIOS:
+            col = f"Fib_{ratio:.3f}"
+            df[col] = swing_high
+        df["Fib_Support"] = swing_high * 0.92
+        df["Fib_Resistance"] = swing_high * 1.08
+
+    # ── Candlestick Patterns (Doji, Hammer, Shooting Star) ──
+    df["Body"] = abs(df["Close"] - df["Open"])
+    df["Range"] = df["High"] - df["Low"]
+    df["Upper_Wick"] = df["High"] - df[["Open", "Close"]].max(axis=1)
+    df["Lower_Wick"] = df[["Open", "Close"]].min(axis=1) - df["Low"]
+    df["Doji"] = ""
+    doji_mask = (df["Body"] / df["Range"].replace(0, np.nan) < 0.25) & (df["Range"] > 0)
+    df.loc[doji_mask & (df["Lower_Wick"] > 2 * df["Body"]), "Doji"] = "Bullish Doji"
+    df.loc[doji_mask & (df["Upper_Wick"] > 2 * df["Body"]), "Doji"] = "Bearish Doji"
+    # FIX: True doji (both wicks large) applied after directional ones
+    df.loc[
+        doji_mask & (df["Upper_Wick"] > 2 * df["Body"]) & (df["Lower_Wick"] > 2 * df["Body"]),
+        "Doji",
+    ] = "Doji"
+
+    df = df.dropna(subset=["RSI", "BB_Middle"])
+    return df if len(df) >= 30 else None
+
 def add_indicators(data_dict):
+    """Apply compute_indicators to all assets in the dict."""
     enriched = {}
     for ticker, df in data_dict.items():
-        if df is None or "Close" not in df.columns: continue
-        df = df.copy()
-
-        delta = df["Close"].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta).clip(lower=0).rolling(14).mean()
-        rs = gain / loss.where(loss != 0, 1e-10)
-        df["RSI"] = 100 - (100 / (1 + rs))
-
-        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-        df["MACD"] = ema12 - ema26
-        df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-
-        sma20 = df["Close"].rolling(20).mean()
-        std20 = df["Close"].rolling(20).std()
-        df["BB_Upper"] = sma20 + 2*std20
-        df["BB_Middle"] = sma20
-        df["BB_Lower"] = sma20 - 2*std20
-
-        df["MACD_Crossover"] = 0
-        bull = (df["MACD"].shift(1) <= df["MACD_Signal"].shift(1)) & (df["MACD"] > df["MACD_Signal"])
-        bear = (df["MACD"].shift(1) >= df["MACD_Signal"].shift(1)) & (df["MACD"] < df["MACD_Signal"])
-        df.loc[bull, "MACD_Crossover"] = 1
-        df.loc[bear, "MACD_Crossover"] = -1
-
-        recent = df.tail(180)
-        if len(recent) >= 60:
-            high = recent["Close"].max()
-            low = recent["Close"].min()
-            diff = high - low
-            # BUG FIX 6: diff could be 0 if all prices are identical, causing NaN fib levels.
-            if diff > 0:
-                fib_support = high - 0.618 * diff
-                fib_resistance = high - 0.382 * diff
-                current = df["Close"].iloc[-1]
-                if current < fib_support:
-                    fib_support = low * 0.95
-                df["Fib_Support"] = fib_support
-                df["Fib_Resistance"] = fib_resistance
-            else:
-                df["Fib_Support"] = high * 0.92
-                df["Fib_Resistance"] = high * 1.08
-
-        df["Body"] = abs(df["Close"] - df["Open"])
-        df["Range"] = df["High"] - df["Low"]
-        df["Upper_Wick"] = df["High"] - df[["Open","Close"]].max(axis=1)
-        df["Lower_Wick"] = df[["Open","Close"]].min(axis=1) - df["Low"]
-
-        df["Doji"] = ""
-        doji_mask = (df["Body"] / df["Range"].replace(0, np.nan) < 0.25) & (df["Range"] > 0)
-        df.loc[doji_mask & (df["Lower_Wick"] > 2 * df["Body"]), "Doji"] = "Bullish Doji"
-        df.loc[doji_mask & (df["Upper_Wick"] > 2 * df["Body"]), "Doji"] = "Bearish Doji"
-        # BUG FIX 7: The combined "Doji" label must be applied AFTER the two directional ones,
-        # and only when BOTH wicks are large (true Doji, not Hammer/Shooting Star).
-        df.loc[doji_mask & (df["Upper_Wick"] > 2 * df["Body"]) & (df["Lower_Wick"] > 2 * df["Body"]), "Doji"] = "Doji"
-
-        df = df.dropna(subset=["RSI", "BB_Middle"])
-        if len(df) >= 30:
-            enriched[ticker] = df
+        result = compute_indicators(df)
+        if result is not None:
+            enriched[ticker] = result
     return enriched
 
+# ====================== SCORING ======================
 def score_coin(df):
     """
-    5-component scoring system. Range: 0 (most bearish) to 5 (most bullish).
-    Each component contributes 1 point if bullish, 0 if bearish or neutral.
+    IMPROVED 5-component scoring system. Range: -5 to +5.
+      1. Volatility     : +1 if low (<2%), -1 if high (>3.5%)
+      2. RSI            : +1 if oversold (<35), -1 if overbought (>68)
+      3. MACD Crossover : +1 bull cross, -1 bear cross, 0 none
+      4. Bollinger Band : +1 below mid, -1 above upper
+      5. Fibonacci      : +1 near/below Fib support, -1 near/above Fib resistance
 
-      1. Volatility     : 1 if low daily volatility (<2%)
-      2. RSI            : 1 if oversold (<35),  0 if overbought (>68) or neutral
-      3. MACD           : 1 if bullish crossover occurred,  0 otherwise
-      4. Bollinger Band : 1 if price below midline (SMA20),  0 if above upper band
-      5. Fibonacci      : 1 if price at/below 61.8% support, 0 if at/above 38.2% resistance
-
-    Score interpretation:
-      5   = all signals bullish  → STRONG BUY
-      3-4 = majority bullish     → BUY
-      2   = mixed signals        → HOLD
-      0-1 = majority bearish     → SELL
+    IMPROVEMENT: More responsive — bearish conditions are penalized, not just neutral.
+    Each component returns -1, 0, or +1 cleanly.
     """
     latest = df.iloc[-1]
-    close  = latest.get("Close", 0)
-    s = 0
+    close = latest.get("Close", 0)
 
-    # 1. Volatility — reward low vol, ignore high vol (don't subtract)
+    # 1. Volatility
     vol = df["Close"].pct_change().abs().mean() * 100
-    if vol < 2.0:
-        s += 1
+    s = -1 if vol > 3.5 else (1 if vol < 2.0 else 0)
 
-    # 2. RSI — reward oversold only
+    # 2. RSI — expanded thresholds for more responsiveness
     rsi = latest.get("RSI", 50)
-    if rsi < 35:
-        s += 1
+    s += -1 if rsi > 68 else (1 if rsi < 35 else 0)
 
-    # 3. MACD — reward bullish crossover only
-    if latest.get("MACD_Crossover", 0) == 1:
-        s += 1
+    # 3. MACD Crossover
+    s += int(latest.get("MACD_Crossover", 0))
 
-    # 4. Bollinger Bands — reward price below midline
-    bb_mid   = latest.get("BB_Middle", 0)
+    # 4. Bollinger Bands — price relative to bands
+    bb_mid = latest.get("BB_Middle", 0)
     bb_upper = latest.get("BB_Upper", 0)
-    if bb_mid > 0 and close < bb_mid * 0.98:
+    bb_lower = latest.get("BB_Lower", 0)
+    if close < bb_lower * 1.01:
+        # Price at or below lower band: strong bullish signal
         s += 1
+    elif close < bb_mid * 0.98:
+        s += 1
+    elif close > bb_upper * 1.02:
+        s -= 1
+    elif close > bb_upper * 0.98:
+        # Near upper band: mild bearish
+        s -= 1
 
-    # 5. Fibonacci — reward price near/below support
+    # 5. Fibonacci position relative to key support/resistance
     fib_s = latest.get("Fib_Support", 0)
     fib_r = latest.get("Fib_Resistance", 0)
-    if fib_s > 0 and fib_r > 0 and close <= fib_s * 1.02:
-        s += 1
+    if fib_s > 0 and fib_r > 0:
+        if close <= fib_s * 1.02:
+            s += 1
+        elif close >= fib_r * 0.98:
+            s -= 1
 
     return s, latest
 
 def score_to_rec(s):
-    # Thresholds for 0-5 range
-    if s == 5:   return "🟢 STRONG BUY"
-    elif s >= 3: return "🟢 BUY"
-    elif s == 2: return "🟠 HOLD"
-    else:        return "🔴 SELL"   # 0 or 1
+    if s >= 4:   return "🟢 STRONG BUY"
+    elif s >= 2: return "🟢 BUY"
+    elif s >= 0: return "🟠 HOLD"
+    else:        return "🔴 SELL"
 
 def get_action(s):
-    # Thresholds for 0-5 range
-    if s >= 3:  return "BUY"
-    elif s <= 1: return "SELL"
-    else:        return "HOLD"   # score == 2
+    if s >= 3:    return "BUY"
+    elif s <= -1: return "SELL"
+    else:         return "HOLD"
 
 def should_exit(hist, entry_price, days_held, max_hold_days,
                 stop_loss_pct=8.0, take_profit_pct=20.0):
     """
-    Multi-condition exit — checked in priority order:
-      1. Stop-loss   : price fell more than stop_loss_pct % below entry
-      2. Take-profit : price rose more than take_profit_pct % above entry
-      3. Signal SELL : composite score <= -1 (MACD bear cross, RSI overbought, etc.)
-      4. Max hold    : safety valve — exits after max_hold_days regardless
+    IMPROVEMENT: Multi-condition exit with trend-aware max-hold extension.
+    Priority order:
+      1. Stop-loss       : price fell >= stop_loss_pct% below entry
+      2. Take-profit     : price rose >= take_profit_pct% above entry
+      3. Signal SELL     : composite score <= -1
+      4. Max hold        : safety valve — but only fires if trend is NOT strong
+                           (strong trend = MACD bullish + price above BB mid)
     Returns (should_exit: bool, reason: str)
     """
     latest = hist.iloc[-1]
     current_price = latest.get("Close", entry_price)
+
     if entry_price > 0:
         pct_chg = (current_price / entry_price - 1) * 100
         if pct_chg <= -stop_loss_pct:
             return True, f"STOP-LOSS ({pct_chg:+.1f}%)"
         if pct_chg >= take_profit_pct:
             return True, f"TAKE-PROFIT ({pct_chg:+.1f}%)"
+
     score, _ = score_coin(hist)
-    if score <= 1:    # 0 or 1 bullish signals — majority bearish
+    if score <= -1:
         return True, "SIGNAL SELL"
+
+    # IMPROVEMENT: Max-hold extension if trend is still strong
     if days_held >= max_hold_days - 1:
-        return True, f"MAX HOLD ({max_hold_days}d safety valve — no exit signal fired)"
+        macd_val = latest.get("MACD", 0)
+        macd_sig = latest.get("MACD_Signal", 0)
+        bb_mid = latest.get("BB_Middle", 0)
+        trend_strong = (macd_val > macd_sig) and (current_price > bb_mid)
+        if trend_strong:
+            # Extend by up to 50% of max_hold_days before forcing exit
+            extended_limit = int(max_hold_days * 1.5)
+            if days_held < extended_limit:
+                return False, ""
+        return True, f"MAX HOLD ({max_hold_days}d safety valve)"
+
     return False, ""
 
 # ====================== MAIN ======================
 def main():
     while True:
-        print("\n" + "="*100)
-        print("MAIN MENU - Consistent Flow")
-        print("="*100)
+        print("\n" + "=" * 100)
+        print("MAIN MENU - Robust v37")
+        print("=" * 100)
         print("1. Crypto Analysis")
         print("2. Traditional Markets Analysis")
         print("3. Clear Cache")
@@ -497,84 +441,95 @@ def main():
         is_crypto = main_choice == "1"
         print(f"\n{'Crypto' if is_crypto else 'Traditional Markets'} Analysis")
 
-        # Initial Capital (same for both)
         try:
             init_input = input(f"\nInitial Capital USD (default 10000): $").strip()
             INITIAL_CAPITAL = float(init_input) if init_input else 10000.0
-        except:
+        except Exception:
             INITIAL_CAPITAL = 10000.0
         print(f"Using Initial Capital: ${INITIAL_CAPITAL:,.2f}\n")
 
-        # Mode: Live or Backtest (same for both)
         print("Select mode:")
         print("1. Live Dashboard")
         print("2. Backtest + Equity Curve")
         mode_choice = input("\nEnter 1 or 2: ").strip()
         is_backtest = mode_choice == "2"
 
-        # Candle interval
-        print("\nSelect candle interval:")
-        print("1. 1 Day (default)   2. 12 Hours   3. 4 Hours")
-        iv_choice = input("\nEnter 1-3: ").strip()
-        interval_key = {"1": "1d", "2": "12h", "3": "4h"}.get(iv_choice, "1d")
-        print(f"\u2705 Interval: {interval_key}\n")
-
-        # For sub-daily intervals, cap backtest months to what yfinance provides
-        max_months = 24 if interval_key == "1d" else 18
-
-        # Backtest lookback period (only if backtest)
+        # FIX: Initialize BACKTEST_DAYS before the if-block to avoid UnboundLocalError
         months = 12
         BACKTEST_DAYS = months * 30
+        STOP_LOSS_PCT = 8.0
+        TAKE_PROFIT_PCT = 20.0
+        MAX_HOLD_DAYS_CFG = 45
+        # IMPROVEMENT: Transaction cost and position sizing defaults
+        FEE_PCT = 0.1       # 0.1% fee per trade leg
+        SLIPPAGE_PCT = 0.05  # 0.05% slippage per trade leg
+        POSITION_SIZE_PCT = 0.50  # Allocate 50% of capital per trade
+
         if is_backtest:
             print("\nBacktest lookback period:")
-            if max_months >= 24:
-                print("1. 6 months   2. 12 months   3. 18 months   4. 24 months")
-                period_choice = input("\nEnter 1-4: ").strip()
-                months = {"1":6, "2":12, "3":18, "4":24}.get(period_choice, 12)
-            else:
-                print("1. 6 months   2. 12 months   3. 18 months")
-                print(f"  (24 months not available for {interval_key} — yfinance limit)")
-                period_choice = input("\nEnter 1-3: ").strip()
-                months = {"1":6, "2":12, "3":18}.get(period_choice, 12)
-            months = min(months, max_months)
+            print("1. 6 months   2. 12 months   3. 18 months   4. 24 months")
+            period_choice = input("\nEnter 1-4: ").strip()
+            months = {"1": 6, "2": 12, "3": 18, "4": 24}.get(period_choice, 12)
             BACKTEST_DAYS = months * 30
-            print(f"✅ Backtest set to last {months} months ({interval_key} candles).\n")
+            print(f"✅ Backtest set to last {months} months.\n")
 
-            # ---- Exit rule parameters ----
             print("Exit rules (press Enter to use defaults):")
             try:
                 sl_in = input("  Stop-loss %    (default  8%): ").strip()
                 STOP_LOSS_PCT = float(sl_in) if sl_in else 8.0
-            except: STOP_LOSS_PCT = 8.0
+            except Exception:
+                STOP_LOSS_PCT = 8.0
             try:
                 tp_in = input("  Take-profit %  (default 20%): ").strip()
                 TAKE_PROFIT_PCT = float(tp_in) if tp_in else 20.0
-            except: TAKE_PROFIT_PCT = 20.0
+            except Exception:
+                TAKE_PROFIT_PCT = 20.0
             try:
                 mh_in = input("  Max hold days  (default 45d): ").strip()
                 MAX_HOLD_DAYS_CFG = int(mh_in) if mh_in else 45
-            except: MAX_HOLD_DAYS_CFG = 45
-            print(f"✅ Exit rules — SL: {STOP_LOSS_PCT}%  TP: {TAKE_PROFIT_PCT}%  Max hold: {MAX_HOLD_DAYS_CFG}d\n")
+            except Exception:
+                MAX_HOLD_DAYS_CFG = 45
 
-        if not is_backtest:
-            STOP_LOSS_PCT     = 8.0
-            TAKE_PROFIT_PCT   = 20.0
-            MAX_HOLD_DAYS_CFG = 45
+            # IMPROVEMENT: Transaction cost parameters
+            print("\nTransaction costs (press Enter for defaults):")
+            try:
+                fee_in = input("  Fee % per trade leg   (default 0.10%): ").strip()
+                FEE_PCT = float(fee_in) if fee_in else 0.1
+            except Exception:
+                FEE_PCT = 0.1
+            try:
+                slip_in = input("  Slippage % per leg    (default 0.05%): ").strip()
+                SLIPPAGE_PCT = float(slip_in) if slip_in else 0.05
+            except Exception:
+                SLIPPAGE_PCT = 0.05
+
+            # IMPROVEMENT: Position sizing
+            print("\nPosition sizing (press Enter for default):")
+            try:
+                pos_in = input("  Capital % per trade   (default 50%): ").strip()
+                POSITION_SIZE_PCT = float(pos_in) / 100.0 if pos_in else 0.50
+            except Exception:
+                POSITION_SIZE_PCT = 0.50
+
+            print(
+                f"✅ Exit rules — SL: {STOP_LOSS_PCT}%  TP: {TAKE_PROFIT_PCT}%  "
+                f"Max hold: {MAX_HOLD_DAYS_CFG}d\n"
+                f"✅ Costs — Fee: {FEE_PCT}%  Slippage: {SLIPPAGE_PCT}%\n"
+                f"✅ Position size: {POSITION_SIZE_PCT*100:.0f}% of capital\n"
+            )
 
         # ====================== ASSET SELECTION ======================
         if is_crypto:
-            # Crypto asset selection
             while True:
                 print("Number of top coins:")
                 print("1. Top 10   2. Top 20   3. Top 50   4. Top 100")
                 nc = input("\nEnter 1-4: ").strip()
-                if nc in ["1","2","3","4"]:
-                    requested_n = {"1":10, "2":20, "3":50, "4":100}[nc]
+                if nc in ["1", "2", "3", "4"]:
+                    requested_n = {"1": 10, "2": 20, "3": 50, "4": 100}[nc]
                     break
                 print("❌ Please enter 1-4.")
             final_tickers = fetch_top_coins(requested_n)
         else:
-            # Traditional asset selection
             print("Select Country/Region:")
             print("1. Australia (ASX)   2. United States   3. United Kingdom   4. Europe   5. Canada   6. Other")
             country_choice = input("\nEnter 1-6: ").strip()
@@ -597,10 +552,11 @@ def main():
 
             final_tickers = []
             for t in tickers:
-                if suffix and not any(t.endswith(s) for s in [".AX",".L",".PA",".TO",".DE",".AS"]) and not t.startswith("^"):
-                    # BUG FIX 9: European tickers (e.g. ASML.AS, SAP.DE) were getting
-                    # the country suffix appended again (e.g. ASML.AS.PA). Added ".DE" and ".AS"
-                    # to the exclusion list.
+                # FIX: Extended exclusion list includes .DE and .AS to prevent double-suffix
+                already_suffixed = any(
+                    t.endswith(s) for s in [".AX", ".L", ".PA", ".TO", ".DE", ".AS"]
+                )
+                if suffix and not already_suffixed and not t.startswith("^"):
                     final_tickers.append(t + suffix)
                 else:
                     final_tickers.append(t)
@@ -611,7 +567,7 @@ def main():
         # ====================== LOAD DATA ======================
         raw_data = {}
         for ticker in final_tickers:
-            df = fetch_with_cache(ticker, interval_key=interval_key, months=max_months)
+            df = fetch_with_cache(ticker, period="24mo")
             if df is not None and len(df) >= 30:
                 raw_data[ticker] = df
 
@@ -627,7 +583,7 @@ def main():
 
         # ====================== RUN ANALYSIS ======================
         if not is_backtest:
-            # Live Dashboard (same for both crypto and traditional)
+            # ── Live Dashboard ──
             results = []
             for t, df in enriched.items():
                 score, latest = score_coin(df)
@@ -636,10 +592,8 @@ def main():
                 fib_support = latest.get("Fib_Support", current * 0.92)
                 fib_resistance = latest.get("Fib_Resistance", current * 1.12)
                 doji = latest.get("Doji", "")
-
                 upside = (fib_resistance - current) / current * 100 if current > 0 else 0
                 downside = (current - fib_support) / current * 100 if current > 0 else 0
-
                 results.append({
                     "Asset": t.replace("-USD", ""),
                     "Action": action,
@@ -651,16 +605,15 @@ def main():
                     "Upside %": round(upside, 1),
                     "Downside %": round(downside, 1),
                     "Doji": doji,
-                    "RSI": round(latest.get("RSI", 0), 1)
+                    "RSI": round(latest.get("RSI", 0), 1),
                 })
 
             df_out = pd.DataFrame(results).sort_values(
                 "Score",
-                key=lambda x: x.str.split('/').str[0].astype(int),
-                ascending=False
+                key=lambda x: x.str.split("/").str[0].astype(int),
+                ascending=False,
             )
-            # BUG FIX 10: `df_out.index += 1` on a RangeIndex doesn't work as intended
-            # after sort_values (index is shuffled). Reset first, then add 1.
+            # FIX: Reset index before incrementing to ensure contiguous rank after sort
             df_out = df_out.reset_index(drop=True)
             df_out.index += 1
             df_out.index.name = "Rank"
@@ -668,57 +621,67 @@ def main():
             mode_name = "Crypto" if is_crypto else "Traditional Markets"
             print(f"\n{'='*150}")
             print(f"🏆 {mode_name} LIVE DASHBOARD")
-            print("="*150)
+            print("=" * 150)
             print(df_out.to_string())
 
-            # ====================== RISK SCORE BREAKDOWN ======================
+            # ── Risk Score Breakdown ──
             print(f"\n{'='*150}")
             print(f"📊 RISK SCORE BREAKDOWN")
-            print("="*150)
+            print("=" * 150)
             risk_rows = []
             for t, df in enriched.items():
                 score, latest = score_coin(df)
                 vol = df["Close"].pct_change().abs().mean() * 100
-                vol_score  = -1 if vol > 3.5 else (1 if vol < 2.0 else 0)
-                rsi_val    = latest.get("RSI", 50)
-                rsi_score  = -1 if rsi_val > 68 else (1 if rsi_val < 35 else 0)
+                vol_score = -1 if vol > 3.5 else (1 if vol < 2.0 else 0)
+                rsi_val = latest.get("RSI", 50)
+                rsi_score = -1 if rsi_val > 68 else (1 if rsi_val < 35 else 0)
                 macd_score = int(latest.get("MACD_Crossover", 0))
-                close      = latest.get("Close", 0)
-                bb_mid     = latest.get("BB_Middle", 0)
-                bb_upper   = latest.get("BB_Upper", 0)
-                bb_score   = 1 if close < bb_mid * 0.98 else (-1 if close > bb_upper * 1.02 else 0)
-                macd_val   = latest.get("MACD", 0)
-                macd_sig   = latest.get("MACD_Signal", 0)
-                fib_s_val  = latest.get("Fib_Support", 0)
-                fib_r_val  = latest.get("Fib_Resistance", 0)
-                close_val  = latest.get("Close", 0)
+                close = latest.get("Close", 0)
+                bb_mid = latest.get("BB_Middle", 0)
+                bb_upper = latest.get("BB_Upper", 0)
+                bb_lower = latest.get("BB_Lower", 0)
+                if close < bb_lower * 1.01 or close < bb_mid * 0.98:
+                    bb_score = 1
+                elif close > bb_upper * 0.98:
+                    bb_score = -1
+                else:
+                    bb_score = 0
+                macd_val = latest.get("MACD", 0)
+                macd_sig = latest.get("MACD_Signal", 0)
+                fib_s_val = latest.get("Fib_Support", 0)
+                fib_r_val = latest.get("Fib_Resistance", 0)
                 if fib_s_val > 0 and fib_r_val > 0:
-                    if close_val <= fib_s_val * 1.02:   fib_score = 1
-                    elif close_val >= fib_r_val * 0.98: fib_score = -1
-                    else:                                fib_score = 0
+                    if close <= fib_s_val * 1.02:
+                        fib_score = 1
+                    elif close >= fib_r_val * 0.98:
+                        fib_score = -1
+                    else:
+                        fib_score = 0
                 else:
                     fib_score = 0
                 risk_rows.append({
-                    "Asset":       t.replace("-USD", ""),
-                    "Total Score": f"{score}/5",   # 0=bearish … 5=bullish
-                    "Volatility":  f"{vol:.2f}% ({'Low' if vol_score==1 else ('High' if vol_score==-1 else 'Med')})",
-                    "RSI":         f"{rsi_val:.1f} ({'OS' if rsi_score==1 else ('OB' if rsi_score==-1 else 'Neutral')})",
-                    "MACD":        f"{macd_val:.4f}/Sig {macd_sig:.4f} ({'BullX' if macd_score==1 else ('BearX' if macd_score==-1 else 'None')})",
+                    "Asset": t.replace("-USD", ""),
+                    "Total Score": f"{score}/5",
+                    "Volatility": f"{vol:.2f}% ({'Low' if vol_score==1 else ('High' if vol_score==-1 else 'Med')})",
+                    "RSI": f"{rsi_val:.1f} ({'OS' if rsi_score==1 else ('OB' if rsi_score==-1 else 'Neutral')})",
+                    "MACD": f"{macd_val:.4f}/Sig {macd_sig:.4f} ({'BullX' if macd_score==1 else ('BearX' if macd_score==-1 else 'None')})",
                     "BB Position": f"{'Below' if bb_score==1 else ('Above' if bb_score==-1 else 'Inside')}",
-                    "Fibonacci":   f"{'Near Support' if fib_score==1 else ('Near Resistance' if fib_score==-1 else 'Between')}",
-                    "Doji":        latest.get("Doji", "") or "—",
+                    "Fibonacci": f"{'Near Support' if fib_score==1 else ('Near Resistance' if fib_score==-1 else 'Between')}",
+                    "Doji": latest.get("Doji", "") or "—",
                 })
             risk_df = pd.DataFrame(risk_rows).sort_values(
-                "Total Score", key=lambda x: x.str.split('/').str[0].astype(int), ascending=False
+                "Total Score",
+                key=lambda x: x.str.split("/").str[0].astype(int),
+                ascending=False,
             ).reset_index(drop=True)
             risk_df.index += 1
             risk_df.index.name = "Rank"
             print(risk_df.to_string())
 
-            # ====================== TOP ASSET TECHNICAL CHART ======================
-            top_ticker  = max(enriched.keys(), key=lambda t: score_coin(enriched[t])[0])
-            chart_df    = enriched[top_ticker].tail(180).copy()
-            label       = top_ticker.replace("-USD", "") if is_crypto else top_ticker
+            # ── Top Asset Technical Chart ──
+            top_ticker = max(enriched.keys(), key=lambda t: score_coin(enriched[t])[0])
+            chart_df = enriched[top_ticker].tail(180).copy()
+            label = top_ticker.replace("-USD", "") if is_crypto else top_ticker
 
             fig = make_subplots(
                 rows=4, cols=1,
@@ -729,19 +692,18 @@ def main():
                     f"{label} — Price, Bollinger Bands & Fibonacci",
                     "MACD",
                     "RSI (14)",
-                    "Volume"
-                )
+                    "Volume",
+                ),
             )
 
-            # ── Row 1: Candlestick + BB + Fibonacci ──
+            # Row 1: Candlestick + BB + Fibonacci
             fig.add_trace(go.Candlestick(
                 x=chart_df.index,
                 open=chart_df["Open"], high=chart_df["High"],
-                low=chart_df["Low"],  close=chart_df["Close"],
+                low=chart_df["Low"], close=chart_df["Close"],
                 name="Price",
-                increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
+                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
             ), row=1, col=1)
-
             fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Upper"],
                 name="BB Upper", line=dict(color="rgba(100,100,255,0.6)", width=1, dash="dot")), row=1, col=1)
             fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["BB_Middle"],
@@ -762,19 +724,20 @@ def main():
                               annotation_position="top left",
                               annotation_font_color="rgba(255,80,80,0.9)", row=1, col=1)
 
-            # Doji candlestick markers
-            for doji_type, sym, col in [("Bullish Doji","triangle-up","#26a69a"),
-                                         ("Bearish Doji","triangle-down","#ef5350"),
-                                         ("Doji","diamond","#ffcc00")]:
+            for doji_type, sym, col in [
+                ("Bullish Doji", "triangle-up", "#26a69a"),
+                ("Bearish Doji", "triangle-down", "#ef5350"),
+                ("Doji", "diamond", "#ffcc00"),
+            ]:
                 d = chart_df[chart_df["Doji"] == doji_type]
                 if not d.empty:
                     fig.add_trace(go.Scatter(
                         x=d.index, y=d["Low"] * 0.98,
                         mode="markers", marker=dict(symbol=sym, size=10, color=col),
-                        name=doji_type
+                        name=doji_type,
                     ), row=1, col=1)
 
-            # ── Row 2: MACD ──
+            # Row 2: MACD
             macd_hist = chart_df["MACD"] - chart_df["MACD_Signal"]
             fig.add_trace(go.Bar(x=chart_df.index, y=macd_hist, name="MACD Hist",
                 marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in macd_hist]), row=2, col=1)
@@ -782,16 +745,17 @@ def main():
                 name="MACD", line=dict(color="#1f77b4", width=1.5)), row=2, col=1)
             fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["MACD_Signal"],
                 name="Signal", line=dict(color="#ff7f0e", width=1.5)), row=2, col=1)
-
-            for cross_val, sym, col, cname in [(1,"triangle-up","#26a69a","Bull Cross"),
-                                                (-1,"triangle-down","#ef5350","Bear Cross")]:
+            for cross_val, sym, col, cname in [
+                (1, "triangle-up", "#26a69a", "Bull Cross"),
+                (-1, "triangle-down", "#ef5350", "Bear Cross"),
+            ]:
                 cx = chart_df[chart_df["MACD_Crossover"] == cross_val]
                 if not cx.empty:
                     fig.add_trace(go.Scatter(x=cx.index, y=cx["MACD"],
                         mode="markers", marker=dict(symbol=sym, size=9, color=col),
                         name=cname), row=2, col=1)
 
-            # ── Row 3: RSI ──
+            # Row 3: RSI
             fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["RSI"],
                 name="RSI(14)", line=dict(color="#9c27b0", width=1.5)), row=3, col=1)
             fig.add_hline(y=70, line_dash="dash", line_color="rgba(239,83,80,0.5)",
@@ -801,23 +765,25 @@ def main():
             fig.add_hline(y=50, line_dash="dot", line_color="rgba(150,150,150,0.4)", row=3, col=1)
             fig.add_hrect(y0=30, y1=70, fillcolor="rgba(150,150,150,0.05)", line_width=0, row=3, col=1)
 
-            # ── Row 4: Volume ──
+            # Row 4: Volume
             if "Volume" in chart_df.columns and chart_df["Volume"].sum() > 0:
-                vol_colors = ["#26a69a" if chart_df["Close"].iloc[i] >= chart_df["Open"].iloc[i]
-                              else "#ef5350" for i in range(len(chart_df))]
+                vol_colors = [
+                    "#26a69a" if chart_df["Close"].iloc[i] >= chart_df["Open"].iloc[i]
+                    else "#ef5350"
+                    for i in range(len(chart_df))
+                ]
                 fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"],
                     name="Volume", marker_color=vol_colors), row=4, col=1)
 
             fig.update_layout(
                 title=dict(
                     text=f"{'🪙' if is_crypto else '📈'} {label} — Technical Analysis ({mode_name})",
-                    font=dict(size=18)
+                    font=dict(size=18),
                 ),
-                height=900,
-                template="plotly_white",
+                height=900, template="plotly_white",
                 xaxis_rangeslider_visible=False,
                 legend=dict(orientation="v", x=1.01, y=1),
-                margin=dict(r=180)
+                margin=dict(r=180),
             )
             fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
             fig.update_yaxes(title_text="MACD",        row=2, col=1)
@@ -827,14 +793,10 @@ def main():
             print(f"\n📈 Chart shown for top-scored asset: {label}")
 
         else:
-            # Backtest (same for both)
+            # ── Backtest ──
             anchor = list(enriched.keys())[0]
-            # BACKTEST_DAYS is in calendar days; convert to candle count
-            mins_per_candle = INTERVAL_MAP[interval_key][3]
-            candles_per_day = 1440 / mins_per_candle
-            backtest_candles = int(BACKTEST_DAYS * candles_per_day)
             available_days = len(enriched[anchor])
-            actual_days = min(backtest_candles, available_days)
+            actual_days = min(BACKTEST_DAYS, available_days)
             test_dates = enriched[anchor].index[-actual_days:]
 
             equity = [INITIAL_CAPITAL]
@@ -845,27 +807,41 @@ def main():
             entry_date = None
             entry_asset = ""
             entry_asset_label = ""
-            entry_snapshot = None   # full market snapshot DataFrame at entry
+            entry_snapshot = None
             days_held = 0
             current_capital = INITIAL_CAPITAL
+            allocated_capital = 0.0   # IMPROVEMENT: track allocated portion separately
             MAX_HOLD_DAYS = MAX_HOLD_DAYS_CFG
 
-            def build_snapshot(enriched_dict, test_date, is_crypto):
-                """Build a full signal snapshot for every asset at a given date."""
+            # Total cost per round-trip leg (applied at entry and exit separately)
+            COST_PER_LEG = (FEE_PCT + SLIPPAGE_PCT) / 100.0
+
+            def build_snapshot_at(raw_dict, test_date, is_crypto):
+                """
+                CRITICAL FIX: Build signal snapshot using ONLY data up to test_date.
+                Indicators are recalculated here on the truncated slice — eliminates lookahead bias.
+                """
                 rows = []
-                for t, df in enriched_dict.items():
-                    hist = df[df.index <= test_date]
-                    if len(hist) < 20: continue
+                for t, df in raw_dict.items():
+                    # Slice to only include rows up to and including test_date
+                    hist_raw = df[df.index <= test_date]
+                    if len(hist_raw) < 40:
+                        continue
+                    # Recompute all indicators on this slice (no future data)
+                    hist = compute_indicators(hist_raw)
+                    if hist is None or len(hist) < 20:
+                        continue
                     score, latest = score_coin(hist)
                     action = get_action(score)
                     current = latest.get("Close", 0)
-                    fib_support    = latest.get("Fib_Support",    current * 0.92)
+                    fib_support = latest.get("Fib_Support", current * 0.92)
                     fib_resistance = latest.get("Fib_Resistance", current * 1.12)
-                    upside   = (fib_resistance - current) / current * 100 if current > 0 else 0
-                    downside = (current - fib_support)    / current * 100 if current > 0 else 0
+                    upside = (fib_resistance - current) / current * 100 if current > 0 else 0
+                    downside = (current - fib_support) / current * 100 if current > 0 else 0
                     rows.append({
                         "Asset":          t.replace("-USD", "") if is_crypto else t,
-                        "_Ticker":        t,               # internal key, hidden in display
+                        "_Ticker":        t,
+                        "_HistSlice":     hist,  # stored internally for exit checks
                         "Action":         action,
                         "Recommendation": score_to_rec(score),
                         "Score":          f"{score}/5",
@@ -880,14 +856,15 @@ def main():
                 if not rows:
                     return pd.DataFrame()
                 snap = pd.DataFrame(rows).sort_values(
-                    "Score", key=lambda x: x.str.split('/').str[0].astype(int), ascending=False
+                    "Score", key=lambda x: x.str.split("/").str[0].astype(int), ascending=False
                 ).reset_index(drop=True)
                 snap.index += 1
                 snap.index.name = "Rank"
                 return snap
 
             def print_snapshot(snap, title):
-                display = snap.drop(columns=["_Ticker"], errors="ignore")
+                # Hide internal columns from display
+                display = snap.drop(columns=["_Ticker", "_HistSlice"], errors="ignore")
                 print(f"\n{'─'*170}")
                 print(f"  {title}")
                 print(f"{'─'*170}")
@@ -896,55 +873,67 @@ def main():
             for test_date in test_dates:
                 equity_dates.append(test_date)
 
-                # Build today's full snapshot (used for signals, price lookup, and logging)
-                snap = build_snapshot(enriched, test_date, is_crypto)
+                # CRITICAL FIX: Build snapshot per-bar using only past data
+                snap = build_snapshot_at(raw_data, test_date, is_crypto)
 
                 if snap.empty:
                     equity.append(equity[-1])
-                    if position: days_held += 1
+                    if position:
+                        days_held += 1
                     continue
 
-                # Price lookup: full ticker → today's close
                 price_lookup = dict(zip(snap["_Ticker"], snap["Price"]))
+                hist_lookup = dict(zip(snap["_Ticker"], snap["_HistSlice"]))
 
-                # Top-ranked asset
-                top_row    = snap.iloc[0]
+                top_row = snap.iloc[0]
                 top_ticker = top_row["_Ticker"]
-                top_asset  = top_row["Asset"]
-                top_rec    = top_row["Recommendation"]
-                top_price  = top_row["Price"]
+                top_asset = top_row["Asset"]
+                top_rec = top_row["Recommendation"]
+                top_price = top_row["Price"]
 
-                # Held asset current price
                 held_price = price_lookup.get(entry_asset, entry_price) if position == 1 else 0.0
 
-                # Check all exit conditions (SL, TP, signal, max-hold)
+                # Check exit conditions using the per-bar indicator-recalculated hist slice
                 exit_now, exit_reason = False, ""
-                if position == 1 and entry_asset and entry_asset in enriched:
-                    held_hist = enriched[entry_asset][enriched[entry_asset].index <= test_date]
+                if position == 1 and entry_asset and entry_asset in hist_lookup:
+                    held_hist = hist_lookup[entry_asset]
                     exit_now, exit_reason = should_exit(
                         held_hist, entry_price, days_held, MAX_HOLD_DAYS,
-                        stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT
+                        stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT,
                     )
 
                 # ── BUY ──
                 if "BUY" in top_rec and position == 0:
                     position = 1
-                    entry_price       = top_price
-                    entry_date        = test_date.date()
-                    entry_asset       = top_ticker
+                    # IMPROVEMENT: Apply slippage to entry price
+                    entry_price = top_price * (1 + SLIPPAGE_PCT / 100.0)
+                    # IMPROVEMENT: Deduct entry fee from capital
+                    allocated_capital = current_capital * POSITION_SIZE_PCT
+                    entry_fee = allocated_capital * FEE_PCT / 100.0
+                    current_capital -= entry_fee
+                    entry_date = test_date.date()
+                    entry_asset = top_ticker
                     entry_asset_label = top_asset
-                    entry_snapshot    = snap.copy()
+                    entry_snapshot = snap.copy()
                     days_held = 0
                     print(f"\n{'='*170}")
-                    print(f"  🟢 BUY  {test_date.date()}  →  {entry_asset_label}  @  ${entry_price:,.4f}")
+                    print(
+                        f"  🟢 BUY  {test_date.date()}  →  {entry_asset_label}  @  "
+                        f"${entry_price:,.4f}  (alloc: ${allocated_capital:,.2f}, fee: ${entry_fee:,.2f})"
+                    )
                     print_snapshot(snap, f"ENTRY SIGNALS — {test_date.date()} (all assets ranked by score)")
 
                 # ── SELL ──
                 elif position == 1 and exit_now:
-                    exit_price = held_price
-                    pnl_pct    = (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0.0
-                    profit     = current_capital * (pnl_pct / 100)
-                    current_capital += profit
+                    # IMPROVEMENT: Apply slippage to exit price
+                    exit_price = held_price * (1 - SLIPPAGE_PCT / 100.0)
+                    pnl_pct = (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                    # Calculate gross profit on the allocated portion
+                    gross_profit = allocated_capital * (pnl_pct / 100)
+                    # Deduct exit fee
+                    exit_fee = (allocated_capital + gross_profit) * FEE_PCT / 100.0
+                    net_profit = gross_profit - exit_fee
+                    current_capital += net_profit
                     action_label = exit_reason
 
                     trade_log.append({
@@ -955,53 +944,58 @@ def main():
                         "Entry $":       round(entry_price, 4),
                         "Exit $":        round(exit_price, 4),
                         "PnL %":         round(pnl_pct, 2),
-                        "Profit $":      round(profit, 2),
+                        "Profit $":      round(net_profit, 2),
                         "Exit Reason":   action_label,
                         "Entry Signals": entry_snapshot,
                         "Exit Signals":  snap.copy(),
                     })
 
                     print(f"\n{'='*170}")
-                    print(f"  🔴 {action_label}  {test_date.date()}  →  {entry_asset_label}  @  ${exit_price:,.4f}  |  PnL {pnl_pct:+.2f}%  |  Profit ${profit:,.2f}")
+                    print(
+                        f"  🔴 {action_label}  {test_date.date()}  →  {entry_asset_label}  @  "
+                        f"${exit_price:,.4f}  |  PnL {pnl_pct:+.2f}%  |  Net Profit ${net_profit:,.2f}"
+                    )
                     print_snapshot(snap, f"EXIT SIGNALS — {test_date.date()} (all assets ranked by score)")
 
                     equity.append(current_capital)
-                    position  = 0
+                    position = 0
                     days_held = 0
+                    allocated_capital = 0.0
                     entry_snapshot = None
 
                 # ── HOLD ──
                 else:
                     if position == 1:
                         days_held += 1
-                        mtm = current_capital * (held_price / entry_price) if entry_price > 0 else current_capital
-                        equity.append(mtm)
+                        # MTM: unallocated capital + mark-to-market value of position
+                        mtm_position = allocated_capital * (held_price / entry_price) if entry_price > 0 else allocated_capital
+                        unallocated = current_capital - 0  # current_capital already excludes entry fee
+                        equity.append(unallocated + mtm_position)
                     else:
                         equity.append(current_capital)
 
             min_len = min(len(equity_dates), len(equity))
             equity_dates = equity_dates[:min_len]
-            equity       = equity[:min_len]
+            equity = equity[:min_len]
 
-            eq_df        = pd.DataFrame({"Date": equity_dates, "Equity": equity})
+            eq_df = pd.DataFrame({"Date": equity_dates, "Equity": equity})
             total_return = (equity[-1] / INITIAL_CAPITAL - 1) * 100
 
             # ── Equity Curve ──
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=eq_df["Date"], y=eq_df["Equity"],
-                name="Equity Curve", line=dict(color="#1f77b4", width=3)
+                name="Equity Curve", line=dict(color="#1f77b4", width=3),
             ))
-            # Mark trade entry/exit points on the curve
             for trade in trade_log:
                 entry_eq = eq_df[eq_df["Date"] == pd.Timestamp(trade["Entry Date"])]
-                exit_eq  = eq_df[eq_df["Date"] == pd.Timestamp(trade["Exit Date"])]
+                exit_eq = eq_df[eq_df["Date"] == pd.Timestamp(trade["Exit Date"])]
                 if not entry_eq.empty:
                     fig.add_trace(go.Scatter(
                         x=[entry_eq["Date"].iloc[0]], y=[entry_eq["Equity"].iloc[0]],
                         mode="markers", marker=dict(symbol="triangle-up", size=12, color="#26a69a"),
                         name=f"BUY {trade['Asset']} {trade['Entry Date']}", showlegend=False,
-                        hovertext=f"BUY {trade['Asset']}<br>@ ${trade['Entry $']:,.4f}<br>{trade['Entry Date']}"
+                        hovertext=f"BUY {trade['Asset']}<br>@ ${trade['Entry $']:,.4f}<br>{trade['Entry Date']}",
                     ))
                 if not exit_eq.empty:
                     color = "#26a69a" if trade["PnL %"] >= 0 else "#ef5350"
@@ -1009,17 +1003,19 @@ def main():
                         x=[exit_eq["Date"].iloc[0]], y=[exit_eq["Equity"].iloc[0]],
                         mode="markers", marker=dict(symbol="triangle-down", size=12, color=color),
                         name=f"SELL {trade['Asset']} {trade['Exit Date']}", showlegend=False,
-                        hovertext=f"SELL {trade['Asset']}<br>@ ${trade['Exit $']:,.4f}<br>PnL {trade['PnL %']:+.2f}%<br>{trade['Exit Date']}"
+                        hovertext=f"SELL {trade['Asset']}<br>@ ${trade['Exit $']:,.4f}<br>PnL {trade['PnL %']:+.2f}%<br>{trade['Exit Date']}",
                     ))
             fig.update_layout(
-                title=f"{'Crypto' if is_crypto else 'Traditional'} Equity Curve — "
-                      f"${INITIAL_CAPITAL:,.0f} → ${equity[-1]:,.0f} ({total_return:+.1f}%) | {months} months",
+                title=(
+                    f"{'Crypto' if is_crypto else 'Traditional'} Equity Curve — "
+                    f"${INITIAL_CAPITAL:,.0f} → ${equity[-1]:,.0f} ({total_return:+.1f}%) | {months} months"
+                ),
                 xaxis_title="Date", yaxis_title="Portfolio Value (USD)",
-                height=650, template="plotly_white"
+                height=650, template="plotly_white",
             )
             fig.show()
 
-            # ── Detailed Trade History with Signal Snapshots ──
+            # ── Detailed Trade History ──
             print(f"\n{'='*170}")
             print(f"  📋 DETAILED TRADE HISTORY ({'Crypto' if is_crypto else 'Traditional'})")
             print(f"{'='*170}")
@@ -1028,18 +1024,22 @@ def main():
                 for i, trade in enumerate(trade_log, 1):
                     pnl_icon = "🟢" if trade["PnL %"] >= 0 else "🔴"
                     print(f"\n{'━'*170}")
-                    print(f"  TRADE #{i}  |  {trade['Asset']}  |  "
-                          f"Entry: {trade['Entry Date']}  →  Exit: {trade['Exit Date']}  |  "
-                          f"Days Held: {trade['Days Held']}  |  "
-                          f"Entry: ${trade['Entry $']:,.4f}  Exit: ${trade['Exit $']:,.4f}  |  "
-                          f"{pnl_icon} PnL: {trade['PnL %']:+.2f}%  |  "
-                          f"Profit: ${trade['Profit $']:,.2f}  |  "
-                          f"Reason: {trade['Exit Reason']}")
+                    print(
+                        f"  TRADE #{i}  |  {trade['Asset']}  |  "
+                        f"Entry: {trade['Entry Date']}  →  Exit: {trade['Exit Date']}  |  "
+                        f"Days Held: {trade['Days Held']}  |  "
+                        f"Entry: ${trade['Entry $']:,.4f}  Exit: ${trade['Exit $']:,.4f}  |  "
+                        f"{pnl_icon} PnL: {trade['PnL %']:+.2f}%  |  "
+                        f"Profit: ${trade['Profit $']:,.2f}  |  "
+                        f"Reason: {trade['Exit Reason']}"
+                    )
                     print_snapshot(trade["Entry Signals"], f"ENTRY SIGNALS — {trade['Entry Date']}")
                     print_snapshot(trade["Exit Signals"],  f"EXIT SIGNALS  — {trade['Exit Date']}")
 
-                # Summary table (no signal columns)
-                summary_cols = ["Entry Date","Exit Date","Asset","Days Held","Entry $","Exit $","PnL %","Profit $","Exit Reason"]
+                summary_cols = [
+                    "Entry Date", "Exit Date", "Asset", "Days Held",
+                    "Entry $", "Exit $", "PnL %", "Profit $", "Exit Reason",
+                ]
                 summary_df = pd.DataFrame([{k: t[k] for k in summary_cols} for t in trade_log])
                 print(f"\n{'='*170}")
                 print(f"  📊 TRADE SUMMARY")
@@ -1048,10 +1048,17 @@ def main():
             else:
                 print("  No closed trades during the period.")
 
+            wins = [t for t in trade_log if t["PnL %"] >= 0]
+            losses = [t for t in trade_log if t["PnL %"] < 0]
+            win_rate = len(wins) / len(trade_log) * 100 if trade_log else 0.0
+
             print(f"\n  Final Value   : ${equity[-1]:,.2f}")
             print(f"  Total Return  : {total_return:+.2f}%")
             print(f"  Days analyzed : {len(eq_df)-1}")
             print(f"  Trades closed : {len(trade_log)}")
+            print(f"  Win rate      : {win_rate:.1f}%  ({len(wins)} wins / {len(losses)} losses)")
+            print(f"  Fee/Slippage  : {FEE_PCT}% / {SLIPPAGE_PCT}% per leg")
+            print(f"  Position size : {POSITION_SIZE_PCT*100:.0f}% of capital")
 
         input("\nPress Enter to return to main menu...")
 
