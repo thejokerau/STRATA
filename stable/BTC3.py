@@ -15,6 +15,16 @@ print("🚀 Crypto & Traditional Risk Dashboard (Consistent Flow v36)\n")
 # ====================== DATABASE ======================
 conn = sqlite3.connect("crypto_data.db")
 
+def ensure_table():
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS price_data (
+        ticker TEXT, date TEXT,
+        open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+        PRIMARY KEY (ticker, date)
+    )
+    """)
+    conn.commit()
+
 def reset_table():
     conn.execute("DROP TABLE IF EXISTS price_data")
     conn.execute("""
@@ -26,7 +36,7 @@ def reset_table():
     """)
     conn.commit()
 
-reset_table()
+ensure_table()
 
 COINGECKO_KEY = ""
 
@@ -65,7 +75,8 @@ def fetch_from_binance(ticker):
         open_times = [row[0] for row in data]
         df.index = pd.to_datetime(open_times, unit='ms')
         return validate_and_clean(df, ticker)
-    except:
+    except Exception as e:
+        print(f"   ⚠️ Binance failed for {ticker}: {e}")
         return None
 
 # ====================== CACHE ======================
@@ -139,7 +150,8 @@ def fetch_top_coins(n):
         tickers = [f"{coin['symbol'].upper()}-USD" for coin in r.json() 
                   if coin.get('symbol','').upper() not in ["USDT","USDC","DAI","FDUSD","TUSD","USDE","BUSD"]]
         print(f"✅ Got {len(tickers)} valid tickers.")
-    except:
+    except Exception as e:
+        print(f"   ⚠️ CoinGecko fetch failed: {e}")
         tickers = []
     MAJOR = ["BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD","DOGE-USD","TON-USD","ADA-USD","TRX-USD","AVAX-USD"]
     final = tickers[:n]
@@ -334,7 +346,7 @@ def main():
         try:
             init_input = input(f"\nInitial Capital USD (default 10000): $").strip()
             INITIAL_CAPITAL = float(init_input) if init_input else 10000.0
-        except:
+        except ValueError:
             INITIAL_CAPITAL = 10000.0
         print(f"Using Initial Capital: ${INITIAL_CAPITAL:,.2f}\n")
 
@@ -680,6 +692,7 @@ def main():
                     rows.append({
                         "Asset":          t.replace("-USD", "") if is_crypto else t,
                         "_Ticker":        t,               # internal key, hidden in display
+                        "_PriceRaw":      float(current),  # full precision for backtest math
                         "Action":         action,
                         "Recommendation": score_to_rec(score),
                         "Score":          f"{score}/5",
@@ -701,7 +714,8 @@ def main():
                 return snap
 
             def print_snapshot(snap, title):
-                display = snap.drop(columns=["_Ticker"], errors="ignore")
+                hidden_cols = [c for c in snap.columns if c.startswith("_")]
+                display = snap.drop(columns=hidden_cols, errors="ignore")
                 print(f"\n{'─'*170}")
                 print(f"  {title}")
                 print(f"{'─'*170}")
@@ -719,14 +733,14 @@ def main():
                     continue
 
                 # Price lookup: full ticker → today's close
-                price_lookup = dict(zip(snap["_Ticker"], snap["Price"]))
+                price_lookup = dict(zip(snap["_Ticker"], snap["_PriceRaw"]))
 
                 # Top-ranked asset
                 top_row    = snap.iloc[0]
                 top_ticker = top_row["_Ticker"]
                 top_asset  = top_row["Asset"]
                 top_rec    = top_row["Recommendation"]
-                top_price  = top_row["Price"]
+                top_price  = top_row["_PriceRaw"]
 
                 # Held asset current price
                 held_price = price_lookup.get(entry_asset, entry_price) if position == 1 else 0.0
