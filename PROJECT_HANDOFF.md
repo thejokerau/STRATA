@@ -58,6 +58,8 @@
   - handles all-pruned Optuna runs by safely reverting to base config
 - Added post-tune drawdown guard in main flow:
   - if final-window DD breaches target, runs one constrained re-tune attempt and adopts it when risk/return improves
+- Fixed live action label rendering artifact:
+  - replaced hard-coded `??` labels with Unicode-escaped circle markers (`🟢/🟠/🔴`) to avoid source-encoding corruption
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -73,6 +75,7 @@
 - Hard constraints are now active for optimization folds; final full-window backtest can still exceed constraints if market regime shifts after tuning.
 - Live setup reliability statistics are heuristic and sample-size-sensitive for thin-history assets/timeframes.
 - Correlation-based live diversification notes use recent rolling history and may change quickly across volatile regimes.
+- Some terminals/fonts may still not render emoji markers even when source encoding is correct.
 
 ## Run / Validate
 - Syntax check:

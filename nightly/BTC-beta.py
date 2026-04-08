@@ -753,11 +753,13 @@ def score_to_rec(score: int, tuned: TunedParams) -> str:
 
 
 def action_emoji(rec: str) -> str:
+    # Use Unicode escapes (ASCII-safe source) so symbols are preserved across editors.
+    # Terminal/font support still affects rendering, but this avoids hard-coded "??" artifacts.
     if rec in ["BUY", "STRONG BUY"]:
-        return "?? BUY"
+        return "\U0001F7E2 BUY"   # green circle
     if rec == "SELL":
-        return "?? SELL"
-    return "?? HOLD"
+        return "\U0001F534 SELL"  # red circle
+    return "\U0001F7E0 HOLD"      # orange circle
 
 
 def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned: TunedParams, timeframe: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
