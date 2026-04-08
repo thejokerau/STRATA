@@ -28,7 +28,7 @@ def reset_table():
 
 reset_table()
 
-COINGECKO_KEY = "CG-bYEnN8RhYBJiP9JBahcJAp6f"
+COINGECKO_KEY = ""
 
 # ====================== VALIDATION ======================
 def validate_and_clean(df, ticker):
