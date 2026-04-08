@@ -60,6 +60,9 @@ python nightly/BTC-beta.py
 - Dynamic Fibonacci swing detection with support/resistance guards
 - ATR/ADX/OBV/CMF risk-scoring integration
 - Walk-forward auto-tuning with Optuna
+- Hard risk constraints in tuning:
+  - validation fold drawdown constraint (trials are pruned when exceeded)
+  - position-size search bounded by configured max exposure
 - CPU parallelism:
   - Indicator cache build worker selection
   - Optuna trial parallel jobs
@@ -68,6 +71,7 @@ python nightly/BTC-beta.py
 - Backtest churn controls:
   - `min_hold_bars` before signal exits
   - `cooldown_bars` after exits
+  - same-asset re-entry cooldown bars
 
 ## Notes
 

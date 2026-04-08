@@ -34,6 +34,9 @@
   - drawdown penalty (`max_drawdown_limit_pct`)
   - exposure penalty (`max_exposure_pct`)
   - turnover penalty
+- Upgraded optimizer risk controls to hard constraints:
+  - validation-fold drawdown breaches are now pruned (`optuna.TrialPruned`)
+  - position-size search upper bound now respects configured max exposure
 - Added explicit train/validate/test split for auto-tune flow:
   - walk-forward optimization on pre-holdout history
   - final holdout summary on most recent window
@@ -51,6 +54,7 @@
 - CUDA path currently accelerates only a small numeric hotspot; most workload remains CPU/pandas-bound.
 - Walk-forward objective uses a no-trade penalty heuristic; may need tuning depending on strategy goals.
 - Current ranking remains single-position top-asset rotation; portfolio-level multi-asset allocation is not yet implemented.
+- Hard constraints are now active for optimization folds; final full-window backtest can still exceed constraints if market regime shifts after tuning.
 
 ## Run / Validate
 - Syntax check:

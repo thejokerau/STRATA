@@ -1192,8 +1192,9 @@ def run_walk_forward_optuna(
     optimize_end = holdout_start - pd.Timedelta(seconds=1)
 
     def objective(trial: "optuna.Trial") -> float:
+        max_pos = float(np.clip(base_cfg.max_exposure_pct, 0.20, 0.40))
         tuned = TunedParams(
-            position_size=trial.suggest_float("position_size", 0.20, 0.40),
+            position_size=trial.suggest_float("position_size", 0.20, max_pos),
             atr_multiplier=trial.suggest_float("atr_multiplier", 2.0, 2.5),
             adx_threshold=trial.suggest_float("adx_threshold", 20.0, 30.0),
             cmf_threshold=trial.suggest_float("cmf_threshold", -0.02, 0.10),
@@ -1247,7 +1248,11 @@ def run_walk_forward_optuna(
             else:
                 fold_returns.append(float(res["return_pct"]))
                 m = res.get("metrics", {})
-                fold_dd.append(float(m.get("max_drawdown_pct", 100.0)))
+                this_dd = float(m.get("max_drawdown_pct", 100.0))
+                # Hard risk constraint: reject any trial breaching drawdown limit.
+                if this_dd > cfg.max_drawdown_limit_pct:
+                    raise optuna.TrialPruned(f"Validation drawdown {this_dd:.2f}% > limit {cfg.max_drawdown_limit_pct:.2f}%")
+                fold_dd.append(this_dd)
                 fold_turnover.append(float(m.get("turnover_per_year", 0.0)))
             cursor += pd.Timedelta(days=val_days)
 
@@ -1259,12 +1264,11 @@ def run_walk_forward_optuna(
         mean_dd = float(np.mean(fold_dd)) if fold_dd else 100.0
         mean_turnover = float(np.mean(fold_turnover)) if fold_turnover else 0.0
 
-        # Objective: reward return stability, penalize excessive drawdown/exposure/churn.
+        # Objective: reward return stability and moderate churn.
+        # Drawdown/exposure are enforced as hard constraints.
         score = mean_ret - 0.4 * std_ret
-        dd_penalty = max(0.0, mean_dd - cfg.max_drawdown_limit_pct) * 1.2
-        exposure_penalty = max(0.0, (cfg.tuned.position_size - cfg.max_exposure_pct) * 100.0) * 2.0
         turnover_penalty = max(0.0, mean_turnover - 40.0) * 0.05
-        return score - dd_penalty - exposure_penalty - turnover_penalty
+        return score - turnover_penalty
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, n_jobs=max(1, int(n_jobs)), show_progress_bar=False)
@@ -1308,6 +1312,12 @@ def run_walk_forward_optuna(
         verbose=False,
     )
     hm = holdout.get("metrics", {})
+    holdout_dd = float(hm.get("max_drawdown_pct", 0.0))
+    if holdout_dd > out.max_drawdown_limit_pct:
+        print(
+            f"WARNING: Best tuned params failed holdout drawdown constraint "
+            f"({holdout_dd:.2f}% > {out.max_drawdown_limit_pct:.2f}%)."
+        )
     print(
         "Holdout test summary "
         f"({holdout_start.date()} to {all_dates[-1].date()}): "
