@@ -15,6 +15,16 @@ print("🚀 Crypto & Traditional Risk Dashboard (Robust v37)\n")
 # ====================== DATABASE ======================
 conn = sqlite3.connect("crypto_data.db")
 
+def ensure_table():
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS price_data (
+        ticker TEXT, date TEXT,
+        open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+        PRIMARY KEY (ticker, date)
+    )
+    """)
+    conn.commit()
+
 def reset_table():
     conn.execute("DROP TABLE IF EXISTS price_data")
     conn.execute("""
@@ -26,7 +36,7 @@ def reset_table():
     """)
     conn.commit()
 
-reset_table()
+ensure_table()
 
 COINGECKO_KEY = ""
 
@@ -75,7 +85,8 @@ def fetch_from_binance(ticker):
         # FIX: Use open_time column values (milliseconds) for index, not RangeIndex
         df.index = pd.to_datetime(open_times, unit="ms", utc=True).tz_localize(None).normalize()
         return validate_and_clean(df, ticker)
-    except Exception:
+    except Exception as e:
+        print(f"   ⚠️ Binance failed for {ticker}: {e}")
         return None
 
 # ====================== CACHE ======================
@@ -189,7 +200,8 @@ def fetch_top_coins(n):
             not in ["USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "BUSD"]
         ]
         print(f"✅ Got {len(tickers)} valid tickers.")
-    except Exception:
+    except Exception as e:
+        print(f"   ⚠️ CoinGecko fetch failed: {e}")
         tickers = []
     MAJOR = [
         "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
@@ -444,7 +456,7 @@ def main():
         try:
             init_input = input(f"\nInitial Capital USD (default 10000): $").strip()
             INITIAL_CAPITAL = float(init_input) if init_input else 10000.0
-        except Exception:
+        except ValueError:
             INITIAL_CAPITAL = 10000.0
         print(f"Using Initial Capital: ${INITIAL_CAPITAL:,.2f}\n")
 
@@ -841,6 +853,7 @@ def main():
                     rows.append({
                         "Asset":          t.replace("-USD", "") if is_crypto else t,
                         "_Ticker":        t,
+                        "_PriceRaw":      float(current),
                         "_HistSlice":     hist,  # stored internally for exit checks
                         "Action":         action,
                         "Recommendation": score_to_rec(score),
@@ -864,7 +877,8 @@ def main():
 
             def print_snapshot(snap, title):
                 # Hide internal columns from display
-                display = snap.drop(columns=["_Ticker", "_HistSlice"], errors="ignore")
+                hidden_cols = [c for c in snap.columns if c.startswith("_")]
+                display = snap.drop(columns=hidden_cols, errors="ignore")
                 print(f"\n{'─'*170}")
                 print(f"  {title}")
                 print(f"{'─'*170}")
@@ -882,14 +896,14 @@ def main():
                         days_held += 1
                     continue
 
-                price_lookup = dict(zip(snap["_Ticker"], snap["Price"]))
+                price_lookup = dict(zip(snap["_Ticker"], snap["_PriceRaw"]))
                 hist_lookup = dict(zip(snap["_Ticker"], snap["_HistSlice"]))
 
                 top_row = snap.iloc[0]
                 top_ticker = top_row["_Ticker"]
                 top_asset = top_row["Asset"]
                 top_rec = top_row["Recommendation"]
-                top_price = top_row["Price"]
+                top_price = top_row["_PriceRaw"]
 
                 held_price = price_lookup.get(entry_asset, entry_price) if position == 1 else 0.0
 
