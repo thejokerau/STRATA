@@ -83,6 +83,11 @@ python nightly/BTC-beta.py
   - `cooldown_bars` after exits
   - same-asset re-entry cooldown bars
   - max consecutive same-asset entries
+- Action-label UI fallback:
+  - auto-detects terminal support for emoji and ANSI color
+  - falls back to plain text labels if unsupported
+  - optional env override: `CTMT_DISABLE_EMOJI=1`
+  - optional color controls: `NO_COLOR=1` or `FORCE_COLOR=1`
 
 ## Notes
 

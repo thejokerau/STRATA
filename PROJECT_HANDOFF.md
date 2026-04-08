@@ -60,6 +60,10 @@
   - if final-window DD breaches target, runs one constrained re-tune attempt and adopts it when risk/return improves
 - Fixed live action label rendering artifact:
   - replaced hard-coded `??` labels with Unicode-escaped circle markers (`🟢/🟠/🔴`) to avoid source-encoding corruption
+- Added terminal display fallback for action labels:
+  - auto-detect emoji and ANSI-color capability at runtime
+  - colorized labels when supported, plain text fallback otherwise
+  - env overrides: `CTMT_DISABLE_EMOJI`, `NO_COLOR`, `FORCE_COLOR`
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`

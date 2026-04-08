@@ -102,6 +102,61 @@ CUDA_AVAILABLE = False
 CUDA_BACKEND = "cpu"
 cp = None
 _BINANCE_SPOT_SYMBOLS: Optional[set] = None
+EMOJI_ENABLED = True
+COLOR_ENABLED = False
+
+
+def _enable_windows_vt_mode() -> bool:
+    """
+    Enable ANSI escape support on modern Windows terminals when possible.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        if handle == 0 or handle == -1:
+            return False
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if kernel32.SetConsoleMode(handle, new_mode) == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def detect_terminal_display_capabilities() -> Tuple[bool, bool]:
+    """
+    Determine whether emoji and ANSI colors should be used in action labels.
+    - Honors NO_COLOR and FORCE_COLOR env conventions.
+    - Allows explicit emoji override via CTMT_DISABLE_EMOJI.
+    """
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    no_color = os.getenv("NO_COLOR") is not None
+    force_color = os.getenv("FORCE_COLOR") is not None
+    disable_emoji = os.getenv("CTMT_DISABLE_EMOJI", "").strip().lower() in {"1", "true", "yes", "y"}
+
+    emoji_ok = ("utf" in enc) and (not disable_emoji)
+
+    ansi_ok = False
+    if is_tty and not no_color:
+        if force_color:
+            ansi_ok = True
+        else:
+            term = (os.getenv("TERM", "") or "").lower()
+            wt_session = os.getenv("WT_SESSION") is not None
+            conemu = os.getenv("ConEmuANSI", "").upper() == "ON"
+            ansicon = os.getenv("ANSICON") is not None
+            ansi_ok = bool(term and term != "dumb") or wt_session or conemu or ansicon
+        if ansi_ok:
+            ansi_ok = _enable_windows_vt_mode()
+    return emoji_ok, ansi_ok
 
 
 def detect_cuda_backend() -> Tuple[bool, str, Optional[object]]:
@@ -753,13 +808,23 @@ def score_to_rec(score: int, tuned: TunedParams) -> str:
 
 
 def action_emoji(rec: str) -> str:
-    # Use Unicode escapes (ASCII-safe source) so symbols are preserved across editors.
-    # Terminal/font support still affects rendering, but this avoids hard-coded "??" artifacts.
     if rec in ["BUY", "STRONG BUY"]:
-        return "\U0001F7E2 BUY"   # green circle
-    if rec == "SELL":
-        return "\U0001F534 SELL"  # red circle
-    return "\U0001F7E0 HOLD"      # orange circle
+        base = "BUY"
+        emoji = "\U0001F7E2"
+        color = "\x1b[92m"
+    elif rec == "SELL":
+        base = "SELL"
+        emoji = "\U0001F534"
+        color = "\x1b[91m"
+    else:
+        base = "HOLD"
+        emoji = "\U0001F7E0"
+        color = "\x1b[93m"
+
+    label = f"{emoji} {base}" if EMOJI_ENABLED else base
+    if COLOR_ENABLED:
+        return f"{color}{label}\x1b[0m"
+    return label
 
 
 def build_live_tables(enriched: Dict[str, pd.DataFrame], is_crypto: bool, tuned: TunedParams, timeframe: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1712,10 +1777,13 @@ def prompt_cpu_workers(label: str) -> int:
 
 
 def main() -> None:
-    global CUDA_AVAILABLE, CUDA_BACKEND, cp
+    global CUDA_AVAILABLE, CUDA_BACKEND, cp, EMOJI_ENABLED, COLOR_ENABLED
     ensure_table()
     CUDA_AVAILABLE, CUDA_BACKEND, cp = detect_cuda_backend()
+    EMOJI_ENABLED, COLOR_ENABLED = detect_terminal_display_capabilities()
     print(f"Runtime acceleration backend: {CUDA_BACKEND}")
+    display_mode = "emoji+color" if (EMOJI_ENABLED and COLOR_ENABLED) else ("emoji" if EMOJI_ENABLED else ("color" if COLOR_ENABLED else "plain-text"))
+    print(f"Action label display mode: {display_mode}")
 
     while True:
         print("\n" + "=" * 100)
