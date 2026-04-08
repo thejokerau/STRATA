@@ -25,6 +25,19 @@ try:
 except Exception:
     pass
 
+# Python runtime policy:
+# - Enforce minimum Python 3.13
+# - Advise that the primary tested target is Python 3.13.x
+if sys.version_info < (3, 13):
+    raise SystemExit(
+        f"Python 3.13+ is required. Current: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+if sys.version_info[:2] != (3, 13):
+    print(
+        f"Note: This script is tested primarily on Python 3.13.x. "
+        f"Current runtime is {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}."
+    )
+
 print("Crypto & Traditional Risk Dashboard (Nightly Quant)")
 
 DB_PATH = "crypto_data.db"
