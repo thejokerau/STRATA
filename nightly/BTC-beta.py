@@ -2261,15 +2261,36 @@ def print_ai_profiles(prefs: Dict[str, object]) -> None:
     if not isinstance(profiles, dict) or not profiles:
         print("No AI profiles configured.")
         return
-    print("Configured AI profiles:")
-    for name, p in profiles.items():
+    print("Available AI profiles:")
+    for idx, (name, p) in enumerate(profiles.items(), start=1):
         if not isinstance(p, dict):
             continue
         mark = "*" if name == active else " "
         provider = str(p.get("provider", ""))
         model = str(p.get("model", ""))
         endpoint = str(p.get("endpoint", ""))
-        print(f"{mark} {name}: provider={provider}, model={model}, endpoint={endpoint}")
+        print(f"{mark} [{idx}] {name}  |  {provider}  |  {model}")
+        print(f"      endpoint: {endpoint}")
+
+
+def choose_profile_name(prefs: Dict[str, object], prompt: str) -> Optional[str]:
+    profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+    if not isinstance(profiles, dict) or not profiles:
+        print("No profiles available.")
+        return None
+    names = list(profiles.keys())
+    print_ai_profiles(prefs)
+    raw = input(prompt).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        i = int(raw)
+        if 1 <= i <= len(names):
+            return names[i - 1]
+    if raw in profiles:
+        return raw
+    print("Profile not found.")
+    return None
 
 
 def configure_ai_profile(prefs: Dict[str, object], secrets: Dict[str, str]) -> Tuple[Dict[str, object], Dict[str, str]]:
@@ -2408,22 +2429,33 @@ def run_ai_provider_settings_menu() -> None:
     secrets = load_ai_secrets()
     while True:
         print("\n" + "=" * 100)
-        print("AI PROVIDER SETTINGS")
+        print("AI SETTINGS")
         print("=" * 100)
         active_name, active_profile = get_active_ai_profile(prefs)
         key_val, key_source = resolve_profile_api_key(active_profile, secrets)
+        provider = str(active_profile.get("provider", "")).strip()
+        model = str(active_profile.get("model", "")).strip()
+        key_status = "configured" if key_val else "missing"
+        if key_source.startswith("env:"):
+            key_hint = f"from environment variable ({key_source.split(':', 1)[1]})"
+        elif key_source.startswith("prefs:"):
+            key_hint = "from secure local storage"
+        else:
+            key_hint = "not set"
         print(
-            f"Active profile: {active_name} | provider={active_profile.get('provider', '')} | "
-            f"model={active_profile.get('model', '')} | key={'set' if key_val else 'missing'} ({key_source})"
+            f"Current profile: {active_name}\n"
+            f"Provider: {provider}\n"
+            f"Model: {model}\n"
+            f"API key: {key_status} ({key_hint})"
         )
-        print("1. List profiles")
-        print("2. Quick-start preset profile")
-        print("3. Create/Update custom profile")
-        print("4. Set active profile")
-        print("5. Remove profile")
-        print("6. Set/Replace API key for profile")
-        print("7. Remove API key for profile")
-        print("8. Test active profile")
+        print("1. View profiles")
+        print("2. Add quick-start profile")
+        print("3. Create or edit custom profile")
+        print("4. Switch active profile")
+        print("5. Delete a profile")
+        print("6. Set or replace profile API key")
+        print("7. Remove profile API key")
+        print("8. Test active profile connection")
         print("9. Back")
 
         ch = (input("Enter 1-9: ").strip() or "9")
@@ -2452,32 +2484,24 @@ def run_ai_provider_settings_menu() -> None:
             print("Profile saved.")
             continue
         if ch == "4":
-            print_ai_profiles(prefs)
-            name = input("Enter profile name to activate: ").strip()
-            if name in profiles:
+            name = choose_profile_name(prefs, "Enter profile number or name to activate: ")
+            if name and name in profiles:
                 prefs["active_profile"] = name
                 save_ai_preferences(prefs)
                 print(f"Active profile set to `{name}`.")
-            else:
-                print("Profile not found.")
             continue
         if ch == "5":
-            print_ai_profiles(prefs)
-            name = input("Enter profile name to remove: ").strip()
-            if name in profiles:
+            name = choose_profile_name(prefs, "Enter profile number or name to delete: ")
+            if name and name in profiles:
                 del profiles[name]
                 if str(prefs.get("active_profile", "")) == name:
                     prefs["active_profile"] = next(iter(profiles.keys()), "")
                 save_ai_preferences(prefs)
                 print(f"Removed profile `{name}`.")
-            else:
-                print("Profile not found.")
             continue
         if ch == "6":
-            print_ai_profiles(prefs)
-            name = input("Enter profile name for API key: ").strip()
-            if name not in profiles or not isinstance(profiles[name], dict):
-                print("Profile not found.")
+            name = choose_profile_name(prefs, "Enter profile number or name for API key update: ")
+            if not name or name not in profiles or not isinstance(profiles[name], dict):
                 continue
             key = getpass.getpass("Enter API key (input hidden): ").strip()
             if not key:
@@ -2491,10 +2515,8 @@ def run_ai_provider_settings_menu() -> None:
             print(f"Stored API key for profile `{name}`.")
             continue
         if ch == "7":
-            print_ai_profiles(prefs)
-            name = input("Enter profile name to clear stored API key: ").strip()
-            if name not in profiles or not isinstance(profiles[name], dict):
-                print("Profile not found.")
+            name = choose_profile_name(prefs, "Enter profile number or name to remove stored API key: ")
+            if not name or name not in profiles or not isinstance(profiles[name], dict):
                 continue
             key_name = str(profiles[name].get("api_key_name", name)).strip() or name
             if key_name in secrets:
