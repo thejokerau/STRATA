@@ -88,6 +88,10 @@ python nightly/BTC-beta.py
   - falls back to plain text labels if unsupported
   - optional env override: `CTMT_DISABLE_EMOJI=1`
   - optional color controls: `NO_COLOR=1` or `FORCE_COLOR=1`
+- Built-in Grok analysis mode:
+  - paste full raw dashboard text and generate a Grok-ready analysis prompt
+  - optional direct xAI API call and response capture
+  - saves prompt/response artifacts under `experiments/grok/`
 
 ## Notes
 
@@ -144,3 +148,29 @@ When a match is found, the script shows champion metrics and prompts to apply:
 
 - Live mode: apply champion tuned parameters for scoring.
 - Backtest mode: replace entered settings with champion config.
+
+## Grok Dashboard Analysis Mode
+
+From nightly main menu select:
+
+- `4. Grok Dashboard Analysis`
+
+Flow:
+
+1. Enter date/time context (or accept default).
+2. Choose source:
+   - paste dashboard output manually, or
+   - use latest saved Live Dashboard snapshot.
+3. If pasting manually, enter `END` on a new line.
+4. Choose whether to send directly to xAI Grok API.
+
+Live snapshots are auto-saved every time Live Dashboard runs:
+
+- `experiments/live_snapshots/live_dashboard_<timestamp>.txt`
+- `experiments/live_snapshots/latest_live_dashboard.txt`
+
+Environment variables for direct API mode:
+
+- `XAI_API_KEY` (required for API call)
+- `CTMT_GROK_MODEL` (optional, default `grok-3-mini`)
+- `XAI_API_URL` (optional, default `https://api.x.ai/v1/chat/completions`)

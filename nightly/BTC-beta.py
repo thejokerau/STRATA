@@ -49,6 +49,9 @@ print("Crypto & Traditional Risk Dashboard (Nightly Quant)")
 DB_PATH = "crypto_data.db"
 COINGECKO_KEY = ""
 CHAMPION_REGISTRY_PATH = Path("experiments") / "registry" / "champions.json"
+GROK_OUTPUT_DIR = Path("experiments") / "grok"
+LIVE_SNAPSHOT_DIR = Path("experiments") / "live_snapshots"
+LATEST_LIVE_SNAPSHOT_PATH = LIVE_SNAPSHOT_DIR / "latest_live_dashboard.txt"
 
 TIMEFRAME_MENU = {
     "1": ("1d", "1d"),
@@ -107,6 +110,52 @@ cp = None
 _BINANCE_SPOT_SYMBOLS: Optional[set] = None
 EMOJI_ENABLED = True
 COLOR_ENABLED = False
+
+GROK_ANALYSIS_INSTRUCTION = """You are Grok, built by xAI — an expert quantitative crypto analyst with real-time tool access (web search, X/Twitter semantic & keyword search, price validation, etc.).
+
+Your job is to deeply analyze the provided LIVE DASHBOARD output (Crypto or Traditional) and deliver maximum actionable insight.
+
+INPUT:
+- The full raw dashboard text (including loading logs, LIVE DASHBOARD table, RISK SCORE BREAKDOWN, and PORTFOLIO CONTEXT).
+- Current date/time context: {datetime_context}.
+
+TASKS — perform ALL of them in order:
+
+1. Data Integrity & Accuracy Check
+   - Verify all prices, Fib levels, RSI, and key metrics against real-time market data (use tools if available).
+   - Flag any anomalies, delisted symbols, or inconsistencies.
+   - Confirm whether the dashboard output is realistic and well-calibrated for the chosen timeframe (4h / 12h / Daily).
+
+2. TLDR Insights
+   - Overall market tone (bullish / cautious / bearish).
+   - Top 2–3 standout assets and why.
+   - Major red flags or caution zones.
+   - How this snapshot compares to the previous one (if provided).
+
+3. Analytical + Technical + Social Rating (1–10 scale)
+   For the TOP 3 ranked assets AND the overall dashboard, give clear 1–10 scores with 1-sentence justification each:
+   - Analytical Score (quant scores, Setup Exp%, Win%, Risk Cone, Total Score quality)
+   - Technical Score (regime, Fib levels, RSI, Doji, trend strength, volume confirmation)
+   - Social / Narrative Score (real-time sentiment, X chatter, news catalysts, Fear & Greed alignment, institutional vs retail flows)
+   - Composite Conviction Score (average of the three, plus your final verdict)
+
+4. Social & Narrative Overlay
+   - Pull fresh X/Twitter sentiment, news, and on-chain narrative for the top assets (especially BUY/HOLD signals).
+   - Explain how social signals support or contradict the dashboard.
+   - Highlight any hidden catalysts or risks not visible in the numbers.
+
+5. Actionable Bottom Line
+   - Clear trading stance for the chosen timeframe (aggressive / opportunistic / defensive / wait).
+   - Position-sizing / risk advice tied to Avg Post-Entry DD% and Risk Cone.
+   - Suggested next steps (e.g., watch specific Fib levels, re-run on different timeframe, etc.).
+
+OUTPUT FORMAT — strictly follow this structure with clean headings and bullet points. Use markdown tables only when helpful. Be concise yet insightful. Always end with:
+
+"Would you like a deeper dive on any specific asset or a side-by-side comparison with the previous dashboard?"
+
+Now analyze this dashboard:
+{dashboard_text}
+"""
 
 
 def _enable_windows_vt_mode() -> bool:
@@ -1906,6 +1955,171 @@ def apply_champion_backtest_config(base_cfg: BacktestConfig, champion_entry: dic
     )
 
 
+def read_multiline_input_until_end() -> str:
+    print("Paste the FULL dashboard text. Type a new line with only END when finished:")
+    lines: List[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "END":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def compose_live_dashboard_snapshot_text(
+    table: pd.DataFrame,
+    risk: pd.DataFrame,
+    portfolio_notes: List[str],
+    is_crypto: bool,
+    timeframe: str,
+    requested_assets: int,
+    loaded_assets: int,
+) -> str:
+    lines: List[str] = []
+    lines.append(f"Snapshot Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Market: {'Crypto' if is_crypto else 'Traditional'}")
+    lines.append(f"Timeframe: {timeframe}")
+    lines.append(f"Assets: requested={requested_assets}, loaded={loaded_assets}")
+    lines.append("")
+    lines.append("=" * 170)
+    lines.append(f"LIVE DASHBOARD ({'Crypto' if is_crypto else 'Traditional'}) [{timeframe}]")
+    lines.append("=" * 170)
+    lines.append(table.drop(columns=["_Ticker"], errors="ignore").to_string())
+    lines.append("")
+    lines.append("=" * 170)
+    lines.append("RISK SCORE BREAKDOWN")
+    lines.append("=" * 170)
+    lines.append(risk.to_string())
+    if portfolio_notes:
+        lines.append("")
+        lines.append("=" * 170)
+        lines.append("PORTFOLIO CONTEXT")
+        lines.append("=" * 170)
+        for n in portfolio_notes:
+            lines.append(f"- {n}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def save_live_dashboard_snapshot(snapshot_text: str) -> Path:
+    LIVE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts_path = LIVE_SNAPSHOT_DIR / f"live_dashboard_{stamp}.txt"
+    ts_path.write_text(snapshot_text, encoding="utf-8")
+    LATEST_LIVE_SNAPSHOT_PATH.write_text(snapshot_text, encoding="utf-8")
+    return ts_path
+
+
+def load_latest_live_dashboard_snapshot() -> Optional[str]:
+    if not LATEST_LIVE_SNAPSHOT_PATH.exists():
+        return None
+    try:
+        txt = LATEST_LIVE_SNAPSHOT_PATH.read_text(encoding="utf-8").strip()
+        return txt if txt else None
+    except Exception:
+        return None
+
+
+def build_grok_prompt(dashboard_text: str, datetime_context: str) -> str:
+    return GROK_ANALYSIS_INSTRUCTION.format(
+        datetime_context=datetime_context,
+        dashboard_text=dashboard_text,
+    )
+
+
+def call_xai_grok(prompt: str) -> Optional[str]:
+    api_key = (os.getenv("XAI_API_KEY", "") or "").strip()
+    if not api_key:
+        print("XAI_API_KEY not found. Skipping direct Grok API call.")
+        return None
+
+    endpoint = (os.getenv("XAI_API_URL", "https://api.x.ai/v1/chat/completions") or "").strip()
+    model = (os.getenv("CTMT_GROK_MODEL", "grok-3-mini") or "").strip()
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are Grok, built by xAI."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message", {}) or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        return str(content).strip() if content is not None else None
+    except Exception as e:
+        print(f"Grok API call failed: {e}")
+        return None
+
+
+def run_grok_analysis_mode() -> None:
+    now_local = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    dt_ctx = input(f"Date/time context for prompt (default {now_local}): ").strip() or now_local
+    latest_exists = LATEST_LIVE_SNAPSHOT_PATH.exists()
+    if latest_exists:
+        print("Dashboard source:")
+        print("1. Paste dashboard text")
+        print("2. Use latest saved Live Dashboard snapshot")
+        src = (input("Enter 1 or 2 (default 2): ").strip() or "2")
+    else:
+        src = "1"
+
+    if src == "2":
+        dashboard_text = load_latest_live_dashboard_snapshot() or ""
+        if dashboard_text:
+            print(f"Loaded latest snapshot: {LATEST_LIVE_SNAPSHOT_PATH}")
+        else:
+            print("No latest snapshot content found. Please paste dashboard text instead.")
+            dashboard_text = read_multiline_input_until_end()
+    else:
+        dashboard_text = read_multiline_input_until_end()
+    if not dashboard_text:
+        print("No dashboard text provided.")
+        return
+
+    prompt = build_grok_prompt(dashboard_text, dt_ctx)
+    GROK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    prompt_path = GROK_OUTPUT_DIR / f"grok_prompt_{stamp}.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    print(f"Grok prompt saved: {prompt_path}")
+
+    if (input("Send this prompt directly to xAI Grok now? (y/n, default n): ").strip().lower() or "n") != "y":
+        print("\nPrompt preview (first 40 lines):")
+        preview = "\n".join(prompt.splitlines()[:40])
+        print(preview)
+        print("\n(Full prompt saved to file above.)")
+        return
+
+    response = call_xai_grok(prompt)
+    if not response:
+        print("No Grok response returned.")
+        return
+
+    resp_path = GROK_OUTPUT_DIR / f"grok_response_{stamp}.md"
+    resp_path.write_text(response, encoding="utf-8")
+    print("\n" + "=" * 120)
+    print("GROK ANALYSIS")
+    print("=" * 120)
+    print(response)
+    print(f"\nSaved response: {resp_path}")
+
+
 def main() -> None:
     global CUDA_AVAILABLE, CUDA_BACKEND, cp, EMOJI_ENABLED, COLOR_ENABLED
     ensure_table()
@@ -1922,11 +2136,16 @@ def main() -> None:
         print("1. Crypto Analysis")
         print("2. Traditional Markets Analysis")
         print("3. Clear Cache")
-        print("4. Exit")
+        print("4. Grok Dashboard Analysis")
+        print("5. Exit")
 
-        main_choice = input("Enter 1-4: ").strip()
-        if main_choice == "4":
+        main_choice = input("Enter 1-5: ").strip()
+        if main_choice == "5":
             break
+        if main_choice == "4":
+            run_grok_analysis_mode()
+            input("\nPress Enter to return to main menu...")
+            continue
         if main_choice == "3":
             if input("Delete entire cache? (yes/no): ").strip().lower() == "yes":
                 reset_table()
@@ -2013,6 +2232,18 @@ def main() -> None:
                 print("=" * 170)
                 for n in portfolio_notes:
                     print(f"- {n}")
+
+            snapshot_text = compose_live_dashboard_snapshot_text(
+                table=table,
+                risk=risk,
+                portfolio_notes=portfolio_notes,
+                is_crypto=is_crypto,
+                timeframe=timeframe,
+                requested_assets=len(tickers),
+                loaded_assets=len(raw_data),
+            )
+            snap_path = save_live_dashboard_snapshot(snapshot_text)
+            print(f"Saved latest Live Dashboard snapshot: {snap_path}")
 
             top_ticker = table.iloc[0]["_Ticker"]
             chart_top_asset(enriched[top_ticker], top_ticker.replace("-USD", "") if is_crypto else top_ticker)

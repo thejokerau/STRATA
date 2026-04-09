@@ -3,3 +3,5 @@ crypto_data.db
 experiments/runs/
 experiments/reports/
 experiments/candidates.jsonl
+experiments/live_snapshots/
+experiments/grok/

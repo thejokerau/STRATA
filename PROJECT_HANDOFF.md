@@ -80,6 +80,15 @@
   - matches best champion by market/timeframe/lookback/asset-count context
   - prompts to apply champion tuned params in live mode
   - prompts to replace backtest config with champion settings in backtest mode
+- Added Grok analysis capability to nightly menu:
+  - new main-menu option `Grok Dashboard Analysis`
+  - accepts pasted raw dashboard text and builds a strict Grok-ready analysis prompt
+  - optionally sends prompt to xAI chat-completions API when `XAI_API_KEY` is configured
+  - stores prompt/response artifacts in `experiments/grok/`
+- Added Grok auto-feed from latest live snapshot:
+  - each Live Dashboard run now saves snapshot text to `experiments/live_snapshots/`
+  - Grok mode can consume `latest_live_dashboard.txt` without manual paste
+- Updated `README.md` with Grok mode workflow and env-var configuration (`XAI_API_KEY`, `CTMT_GROK_MODEL`, `XAI_API_URL`)
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -105,6 +114,8 @@
 - Automated experiment runs depend on live data provider availability and rate limits; failed data pulls can skip scenarios.
 - Champion registry updates are gate-based but still require human review before promoting to stable release behavior.
 - Champion matching is heuristic-based; when multiple close candidates exist, manual confirmation prompt remains the final safeguard.
+- Direct xAI API execution in Grok mode depends on network availability, endpoint compatibility, and valid API credentials.
+- Live snapshot and Grok artifact directories are generated outputs and are now git-ignored.
 
 ## Run / Validate
 - Syntax check:
@@ -128,7 +139,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-08T13:12:50+00:00
+- Last update UTC: 2026-04-09T08:50:42+00:00
 - Latest experiment artifact: `experiments/runs/run_20260408T131249Z.json`
 - Champion scenarios tracked: 1
 - Latest run summary:
