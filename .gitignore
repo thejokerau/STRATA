@@ -8,3 +8,8 @@
 **/experiments/live_snapshots/
 **/experiments/backtest_snapshots/
 **/experiments/grok/
+.ctmt/
+
+# Python build/runtime artifacts
+**/__pycache__/
+*.pyc

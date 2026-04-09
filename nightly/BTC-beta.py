@@ -3,6 +3,7 @@ import time
 import re
 import os
 import json
+import getpass
 import sqlite3
 import warnings
 import importlib.util
@@ -54,6 +55,9 @@ LIVE_SNAPSHOT_DIR = Path("experiments") / "live_snapshots"
 LATEST_LIVE_SNAPSHOT_PATH = LIVE_SNAPSHOT_DIR / "latest_live_dashboard.txt"
 BACKTEST_SNAPSHOT_DIR = Path("experiments") / "backtest_snapshots"
 LATEST_BACKTEST_SNAPSHOT_PATH = BACKTEST_SNAPSHOT_DIR / "latest_backtest.txt"
+USER_PREFS_DIR = Path.home() / ".ctmt"
+AI_PREFS_PATH = USER_PREFS_DIR / "ai_preferences.json"
+AI_SECRETS_PATH = USER_PREFS_DIR / "ai_secrets.json"
 
 TIMEFRAME_MENU = {
     "1": ("1d", "1d"),
@@ -1962,6 +1966,554 @@ def apply_champion_backtest_config(base_cfg: BacktestConfig, champion_entry: dic
     )
 
 
+def ensure_user_prefs_dir() -> None:
+    USER_PREFS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(USER_PREFS_DIR, 0o700)
+    except Exception:
+        pass
+
+
+def default_ai_preferences() -> Dict[str, object]:
+    return {
+        "active_profile": "default_xai",
+        "profiles": {
+            "default_xai": {
+                "provider": "xai",
+                "model": "grok-3-mini",
+                "endpoint": "https://api.x.ai/v1/chat/completions",
+                "api_key_env": "XAI_API_KEY",
+                "api_key_name": "default_xai",
+                "temperature": 0.2,
+            }
+        },
+    }
+
+
+def load_json_file(path: Path, default: object) -> object:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json_file(path: Path, data: object, file_mode: int = 0o600) -> None:
+    ensure_user_prefs_dir()
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, file_mode)
+    except Exception:
+        pass
+
+
+def load_ai_preferences() -> Dict[str, object]:
+    raw = load_json_file(AI_PREFS_PATH, default_ai_preferences())
+    if not isinstance(raw, dict):
+        return default_ai_preferences()
+    if "profiles" not in raw or not isinstance(raw["profiles"], dict):
+        raw["profiles"] = default_ai_preferences()["profiles"]
+    if "active_profile" not in raw or not isinstance(raw["active_profile"], str):
+        raw["active_profile"] = next(iter(raw["profiles"].keys()), "default_xai")
+    return raw
+
+
+def save_ai_preferences(prefs: Dict[str, object]) -> None:
+    save_json_file(AI_PREFS_PATH, prefs, file_mode=0o600)
+
+
+def load_ai_secrets() -> Dict[str, str]:
+    raw = load_json_file(AI_SECRETS_PATH, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def save_ai_secrets(secrets: Dict[str, str]) -> None:
+    save_json_file(AI_SECRETS_PATH, secrets, file_mode=0o600)
+
+
+def provider_default_endpoint(provider: str) -> str:
+    p = provider.lower().strip()
+    if p == "xai":
+        return "https://api.x.ai/v1/chat/completions"
+    if p == "openai":
+        return "https://api.openai.com/v1/chat/completions"
+    if p == "anthropic":
+        return "https://api.anthropic.com/v1/messages"
+    if p == "ollama":
+        return "http://localhost:11434/api/chat"
+    if p in ("openai_compatible", "openclaw"):
+        return "http://localhost:1234/v1/chat/completions"
+    return ""
+
+
+def provider_default_model(provider: str) -> str:
+    p = provider.lower().strip()
+    if p == "xai":
+        return "grok-3-mini"
+    if p == "openai":
+        return "gpt-4o-mini"
+    if p == "anthropic":
+        return "claude-3-5-sonnet-latest"
+    if p == "ollama":
+        return "llama3.1"
+    if p in ("openai_compatible", "openclaw"):
+        return "openclaw"
+    return "model"
+
+
+def provider_default_envvar(provider: str) -> str:
+    p = provider.lower().strip()
+    if p == "xai":
+        return "XAI_API_KEY"
+    if p == "openai":
+        return "OPENAI_API_KEY"
+    if p == "anthropic":
+        return "ANTHROPIC_API_KEY"
+    if p in ("openai_compatible", "openclaw"):
+        return "OPENCLAW_API_KEY"
+    return ""
+
+
+def provider_needs_api_key(provider: str) -> bool:
+    return provider.lower().strip() in ("xai", "openai", "anthropic")
+
+
+def get_active_ai_profile(prefs: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+    profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+    if not isinstance(profiles, dict) or not profiles:
+        d = default_ai_preferences()
+        return str(d["active_profile"]), d["profiles"][str(d["active_profile"])]
+    active = str(prefs.get("active_profile", "")).strip()
+    if active in profiles and isinstance(profiles[active], dict):
+        return active, profiles[active]
+    first = next(iter(profiles.keys()))
+    return str(first), profiles[str(first)]
+
+
+def resolve_profile_api_key(profile: Dict[str, object], secrets: Dict[str, str]) -> Tuple[str, str]:
+    env_name = str(profile.get("api_key_env", "") or "").strip()
+    if env_name:
+        env_val = (os.getenv(env_name, "") or "").strip()
+        if env_val:
+            return env_val, f"env:{env_name}"
+    key_name = str(profile.get("api_key_name", "") or "").strip()
+    if key_name and key_name in secrets and secrets[key_name].strip():
+        return secrets[key_name].strip(), f"prefs:{key_name}"
+    return "", "missing"
+
+
+def call_openai_style_chat(endpoint: str, model: str, prompt: str, system_prompt: str, temperature: float, api_key: str = "") -> Tuple[Optional[str], Optional[int], str]:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(np.clip(temperature, 0.0, 1.0)),
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+        if not (200 <= r.status_code < 300):
+            return None, r.status_code, (r.text or "")[:1200]
+        data = r.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return None, r.status_code, "Empty choices in response."
+        msg = choices[0].get("message", {}) or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip(), r.status_code, ""
+        return (str(content).strip() if content is not None else None), r.status_code, ""
+    except Exception as e:
+        return None, -1, str(e)
+
+
+def call_anthropic_chat(endpoint: str, model: str, prompt: str, system_prompt: str, temperature: float, api_key: str) -> Tuple[Optional[str], Optional[int], str]:
+    payload = {
+        "model": model,
+        "max_tokens": 1800,
+        "temperature": float(np.clip(temperature, 0.0, 1.0)),
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+        if not (200 <= r.status_code < 300):
+            return None, r.status_code, (r.text or "")[:1200]
+        data = r.json()
+        parts = data.get("content", [])
+        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"]
+        content = "\n".join([t for t in text_parts if t]).strip()
+        return (content if content else None), r.status_code, ""
+    except Exception as e:
+        return None, -1, str(e)
+
+
+def call_ollama_chat(endpoint: str, model: str, prompt: str, system_prompt: str, temperature: float) -> Tuple[Optional[str], Optional[int], str]:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": float(np.clip(temperature, 0.0, 1.0))},
+    }
+    headers = {"Content-Type": "application/json"}
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+        if not (200 <= r.status_code < 300):
+            return None, r.status_code, (r.text or "")[:1200]
+        data = r.json()
+        msg = data.get("message", {}) if isinstance(data, dict) else {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            return content.strip(), r.status_code, ""
+        return None, r.status_code, "No message.content returned by Ollama."
+    except Exception as e:
+        return None, -1, str(e)
+
+
+def call_active_ai_provider(prompt: str, system_prompt: str = "You are Grok, built by xAI.") -> Optional[str]:
+    prefs = load_ai_preferences()
+    secrets = load_ai_secrets()
+    profile_name, profile = get_active_ai_profile(prefs)
+    provider = str(profile.get("provider", "xai")).strip().lower()
+    model = str(profile.get("model", provider_default_model(provider))).strip()
+    endpoint = str(profile.get("endpoint", provider_default_endpoint(provider))).strip() or provider_default_endpoint(provider)
+    temperature = float(profile.get("temperature", 0.2))
+
+    key, key_source = resolve_profile_api_key(profile, secrets)
+    if provider_needs_api_key(provider) and not key:
+        print(f"AI provider `{provider}` is missing API key (source: {key_source}).")
+        print("Set env var or store key via AI Provider Settings.")
+        return None
+
+    print(f"Calling AI provider `{provider}` using profile `{profile_name}` (model `{model}`, key source: {key_source}).")
+
+    if provider in ("xai", "openai", "openai_compatible", "openclaw"):
+        # xAI frequently fails on dotted model aliases; try a few common fallbacks.
+        model_candidates: List[str] = [model]
+        if provider == "xai":
+            for m in [model.replace(".", "-"), "grok-4-1-fast-reasoning", "grok-4-1-fast", "grok-3-mini"]:
+                if m and m not in model_candidates:
+                    model_candidates.append(m)
+        last_status = None
+        last_body = ""
+        for m in model_candidates:
+            text, status, err_body = call_openai_style_chat(endpoint, m, prompt, system_prompt, temperature, api_key=key)
+            if text:
+                return text
+            last_status = status
+            last_body = err_body
+            if status not in (400, 404):
+                break
+            print(f"AI call failed for model `{m}` with status {status}. Trying fallback model...")
+        if last_status is not None:
+            print(f"Last AI error status: {last_status}")
+        if last_body:
+            print("Last AI error body (truncated):")
+            print(last_body)
+        return None
+
+    if provider == "anthropic":
+        text, status, err_body = call_anthropic_chat(endpoint, model, prompt, system_prompt, temperature, api_key=key)
+        if text:
+            return text
+        print(f"Anthropic call failed. Status: {status}")
+        if err_body:
+            print("Error body (truncated):")
+            print(err_body)
+        return None
+
+    if provider == "ollama":
+        text, status, err_body = call_ollama_chat(endpoint, model, prompt, system_prompt, temperature)
+        if text:
+            return text
+        print(f"Ollama call failed. Status: {status}")
+        if err_body:
+            print("Error body (truncated):")
+            print(err_body)
+        return None
+
+    print(f"Unsupported AI provider: {provider}")
+    return None
+
+
+def print_ai_profiles(prefs: Dict[str, object]) -> None:
+    active, _ = get_active_ai_profile(prefs)
+    profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+    if not isinstance(profiles, dict) or not profiles:
+        print("No AI profiles configured.")
+        return
+    print("Configured AI profiles:")
+    for name, p in profiles.items():
+        if not isinstance(p, dict):
+            continue
+        mark = "*" if name == active else " "
+        provider = str(p.get("provider", ""))
+        model = str(p.get("model", ""))
+        endpoint = str(p.get("endpoint", ""))
+        print(f"{mark} {name}: provider={provider}, model={model}, endpoint={endpoint}")
+
+
+def configure_ai_profile(prefs: Dict[str, object], secrets: Dict[str, str]) -> Tuple[Dict[str, object], Dict[str, str]]:
+    print("Select provider:")
+    print("1. xAI (Grok)")
+    print("2. OpenAI")
+    print("3. Anthropic")
+    print("4. Ollama (local)")
+    print("5. OpenAI-compatible")
+    print("6. OpenClaw (OpenAI-compatible)")
+    ch = (input("Enter 1-6: ").strip() or "1")
+    provider_map = {
+        "1": "xai",
+        "2": "openai",
+        "3": "anthropic",
+        "4": "ollama",
+        "5": "openai_compatible",
+        "6": "openclaw",
+    }
+    provider = provider_map.get(ch, "xai")
+
+    default_name = f"{provider}_profile"
+    profile_name = (input(f"Profile name (default {default_name}): ").strip() or default_name)
+    model_default = provider_default_model(provider)
+    endpoint_default = provider_default_endpoint(provider)
+    env_default = provider_default_envvar(provider)
+
+    model = (input(f"Model (default {model_default}): ").strip() or model_default)
+    endpoint = (input(f"Endpoint (default {endpoint_default}): ").strip() or endpoint_default)
+    temp_in = (input("Temperature 0-1 (default 0.2): ").strip() or "0.2")
+    try:
+        temperature = float(np.clip(float(temp_in), 0.0, 1.0))
+    except Exception:
+        temperature = 0.2
+
+    api_key_env = ""
+    if provider != "ollama":
+        api_key_env = (input(f"API key env var name (default {env_default or 'NONE'}): ").strip() or env_default)
+    api_key_name = profile_name
+
+    profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+    if not isinstance(profiles, dict):
+        profiles = {}
+    profiles[profile_name] = {
+        "provider": provider,
+        "model": model,
+        "endpoint": endpoint,
+        "api_key_env": api_key_env,
+        "api_key_name": api_key_name,
+        "temperature": temperature,
+    }
+    prefs["profiles"] = profiles
+    if not str(prefs.get("active_profile", "")).strip():
+        prefs["active_profile"] = profile_name
+
+    if provider != "ollama":
+        save_local_key = (input("Store API key securely in user prefs file? (y/n, default n): ").strip().lower() or "n") == "y"
+        if save_local_key:
+            key = getpass.getpass("Enter API key (input hidden): ").strip()
+            if key:
+                secrets[api_key_name] = key
+                print(f"Stored API key for profile `{profile_name}` in user secrets file.")
+    return prefs, secrets
+
+
+def add_preset_profile(prefs: Dict[str, object], secrets: Dict[str, str]) -> Tuple[Dict[str, object], Dict[str, str]]:
+    print("Quick-start presets:")
+    print("1. xAI Cloud (Grok)")
+    print("2. OpenAI Cloud")
+    print("3. Anthropic Cloud")
+    print("4. Ollama Local")
+    print("5. OpenClaw Local (OpenAI-compatible)")
+    print("6. OpenAI-compatible Custom")
+    ch = (input("Enter 1-6: ").strip() or "4")
+    provider_map = {
+        "1": "xai",
+        "2": "openai",
+        "3": "anthropic",
+        "4": "ollama",
+        "5": "openclaw",
+        "6": "openai_compatible",
+    }
+    provider = provider_map.get(ch, "ollama")
+    profile_name_default = f"preset_{provider}"
+    profile_name = (input(f"Profile name (default {profile_name_default}): ").strip() or profile_name_default)
+
+    model = provider_default_model(provider)
+    endpoint = provider_default_endpoint(provider)
+    api_key_env = provider_default_envvar(provider)
+
+    # Provider-tuned defaults.
+    if provider == "ollama":
+        model = "llama3.1:8b"
+        endpoint = "http://localhost:11434/api/chat"
+    elif provider == "openclaw":
+        model = "openclaw"
+        endpoint = "http://localhost:1234/v1/chat/completions"
+        api_key_env = "OPENCLAW_API_KEY"
+
+    override_model = input(f"Model (default {model}): ").strip()
+    if override_model:
+        model = override_model
+    override_endpoint = input(f"Endpoint (default {endpoint}): ").strip()
+    if override_endpoint:
+        endpoint = override_endpoint
+
+    profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+    if not isinstance(profiles, dict):
+        profiles = {}
+    profiles[profile_name] = {
+        "provider": provider,
+        "model": model,
+        "endpoint": endpoint,
+        "api_key_env": api_key_env,
+        "api_key_name": profile_name,
+        "temperature": 0.2,
+    }
+    prefs["profiles"] = profiles
+
+    if provider != "ollama":
+        store_now = (input("Store API key now in secure local prefs? (y/n, default n): ").strip().lower() or "n") == "y"
+        if store_now:
+            key = getpass.getpass("Enter API key (input hidden): ").strip()
+            if key:
+                secrets[profile_name] = key
+                print(f"Stored API key for `{profile_name}`.")
+
+    activate_now = (input("Set this profile as active now? (y/n, default y): ").strip().lower() or "y") == "y"
+    if activate_now:
+        prefs["active_profile"] = profile_name
+    return prefs, secrets
+
+
+def run_ai_provider_settings_menu() -> None:
+    prefs = load_ai_preferences()
+    secrets = load_ai_secrets()
+    while True:
+        print("\n" + "=" * 100)
+        print("AI PROVIDER SETTINGS")
+        print("=" * 100)
+        active_name, active_profile = get_active_ai_profile(prefs)
+        key_val, key_source = resolve_profile_api_key(active_profile, secrets)
+        print(
+            f"Active profile: {active_name} | provider={active_profile.get('provider', '')} | "
+            f"model={active_profile.get('model', '')} | key={'set' if key_val else 'missing'} ({key_source})"
+        )
+        print("1. List profiles")
+        print("2. Quick-start preset profile")
+        print("3. Create/Update custom profile")
+        print("4. Set active profile")
+        print("5. Remove profile")
+        print("6. Set/Replace API key for profile")
+        print("7. Remove API key for profile")
+        print("8. Test active profile")
+        print("9. Back")
+
+        ch = (input("Enter 1-9: ").strip() or "9")
+        profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+        if not isinstance(profiles, dict):
+            profiles = {}
+            prefs["profiles"] = profiles
+
+        if ch == "9":
+            save_ai_preferences(prefs)
+            save_ai_secrets(secrets)
+            return
+        if ch == "1":
+            print_ai_profiles(prefs)
+            continue
+        if ch == "2":
+            prefs, secrets = add_preset_profile(prefs, secrets)
+            save_ai_preferences(prefs)
+            save_ai_secrets(secrets)
+            print("Preset profile saved.")
+            continue
+        if ch == "3":
+            prefs, secrets = configure_ai_profile(prefs, secrets)
+            save_ai_preferences(prefs)
+            save_ai_secrets(secrets)
+            print("Profile saved.")
+            continue
+        if ch == "4":
+            print_ai_profiles(prefs)
+            name = input("Enter profile name to activate: ").strip()
+            if name in profiles:
+                prefs["active_profile"] = name
+                save_ai_preferences(prefs)
+                print(f"Active profile set to `{name}`.")
+            else:
+                print("Profile not found.")
+            continue
+        if ch == "5":
+            print_ai_profiles(prefs)
+            name = input("Enter profile name to remove: ").strip()
+            if name in profiles:
+                del profiles[name]
+                if str(prefs.get("active_profile", "")) == name:
+                    prefs["active_profile"] = next(iter(profiles.keys()), "")
+                save_ai_preferences(prefs)
+                print(f"Removed profile `{name}`.")
+            else:
+                print("Profile not found.")
+            continue
+        if ch == "6":
+            print_ai_profiles(prefs)
+            name = input("Enter profile name for API key: ").strip()
+            if name not in profiles or not isinstance(profiles[name], dict):
+                print("Profile not found.")
+                continue
+            key = getpass.getpass("Enter API key (input hidden): ").strip()
+            if not key:
+                print("No key entered.")
+                continue
+            key_name = str(profiles[name].get("api_key_name", name)).strip() or name
+            profiles[name]["api_key_name"] = key_name
+            secrets[key_name] = key
+            save_ai_preferences(prefs)
+            save_ai_secrets(secrets)
+            print(f"Stored API key for profile `{name}`.")
+            continue
+        if ch == "7":
+            print_ai_profiles(prefs)
+            name = input("Enter profile name to clear stored API key: ").strip()
+            if name not in profiles or not isinstance(profiles[name], dict):
+                print("Profile not found.")
+                continue
+            key_name = str(profiles[name].get("api_key_name", name)).strip() or name
+            if key_name in secrets:
+                del secrets[key_name]
+                save_ai_secrets(secrets)
+                print(f"Removed stored API key for profile `{name}`.")
+            else:
+                print("No stored key for that profile.")
+            continue
+        if ch == "8":
+            resp = call_active_ai_provider("Reply with exactly: OK", system_prompt="You are a concise assistant.")
+            if resp:
+                print(f"AI test response: {resp[:200]}")
+            else:
+                print("AI test call failed.")
+            continue
+        print("Invalid choice.")
+
+
 def read_multiline_input_until_end() -> str:
     print("Paste the FULL dashboard text. Type a new line with only END when finished:")
     lines: List[str] = []
@@ -2113,75 +2665,11 @@ def build_grok_prompt(dashboard_text: str, datetime_context: str) -> str:
 
 
 def call_xai_grok(prompt: str) -> Optional[str]:
-    api_key = (os.getenv("XAI_API_KEY", "") or "").strip()
-    if not api_key:
-        print("XAI_API_KEY not found. Skipping direct Grok API call.")
-        return None
-
-    endpoint = (os.getenv("XAI_API_URL", "https://api.x.ai/v1/chat/completions") or "").strip()
-    configured_model = (os.getenv("CTMT_GROK_MODEL", "grok-3-mini") or "").strip()
-    model_candidates: List[str] = []
-    # Try configured model first, then common aliases to reduce "invalid model" 400s.
-    for m in [
-        configured_model,
-        configured_model.replace(".", "-"),
-        "grok-4-1-fast-reasoning",
-        "grok-4-1-fast",
-        "grok-3-mini",
-    ]:
-        m = (m or "").strip()
-        if m and m not in model_candidates:
-            model_candidates.append(m)
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    last_status = None
-    last_body = ""
-    for model in model_candidates:
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You are Grok, built by xAI."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-        }
-        try:
-            r = requests.post(endpoint, headers=headers, json=payload, timeout=180)
-            if 200 <= r.status_code < 300:
-                data = r.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    print(f"Grok API returned success with empty choices for model `{model}`.")
-                    return None
-                msg = choices[0].get("message", {}) or {}
-                content = msg.get("content")
-                if isinstance(content, str):
-                    return content.strip()
-                return str(content).strip() if content is not None else None
-
-            last_status = r.status_code
-            last_body = (r.text or "")[:1000]
-            print(f"Grok API call failed for model `{model}` with status {r.status_code}.")
-            # If it's not a bad-request style issue, stop retrying aliases.
-            if r.status_code not in (400, 404):
-                break
-        except Exception as e:
-            print(f"Grok API transport error for model `{model}`: {e}")
-            last_status = -1
-            last_body = str(e)
-            break
-
-    if last_status is not None:
-        print(f"Last Grok API error status: {last_status}")
-    if last_body:
-        print("Last Grok API error body (truncated):")
-        print(last_body)
-    return None
+    # Backward-compatible wrapper: uses active AI provider settings.
+    return call_active_ai_provider(prompt, system_prompt="You are Grok, built by xAI.")
 
 
-def run_grok_analysis_mode() -> None:
+def run_ai_analysis_mode() -> None:
     now_local = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     dt_ctx = input(f"Date/time context for prompt (default {now_local}): ").strip() or now_local
     live_exists = LATEST_LIVE_SNAPSHOT_PATH.exists()
@@ -2218,26 +2706,26 @@ def run_grok_analysis_mode() -> None:
     prompt = build_grok_prompt(dashboard_text, dt_ctx)
     GROK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    prompt_path = GROK_OUTPUT_DIR / f"grok_prompt_{stamp}.txt"
+    prompt_path = GROK_OUTPUT_DIR / f"ai_prompt_{stamp}.txt"
     prompt_path.write_text(prompt, encoding="utf-8")
-    print(f"Grok prompt saved: {prompt_path}")
+    print(f"AI analysis prompt saved: {prompt_path}")
 
-    if (input("Send this prompt directly to xAI Grok now? (y/n, default n): ").strip().lower() or "n") != "y":
+    if (input("Send this prompt directly to active AI provider now? (y/n, default n): ").strip().lower() or "n") != "y":
         print("\nPrompt preview (first 40 lines):")
         preview = "\n".join(prompt.splitlines()[:40])
         print(preview)
         print("\n(Full prompt saved to file above.)")
         return
 
-    response = call_xai_grok(prompt)
+    response = call_active_ai_provider(prompt, system_prompt="You are Grok, built by xAI.")
     if not response:
-        print("No Grok response returned.")
+        print("No AI response returned.")
         return
 
-    resp_path = GROK_OUTPUT_DIR / f"grok_response_{stamp}.md"
+    resp_path = GROK_OUTPUT_DIR / f"ai_response_{stamp}.md"
     resp_path.write_text(response, encoding="utf-8")
     print("\n" + "=" * 120)
-    print("GROK ANALYSIS")
+    print("AI ANALYSIS")
     print("=" * 120)
     print(response)
     print(f"\nSaved response: {resp_path}")
@@ -2251,9 +2739,14 @@ def main() -> None:
     print(f"Runtime acceleration backend: {CUDA_BACKEND}")
     display_mode = "emoji+color" if (EMOJI_ENABLED and COLOR_ENABLED) else ("emoji" if EMOJI_ENABLED else ("color" if COLOR_ENABLED else "plain-text"))
     print(f"Action label display mode: {display_mode}")
-    grok_key_set = "yes" if (os.getenv("XAI_API_KEY", "") or "").strip() else "no"
-    grok_model = (os.getenv("CTMT_GROK_MODEL", "grok-3-mini") or "").strip()
-    print(f"Grok API configured: key={grok_key_set}, model={grok_model}")
+    ai_prefs = load_ai_preferences()
+    ai_secrets = load_ai_secrets()
+    active_name, active_profile = get_active_ai_profile(ai_prefs)
+    active_key, active_key_src = resolve_profile_api_key(active_profile, ai_secrets)
+    print(
+        f"AI provider active: profile={active_name}, provider={active_profile.get('provider', '')}, "
+        f"model={active_profile.get('model', '')}, key={'set' if active_key else 'missing'} ({active_key_src})"
+    )
 
     while True:
         print("\n" + "=" * 100)
@@ -2262,14 +2755,19 @@ def main() -> None:
         print("1. Crypto Analysis")
         print("2. Traditional Markets Analysis")
         print("3. Clear Cache")
-        print("4. Grok Dashboard Analysis")
-        print("5. Exit")
+        print("4. AI Analysis Mode")
+        print("5. AI Provider Settings")
+        print("6. Exit")
 
-        main_choice = input("Enter 1-5: ").strip()
-        if main_choice == "5":
+        main_choice = input("Enter 1-6: ").strip()
+        if main_choice == "6":
             break
+        if main_choice == "5":
+            run_ai_provider_settings_menu()
+            input("\nPress Enter to return to main menu...")
+            continue
         if main_choice == "4":
-            run_grok_analysis_mode()
+            run_ai_analysis_mode()
             input("\nPress Enter to return to main menu...")
             continue
         if main_choice == "3":

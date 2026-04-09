@@ -95,6 +95,19 @@
   - startup prints Grok key/model status
   - API failures now surface HTTP status + truncated response body
   - automatic model alias fallback attempts reduce invalid-model 400 failures
+- Added multi-provider AI integration + secure user-local settings:
+  - providers: xAI, OpenAI, Anthropic, Ollama, OpenAI-compatible, OpenClaw
+  - new menu option `AI Provider Settings` for profile creation/switching/testing
+  - active profile now drives Grok analysis API execution
+  - preferences and secrets stored outside repo at `%USERPROFILE%\\.ctmt\\`
+  - environment-variable keys still supported and take precedence when configured
+- Renamed user-facing `Grok Dashboard Analysis` to generic `AI Analysis Mode` to reflect provider-agnostic routing.
+- Added AI Provider quick-start presets:
+  - xAI, OpenAI, Anthropic, Ollama, OpenClaw, OpenAI-compatible custom
+  - one-step profile creation + optional secure key storage + optional activate-now flow
+- Expanded git noise suppression for generated artifacts:
+  - added ignore rules for Python bytecode/cache (`__pycache__`, `*.pyc`)
+  - untracked previously committed cache files from index
 - Updated `README.md` with Grok mode workflow and env-var configuration (`XAI_API_KEY`, `CTMT_GROK_MODEL`, `XAI_API_URL`)
 - Fixed cache date parsing compatibility bug:
   - `get_cached()` now parses mixed legacy date formats (`YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS`)
@@ -127,6 +140,7 @@
 - Direct xAI API execution in Grok mode depends on network availability, endpoint compatibility, and valid API credentials.
 - Live snapshot and Grok artifact directories are generated outputs and are now git-ignored.
 - Backtest snapshot artifacts are generated outputs and are now git-ignored.
+- User-local AI preference/secrets files are outside repo by design; backup/rotation policy is user-managed.
 - Legacy cache rows with malformed/unparseable dates are now dropped at read time; affected rows may need cache refresh if large.
 
 ## Run / Validate
@@ -151,7 +165,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-09T10:12:53+00:00
+- Last update UTC: 2026-04-09T10:37:31+00:00
 - Latest experiment artifact: `experiments/runs/run_20260408T131249Z.json`
 - Champion scenarios tracked: 1
 - Latest run summary:

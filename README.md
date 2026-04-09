@@ -88,10 +88,14 @@ python nightly/BTC-beta.py
   - falls back to plain text labels if unsupported
   - optional env override: `CTMT_DISABLE_EMOJI=1`
   - optional color controls: `NO_COLOR=1` or `FORCE_COLOR=1`
-- Built-in Grok analysis mode:
+- Built-in AI analysis mode:
   - paste full raw dashboard text and generate a Grok-ready analysis prompt
-  - optional direct xAI API call and response capture
+  - optional direct call to active AI provider profile (cloud or local)
   - saves prompt/response artifacts under `experiments/grok/`
+- Multi-provider AI integration:
+  - xAI, OpenAI, Anthropic, Ollama, OpenAI-compatible, OpenClaw
+  - in-app profile management and active-profile switching
+  - secure user-local preference/key storage outside repo
 
 ## Notes
 
@@ -149,11 +153,12 @@ When a match is found, the script shows champion metrics and prompts to apply:
 - Live mode: apply champion tuned parameters for scoring.
 - Backtest mode: replace entered settings with champion config.
 
-## Grok Dashboard Analysis Mode
+## AI Analysis Mode
 
 From nightly main menu select:
 
-- `4. Grok Dashboard Analysis`
+- `4. AI Analysis Mode`
+- `5. AI Provider Settings` (configure provider/model/endpoint/keys/presets)
 
 Flow:
 
@@ -163,7 +168,7 @@ Flow:
    - use latest saved Live Dashboard snapshot.
    - use latest saved Backtest snapshot.
 3. If pasting manually, enter `END` on a new line.
-4. Choose whether to send directly to xAI Grok API.
+4. Choose whether to send directly to active AI provider profile.
 
 Live snapshots are auto-saved every time Live Dashboard runs:
 
@@ -175,14 +180,29 @@ Backtest snapshots are auto-saved every time Backtest mode runs:
 - `experiments/backtest_snapshots/backtest_<timestamp>.txt`
 - `experiments/backtest_snapshots/latest_backtest.txt`
 
-Environment variables for direct API mode:
+AI provider preferences and local keys are stored in user home (not repo):
 
-- `XAI_API_KEY` (required for API call)
-- `CTMT_GROK_MODEL` (optional, default `grok-3-mini`)
-- `XAI_API_URL` (optional, default `https://api.x.ai/v1/chat/completions`)
+- `%USERPROFILE%\\.ctmt\\ai_preferences.json`
+- `%USERPROFILE%\\.ctmt\\ai_secrets.json`
+
+Notes:
+
+- Env vars still work and take precedence over stored keys when configured for a profile.
+- Ollama/OpenClaw local endpoints can be configured in AI Provider Settings.
 
 Diagnostics:
 
-- Startup now prints Grok API config status (`key=yes/no`, active model).
+- Startup now prints active AI profile/provider/model and key source status.
 - On API failure, nightly prints HTTP status and truncated response body.
-- Model alias fallback is attempted automatically (including `grok-4-1-fast-reasoning` style names).
+- xAI profile includes model alias fallback attempts for invalid-model 400/404 cases.
+
+### AI Provider Presets
+
+In `AI Provider Settings`, use quick-start presets for:
+
+- xAI Cloud (Grok)
+- OpenAI Cloud
+- Anthropic Cloud
+- Ollama Local
+- OpenClaw Local (OpenAI-compatible)
+- OpenAI-compatible Custom
