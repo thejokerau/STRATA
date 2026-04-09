@@ -89,6 +89,9 @@
   - each Live Dashboard run now saves snapshot text to `experiments/live_snapshots/`
   - Grok mode can consume `latest_live_dashboard.txt` without manual paste
 - Updated `README.md` with Grok mode workflow and env-var configuration (`XAI_API_KEY`, `CTMT_GROK_MODEL`, `XAI_API_URL`)
+- Fixed cache date parsing compatibility bug:
+  - `get_cached()` now parses mixed legacy date formats (`YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS`)
+  - prevents crash when old cache rows use date-only strings
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -116,6 +119,7 @@
 - Champion matching is heuristic-based; when multiple close candidates exist, manual confirmation prompt remains the final safeguard.
 - Direct xAI API execution in Grok mode depends on network availability, endpoint compatibility, and valid API credentials.
 - Live snapshot and Grok artifact directories are generated outputs and are now git-ignored.
+- Legacy cache rows with malformed/unparseable dates are now dropped at read time; affected rows may need cache refresh if large.
 
 ## Run / Validate
 - Syntax check:
@@ -139,7 +143,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-09T08:50:42+00:00
+- Last update UTC: 2026-04-09T09:17:35+00:00
 - Latest experiment artifact: `experiments/runs/run_20260408T131249Z.json`
 - Champion scenarios tracked: 1
 - Latest run summary:

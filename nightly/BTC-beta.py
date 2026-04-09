@@ -331,7 +331,12 @@ def get_cached(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
     df = pd.read_sql_query(q, conn, params=[ticker, timeframe])
     if df.empty:
         return None
-    df["date"] = pd.to_datetime(df["date"])
+    # Cache may contain mixed legacy date formats (date-only and datetime).
+    # Parse robustly to avoid hard failures during dashboard/backtest loads.
+    df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return None
     df = df.set_index("date")
     df.columns = [c.capitalize() for c in df.columns]
     return validate_and_clean(df)
