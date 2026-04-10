@@ -85,6 +85,7 @@ GUI task execution:
 - Optional `Advanced Mode: Parallel jobs (experimental)` can be enabled in GUI Settings to allow limited concurrent jobs.
 - Use the top `Tasks` button or the `Task Monitor` tab to view task status.
 - `Task Monitor` tab supports:
+  - auto-refresh (~1s) for running/queued state
   - live running/queued visibility
   - pause/resume queue
   - remove queued task

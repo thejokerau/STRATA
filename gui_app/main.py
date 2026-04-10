@@ -85,6 +85,7 @@ class CTMTGuiApp:
         self.task_monitor_window: Optional[tk.Toplevel] = None
         self.task_monitor_text: Optional[tk.Text] = None
         self.task_monitor_job: Optional[str] = None
+        self.task_tab_job: Optional[str] = None
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -385,6 +386,7 @@ class CTMTGuiApp:
         self.task_tab_output = tk.Text(body, height=8, wrap="word")
         self.task_tab_output.pack(fill="x", pady=(8, 0))
         self._refresh_task_tab()
+        self._schedule_task_tab_refresh()
 
     def _build_settings_tab(self) -> None:
         frame = ttk.Frame(self.settings_tab, padding=8)
@@ -590,6 +592,7 @@ class CTMTGuiApp:
         else:
             self.status_progress.stop()
             self.status_var.set("Ready")
+        self._refresh_task_tab()
 
     def _update_run_controls_and_status(self) -> None:
         limit = self._task_limit()
@@ -710,6 +713,15 @@ class CTMTGuiApp:
                 "1.0",
                 f"Running: {self.running_tasks}/{self._task_limit()} | Queued: {len(self.task_queue)} | Queue paused: {self.queue_paused}",
             )
+
+    def _schedule_task_tab_refresh(self) -> None:
+        if self.task_tab_job:
+            try:
+                self.root.after_cancel(self.task_tab_job)
+            except Exception:
+                pass
+        self._refresh_task_tab()
+        self.task_tab_job = self.root.after(1000, self._schedule_task_tab_refresh)
 
     def _toggle_queue_pause(self) -> None:
         self.queue_paused = not self.queue_paused
@@ -1389,7 +1401,17 @@ def run_gui() -> None:
     root = tk.Tk()
     repo_root = Path(__file__).resolve().parents[1]
     app = CTMTGuiApp(root, repo_root=repo_root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app._close_task_monitor(), app._persist_state(), root.destroy()))
+    def _shutdown():
+        app._close_task_monitor()
+        if app.task_tab_job:
+            try:
+                root.after_cancel(app.task_tab_job)
+            except Exception:
+                pass
+            app.task_tab_job = None
+        app._persist_state()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", _shutdown)
     root.mainloop()
 
 
