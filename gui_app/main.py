@@ -4240,11 +4240,81 @@ class StrataGuiApp:
             execution_entries = []
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
+        profile_name = self.pf_binance_profile_var.get().strip() or None
+        display_ccy = (self.display_currency_var.get().strip() or "USD").upper()
+        usd_like = {"USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI"}
+        try:
+            fx_usd_to_disp = float(self.bridge.mod.get_usd_to_currency_rate(display_ccy))
+            if fx_usd_to_disp <= 0:
+                fx_usd_to_disp = 1.0
+        except Exception:
+            fx_usd_to_disp = 1.0
+
+        unrealized_quote: Dict[str, float] = {}
+        unrealized_display: Dict[str, float] = {}
+        op_rows: List[Dict[str, Any]] = []
+        if isinstance(open_positions, dict):
+            for _, pos in open_positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                row = dict(pos)
+                asset = str(row.get("asset", "") or "").strip().upper()
+                quote_ccy = str(row.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+                symbol = str(row.get("symbol", "") or "").strip().upper()
+                if (not symbol) and asset and quote_ccy:
+                    symbol = f"{asset}{quote_ccy}"
+                try:
+                    entry_px = float(row.get("entry_price", 0.0) or 0.0)
+                except Exception:
+                    entry_px = 0.0
+                try:
+                    qty = float(row.get("qty", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                last_px = 0.0
+                if symbol and profile_name:
+                    try:
+                        lpx = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile_name)
+                        if lpx.get("ok"):
+                            last_px = float(lpx.get("price", 0.0) or 0.0)
+                    except Exception:
+                        last_px = 0.0
+                upnl_q = 0.0
+                upnl_pct = 0.0
+                if entry_px > 0 and qty > 0 and last_px > 0:
+                    upnl_q = (last_px - entry_px) * qty
+                    upnl_pct = ((last_px - entry_px) / entry_px) * 100.0
+                upnl_d = 0.0
+                if abs(upnl_q) > 0:
+                    if quote_ccy in usd_like:
+                        upnl_d = upnl_q * fx_usd_to_disp
+                    elif quote_ccy == display_ccy:
+                        upnl_d = upnl_q
+                    else:
+                        upnl_d = 0.0
+                if abs(upnl_q) > 0:
+                    unrealized_quote[quote_ccy] = unrealized_quote.get(quote_ccy, 0.0) + upnl_q
+                if abs(upnl_d) > 0:
+                    unrealized_display[display_ccy] = unrealized_display.get(display_ccy, 0.0) + upnl_d
+                row["symbol"] = symbol
+                row["quote_currency"] = quote_ccy
+                row["last_price"] = round(last_px, 8) if last_px > 0 else ""
+                row["unreal_pnl_quote"] = round(upnl_q, 8)
+                row["unreal_pnl_pct"] = round(upnl_pct, 4)
+                row["unreal_pnl_display"] = round(upnl_d, 8)
+                op_rows.append(row)
 
         if hasattr(self, "pf_open_positions_text"):
             self.pf_open_positions_text.delete("1.0", tk.END)
-            if isinstance(open_positions, dict) and open_positions:
-                op_df = pd.DataFrame(list(open_positions.values()))
+            if op_rows:
+                op_df = pd.DataFrame(op_rows)
+                preferred = [
+                    "entry_id", "entry_ts", "symbol", "asset", "timeframe", "qty", "entry_price",
+                    "last_price", "unreal_pnl_pct", "unreal_pnl_quote", "unreal_pnl_display",
+                    "quote_currency", "display_currency", "panel",
+                ]
+                cols = [c for c in preferred if c in op_df.columns] + [c for c in op_df.columns if c not in preferred]
+                op_df = op_df[cols]
                 self.pf_open_positions_text.insert("1.0", op_df.to_string(index=False))
             else:
                 self.pf_open_positions_text.insert("1.0", "No open positions tracked.")
@@ -4283,6 +4353,12 @@ class StrataGuiApp:
             if realized_display:
                 dtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_display.items())])
                 lines.append(f"Realized PnL (Display): {dtxt}")
+            if unrealized_quote:
+                uqtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(unrealized_quote.items())])
+                lines.append(f"Unrealized PnL (Quote): {uqtxt}")
+            if unrealized_display:
+                udtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(unrealized_display.items())])
+                lines.append(f"Unrealized PnL (Display): {udtxt}")
             lines.append("")
             if isinstance(entries, list) and entries:
                 df = pd.DataFrame(entries[-200:])
@@ -4305,6 +4381,16 @@ class StrataGuiApp:
             self.pf_execution_text.delete("1.0", tk.END)
             if execution_entries:
                 exe_df = pd.DataFrame(execution_entries[-200:])
+                for col in ["pnl_pct", "pnl_quote", "pnl_display"]:
+                    if col not in exe_df.columns:
+                        exe_df[col] = ""
+                preferred = [
+                    "id", "ts", "market", "timeframe", "panel", "asset", "action",
+                    "price", "qty", "pnl_pct", "pnl_quote", "pnl_display",
+                    "quote_currency", "display_currency", "note", "is_execution",
+                ]
+                cols = [c for c in preferred if c in exe_df.columns] + [c for c in exe_df.columns if c not in preferred]
+                exe_df = exe_df[cols]
                 self.pf_execution_text.insert("1.0", exe_df.to_string(index=False))
             else:
                 self.pf_execution_text.insert("1.0", "No execution entries.")
