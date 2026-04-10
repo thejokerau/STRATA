@@ -83,6 +83,28 @@ GUI task execution:
 
 - Default mode runs one active task at a time (additional tasks are queued).
 - Optional `Advanced Mode: Parallel jobs (experimental)` can be enabled in GUI Settings to allow limited concurrent jobs.
+- Use the top `Tasks` button or the `Task Monitor` tab to view task status.
+- `Task Monitor` tab supports:
+  - auto-refresh (~1s) for running/queued state
+  - live running/queued visibility
+  - pause/resume queue
+  - remove queued task
+  - queued task reprioritization (move up/down)
+  - terminal-style live log pane for task start/completion and captured backend output
+
+GUI dashboard readability:
+
+- Live/Backtest text outputs now apply color highlighting for key sections and action states (`BUY/HOLD/SELL`) to improve scanability.
+
+GUI AI configuration:
+
+- AI profiles can now be managed directly in GUI Settings:
+  - list/select profile
+  - update provider/model/endpoint/internet mode/temperature
+  - set active profile
+  - store/remove API key securely
+  - test profile connectivity
+- GUI uses the same user-local secure preference/secret files as CLI mode.
 
 GUI traditional-region UX:
 
@@ -184,6 +206,17 @@ Promotion gates (`scripts/promote_champion.py`) are conservative by default:
 - maximum sharpe drop allowed vs champion: `-0.10`
 
 Detailed automation reference: `docs/AUTOMATION.md`
+
+Bug tracking references:
+
+- `docs/BUG_SCORECARD.md` (generated build-by-build + aggregate view)
+- `docs/BUG_SCORECARD_DATA.json` (source data)
+
+Refresh command:
+
+```bash
+python scripts/update_bug_scorecard.py
+```
 
 From nightly main menu you can run:
 

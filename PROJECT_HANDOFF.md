@@ -168,6 +168,34 @@
   - configurable max concurrent jobs
   - task scheduler now queues when saturated and starts queued jobs automatically
   - per-task bridge instantiation in parallel mode to avoid single-bridge serialization
+- Added GUI-native AI profile management (parity move from CLI-only setup):
+  - list/refresh profiles and active profile visibility
+  - create/update profile fields (provider/model/endpoint/internet/temperature)
+  - set active profile and delete profile
+  - set/remove stored API key from GUI
+  - run profile-level connectivity test from GUI
+  - GUI uses same user-local preference/secret files as nightly CLI
+- Added GUI task monitor method:
+  - status-bar `Tasks` button now shows currently running tasks and queued tasks
+  - supports operational visibility while parallel mode and queueing are active
+  - upgraded to a live Task Monitor window that auto-refreshes every second
+- Added top-level task access + dedicated Task Monitor tab:
+  - top `Tasks` button jumps directly to Task Monitor
+  - Task Monitor tab adds queue operations: pause/resume, remove queued task, and move queued task priority up/down
+  - running tasks are viewable; hard-stop for active running tasks is still not implemented
+  - fixed Task Monitor staleness by adding periodic (~1s) tab refresh and state-change refresh hooks
+  - added terminal-style live log pane at Task Monitor bottom for start/done events and captured backend logs (useful for progress visibility/debugging)
+- Added GUI text color-highlighting for dashboard readability:
+  - highlights key sections and emphasizes `BUY/HOLD/SELL` action labels in live/backtest panes
+- Fixed Task Monitor task identity bug under parallel jobs:
+  - moved task lifecycle tracking to ID-based completion mapping
+  - prevents wrong task from being removed when multiple jobs overlap
+- Added persistent bug tracker:
+  - `docs/BUG_SCORECARD.md` with user-reported issues, fix status, and open/partial items
+- Upgraded bug tracker to build-by-build + cross-build aggregate model:
+  - data source: `docs/BUG_SCORECARD_DATA.json`
+  - generated report: `docs/BUG_SCORECARD.md`
+  - generator script: `scripts/update_bug_scorecard.py`
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -185,6 +213,9 @@
 - `scripts/run_gui.py`
 - `scripts/sync_core_to_nightly.py`
 - `docs/BRANCH_SYNC.md`
+- `docs/BUG_SCORECARD.md`
+- `docs/BUG_SCORECARD_DATA.json`
+- `scripts/update_bug_scorecard.py`
 
 ## Known Issues / Risks
 - Some CoinGecko symbols still may not be usable across all data providers; filtering now favors Binance tradability for crypto.
@@ -208,6 +239,7 @@
 - GUI currently uses text-first output panes; richer native tables/charts and embedded chart views are pending.
 - Branch sync helper is workflow guidance/tooling, not an enforced git hook; manual execution is still required before promotion.
 - GUI parallel mode is experimental; concurrent cache writes may still hit transient SQLite lock contention in high-load scenarios.
+- GUI AI profile test is synchronous today (single request path); very slow endpoints may briefly stall UI if repeatedly tested.
 
 ## Run / Validate
 - Syntax check:
@@ -228,13 +260,13 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T02:20:58+00:00
-- Latest experiment artifact: `experiments/runs/run_20260410T020023Z.json`
+- Last update UTC: 2026-04-10T03:24:14+00:00
+- Latest experiment artifact: `experiments/runs/run_20260410T031732Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:
-- `crypto_1d_12m_top20`: selected `baseline`, return +37.77%, maxDD 35.62%, sharpe 0.89
-- `crypto_8h_12m_top20`: selected `baseline`, return +56.01%, maxDD 28.10%, sharpe 1.11
-- `crypto_8h_24m_top10`: selected `tuned`, return +74.71%, maxDD 35.67%, sharpe 1.04
-- `crypto_12h_24m_top10`: selected `tuned`, return +74.99%, maxDD 40.38%, sharpe 1.21
+- `crypto_1d_12m_top20`: selected `baseline`, return +31.06%, maxDD 36.94%, sharpe 0.91
+- `crypto_8h_12m_top20`: selected `tuned`, return +67.93%, maxDD 38.30%, sharpe 1.08
+- `crypto_8h_24m_top10`: selected `tuned`, return +107.16%, maxDD 36.56%, sharpe 1.04
+- `crypto_12h_24m_top10`: selected `tuned`, return +86.63%, maxDD 37.66%, sharpe 1.11
 <!-- AUTO_HANDBACK_END -->
 

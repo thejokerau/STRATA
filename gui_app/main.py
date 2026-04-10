@@ -32,6 +32,8 @@ COUNTRY_LABELS = {
     "6": "Other / Manual",
 }
 
+AI_PROVIDER_OPTIONS = ["xai", "openai", "anthropic", "ollama", "openai_compatible", "openclaw"]
+
 
 def country_display_values() -> List[str]:
     return [f"{name} ({code})" for code, name in COUNTRY_LABELS.items()]
@@ -75,9 +77,17 @@ class CTMTGuiApp:
         self.auto_refresh_running = False
         self.busy = False
         self.running_tasks = 0
+        self.running_task_names: List[str] = []
+        self._task_id_seq = 0
+        self._running_tasks: Dict[int, str] = {}
         self.task_queue = deque()
+        self.queue_paused = False
         self.ai_last_source_text = ""
         self.ai_conversation: List[Dict[str, str]] = []
+        self.task_monitor_window: Optional[tk.Toplevel] = None
+        self.task_monitor_text: Optional[tk.Text] = None
+        self.task_monitor_job: Optional[str] = None
+        self.task_tab_job: Optional[str] = None
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -91,6 +101,10 @@ class CTMTGuiApp:
         self._update_run_controls_and_status()
 
     def _build_ui(self) -> None:
+        topbar = ttk.Frame(self.root, padding=(8, 4))
+        topbar.pack(side="top", fill="x")
+        ttk.Button(topbar, text="Tasks", command=self._open_task_monitor_tab).pack(side="right")
+
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True)
 
@@ -98,18 +112,21 @@ class CTMTGuiApp:
         self.backtest_tab = ttk.Frame(self.nb)
         self.ai_tab = ttk.Frame(self.nb)
         self.research_tab = ttk.Frame(self.nb)
+        self.task_tab = ttk.Frame(self.nb)
         self.settings_tab = ttk.Frame(self.nb)
 
         self.nb.add(self.live_tab, text="Live Dashboard")
         self.nb.add(self.backtest_tab, text="Backtest")
         self.nb.add(self.ai_tab, text="AI Analysis")
         self.nb.add(self.research_tab, text="Auto-Research")
+        self.nb.add(self.task_tab, text="Task Monitor")
         self.nb.add(self.settings_tab, text="Settings")
 
         self._build_live_tab()
         self._build_backtest_tab()
         self._build_ai_tab()
         self._build_research_tab()
+        self._build_task_tab()
         self._build_settings_tab()
         self._build_status_bar()
 
@@ -119,6 +136,7 @@ class CTMTGuiApp:
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(bar, textvariable=self.status_var)
         self.status_label.pack(side="left")
+        ttk.Button(bar, text="Tasks", command=self._show_task_status).pack(side="right", padx=(8, 0))
         self.status_progress = ttk.Progressbar(bar, mode="indeterminate", length=180)
         self.status_progress.pack(side="right")
 
@@ -177,6 +195,7 @@ class CTMTGuiApp:
 
         self.live_output = tk.Text(right, wrap="none")
         self.live_output.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.live_output)
 
     def _build_backtest_tab(self) -> None:
         top = ttk.Frame(self.backtest_tab, padding=8)
@@ -253,8 +272,10 @@ class CTMTGuiApp:
 
         self.bt_summary = tk.Text(out, height=10, wrap="word")
         self.bt_summary.pack(fill="x")
+        self._configure_dashboard_tags(self.bt_summary)
         self.bt_trades = tk.Text(out, wrap="none")
         self.bt_trades.pack(fill="both", expand=True, pady=(8, 0))
+        self._configure_dashboard_tags(self.bt_trades)
 
     def _build_ai_tab(self) -> None:
         top = ttk.Frame(self.ai_tab, padding=8)
@@ -342,6 +363,46 @@ class CTMTGuiApp:
         self.rs_output = tk.Text(self.research_tab, wrap="word")
         self.rs_output.pack(fill="both", expand=True, padx=8, pady=8)
 
+    def _build_task_tab(self) -> None:
+        top = ttk.Frame(self.task_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.task_tab, padding=8)
+        body.pack(fill="both", expand=True)
+
+        ttk.Button(top, text="Refresh", command=self._refresh_task_tab).pack(side="left")
+        self.btn_pause_queue = ttk.Button(top, text="Pause Queue", command=self._toggle_queue_pause)
+        self.btn_pause_queue.pack(side="left", padx=4)
+        ttk.Button(top, text="Stop/Remove Selected", command=self._stop_selected_task).pack(side="left")
+        ttk.Button(top, text="Move Up", command=lambda: self._reprioritize_queue(-1)).pack(side="left", padx=4)
+        ttk.Button(top, text="Move Down", command=lambda: self._reprioritize_queue(1)).pack(side="left")
+
+        cols = ttk.Frame(body)
+        cols.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(cols, text="Running", padding=6)
+        right = ttk.LabelFrame(cols, text="Queued", padding=6)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right.pack(side="left", fill="both", expand=True)
+
+        self.running_list = tk.Listbox(left, height=12)
+        self.running_list.pack(fill="both", expand=True)
+        self.queued_list = tk.Listbox(right, height=12)
+        self.queued_list.pack(fill="both", expand=True)
+
+        self.task_tab_output = tk.Text(body, height=4, wrap="word")
+        self.task_tab_output.pack(fill="x", pady=(8, 0))
+        self.task_terminal = tk.Text(
+            body,
+            height=12,
+            wrap="none",
+            bg="#101315",
+            fg="#9CF5C6",
+            insertbackground="#9CF5C6",
+        )
+        self.task_terminal.pack(fill="both", expand=True, pady=(6, 0))
+        self.task_terminal.insert("1.0", "CTMT Task Terminal\n")
+        self._refresh_task_tab()
+        self._schedule_task_tab_refresh()
+
     def _build_settings_tab(self) -> None:
         frame = ttk.Frame(self.settings_tab, padding=8)
         frame.pack(fill="both", expand=True)
@@ -366,18 +427,99 @@ class CTMTGuiApp:
         ttk.Button(dash_frame, text="Load Profile", command=self._load_dashboard_profile).pack(fill="x", pady=2)
         ttk.Button(dash_frame, text="Delete Profile", command=self._delete_dashboard_profile).pack(fill="x", pady=2)
 
-        ttk.Button(frame, text="Open AI Provider Settings (CLI)", command=self._show_ai_settings_hint).pack(fill="x", pady=4)
+        ai_frame = ttk.LabelFrame(frame, text="AI Profiles", padding=8)
+        ai_frame.pack(fill="x", pady=8)
+        self.ai_profile_var = tk.StringVar(value="")
+        self.ai_provider_var = tk.StringVar(value="xai")
+        self.ai_model_var = tk.StringVar(value="")
+        self.ai_endpoint_var = tk.StringVar(value="")
+        self.ai_internet_var = tk.BooleanVar(value=True)
+        self.ai_temp_var = tk.StringVar(value="0.2")
+        self.ai_key_var = tk.StringVar(value="")
+
+        self.ai_profile_combo = self._labeled_combo(ai_frame, "Profile", self.ai_profile_var, [], state="readonly")
+        self._labeled_combo(ai_frame, "Provider", self.ai_provider_var, AI_PROVIDER_OPTIONS, state="readonly")
+        self._labeled_entry(ai_frame, "Model", self.ai_model_var)
+        self._labeled_entry(ai_frame, "Endpoint", self.ai_endpoint_var)
+        self._labeled_entry(ai_frame, "Temperature", self.ai_temp_var)
+        key_row = ttk.Frame(ai_frame)
+        key_row.pack(fill="x", pady=2)
+        ttk.Label(key_row, text="API key", width=16).pack(side="left")
+        ttk.Entry(key_row, textvariable=self.ai_key_var, show="*", width=32).pack(side="left")
+        ttk.Checkbutton(ai_frame, text="Internet-enabled profile", variable=self.ai_internet_var).pack(anchor="w")
+
+        ai_btns = ttk.Frame(ai_frame)
+        ai_btns.pack(fill="x", pady=4)
+        ttk.Button(ai_btns, text="Refresh", command=self._refresh_ai_profiles).pack(side="left")
+        ttk.Button(ai_btns, text="Save Profile", command=self._save_ai_profile_from_form).pack(side="left", padx=4)
+        ttk.Button(ai_btns, text="Set Active", command=self._set_active_ai_profile_from_form).pack(side="left")
+        ttk.Button(ai_btns, text="Delete", command=self._delete_ai_profile_from_form).pack(side="left", padx=4)
+        ttk.Button(ai_btns, text="Set Key", command=self._set_ai_key_from_form).pack(side="left")
+        ttk.Button(ai_btns, text="Remove Key", command=self._remove_ai_key_from_form).pack(side="left", padx=4)
+        ttk.Button(ai_btns, text="Test", command=self._test_ai_profile_from_form).pack(side="left")
+
         ttk.Button(frame, text="Save Settings", command=self._persist_state).pack(fill="x")
 
         self.settings_output = tk.Text(frame, height=8, wrap="word")
         self.settings_output.pack(fill="both", expand=True, pady=(8, 0))
         self._append_settings("Settings are stored under %USERPROFILE%\\.ctmt\\gui\\gui_state.json")
+        self.ai_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_ai_profile_into_form())
+        self._refresh_ai_profiles()
 
     def _labeled_entry(self, parent, label: str, var: tk.StringVar) -> None:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=2)
         ttk.Label(row, text=label, width=16).pack(side="left")
         ttk.Entry(row, textvariable=var, width=18).pack(side="left")
+
+    def _configure_dashboard_tags(self, widget: tk.Text) -> None:
+        # Section/header emphasis
+        widget.tag_configure("hdr", foreground="#7FDBFF")
+        widget.tag_configure("subhdr", foreground="#FFD166")
+        # Action emphasis
+        widget.tag_configure("buy", foreground="#2ECC71")
+        widget.tag_configure("hold", foreground="#F39C12")
+        widget.tag_configure("sell", foreground="#E74C3C")
+        # Result emphasis
+        widget.tag_configure("okline", foreground="#2ECC71")
+        widget.tag_configure("errline", foreground="#FF6B6B")
+
+    def _apply_color_tags(self, widget: tk.Text) -> None:
+        if widget is None:
+            return
+        # Clear prior highlights
+        for tag in ("hdr", "subhdr", "buy", "hold", "sell", "okline", "errline"):
+            widget.tag_remove(tag, "1.0", tk.END)
+
+        def _tag_all(needle: str, tag: str, nocase: bool = True) -> None:
+            start = "1.0"
+            while True:
+                idx = widget.search(needle, start, stopindex=tk.END, nocase=nocase)
+                if not idx:
+                    break
+                end = f"{idx}+{len(needle)}c"
+                widget.tag_add(tag, idx, end)
+                start = end
+
+        # Headers and sections commonly present in CLI-style output
+        for k in ("LIVE DASHBOARD", "RISK SCORE BREAKDOWN", "PORTFOLIO CONTEXT", "TRADE HISTORY", "Final Value", "Total Return"):
+            _tag_all(k, "hdr")
+        for k in ("Assets loaded", "Running", "Queued"):
+            _tag_all(k, "subhdr")
+
+        # Action words (including emoji variants)
+        for k in ("🟢 BUY", " BUY "):
+            _tag_all(k, "buy")
+        for k in ("🟠 HOLD", " HOLD "):
+            _tag_all(k, "hold")
+        for k in ("🔴 SELL", " SELL "):
+            _tag_all(k, "sell")
+
+        # Outcome markers
+        for k in ("DONE", "SUCCESS", "OK"):
+            _tag_all(k, "okline")
+        for k in ("ERROR", "FAILED", "Traceback"):
+            _tag_all(k, "errline")
 
     def _labeled_combo(
         self,
@@ -474,9 +616,14 @@ class CTMTGuiApp:
 
     def _set_busy(self, busy: bool, task_name: str = "") -> None:
         if busy:
-            self.running_tasks += 1
+            self._task_id_seq += 1
+            task_id = int(self._task_id_seq)
+            self._running_tasks[task_id] = task_name or "Task"
         else:
-            self.running_tasks = max(0, self.running_tasks - 1)
+            task_id = None
+            # Backward-compatible no-op return var for non-start calls.
+        self.running_task_names = [self._running_tasks[k] for k in sorted(self._running_tasks.keys())]
+        self.running_tasks = len(self._running_tasks)
         self.busy = self.running_tasks > 0
         limit = self._task_limit()
         disable = self.running_tasks > 0 and limit <= 1
@@ -492,7 +639,7 @@ class CTMTGuiApp:
             btn = getattr(self, btn_name, None)
             if btn is not None:
                 btn.configure(state=run_state)
-        if (not busy) and self.task_queue and self.running_tasks < limit:
+        if (not busy) and (not self.queue_paused) and self.task_queue and self.running_tasks < limit:
             slots = limit - self.running_tasks
             for _ in range(min(slots, len(self.task_queue))):
                 next_name, next_job = self.task_queue.popleft()
@@ -509,6 +656,22 @@ class CTMTGuiApp:
         else:
             self.status_progress.stop()
             self.status_var.set("Ready")
+        self._refresh_task_tab()
+        return task_id
+
+    def _finish_task(self, task_id: Optional[int], task_name: str = "") -> None:
+        if task_id is not None and task_id in self._running_tasks:
+            del self._running_tasks[task_id]
+        elif task_name:
+            for k in sorted(self._running_tasks.keys()):
+                if self._running_tasks.get(k) == task_name:
+                    del self._running_tasks[k]
+                    break
+        elif self._running_tasks:
+            # Fallback: remove oldest active task.
+            oldest = sorted(self._running_tasks.keys())[0]
+            del self._running_tasks[oldest]
+        self._set_busy(False, task_name=task_name)
 
     def _update_run_controls_and_status(self) -> None:
         limit = self._task_limit()
@@ -534,6 +697,169 @@ class CTMTGuiApp:
         else:
             self.status_progress.stop()
             self.status_var.set("Ready")
+        self._refresh_task_tab()
+
+    def _task_snapshot(self) -> Dict[str, List[str]]:
+        running = list(self.running_task_names)
+        queued = [str(item[0]) for item in list(self.task_queue)]
+        return {"running": running, "queued": queued}
+
+    def _show_task_status(self) -> None:
+        if self.task_monitor_window is not None and self.task_monitor_window.winfo_exists():
+            self.task_monitor_window.lift()
+            self.task_monitor_window.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Task Monitor")
+        win.geometry("640x360")
+        self.task_monitor_window = win
+        text = tk.Text(win, wrap="word")
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.task_monitor_text = text
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_row, text="Refresh Now", command=self._refresh_task_monitor).pack(side="left")
+        ttk.Button(btn_row, text="Close", command=self._close_task_monitor).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", self._close_task_monitor)
+        self._refresh_task_monitor()
+
+    def _open_task_monitor_tab(self) -> None:
+        self.nb.select(self.task_tab)
+        self._refresh_task_tab()
+
+    def _refresh_task_monitor(self) -> None:
+        if self.task_monitor_window is None or not self.task_monitor_window.winfo_exists():
+            return
+        snap = self._task_snapshot()
+        running = snap["running"]
+        queued = snap["queued"]
+        lines: List[str] = []
+        lines.append(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Running slots: {self.running_tasks}/{self._task_limit()}")
+        lines.append("")
+        lines.append("Current Running Tasks:")
+        if running:
+            for i, name in enumerate(running, 1):
+                lines.append(f"{i}. {name}")
+        else:
+            lines.append("None")
+        lines.append("")
+        lines.append("Queued Tasks:")
+        if queued:
+            for i, name in enumerate(queued, 1):
+                lines.append(f"{i}. {name}")
+        else:
+            lines.append("None")
+        if self.task_monitor_text is not None:
+            self.task_monitor_text.delete("1.0", tk.END)
+            self.task_monitor_text.insert("1.0", "\n".join(lines))
+        if self.task_monitor_job:
+            try:
+                self.root.after_cancel(self.task_monitor_job)
+            except Exception:
+                pass
+        self.task_monitor_job = self.root.after(1000, self._refresh_task_monitor)
+
+    def _close_task_monitor(self) -> None:
+        if self.task_monitor_job:
+            try:
+                self.root.after_cancel(self.task_monitor_job)
+            except Exception:
+                pass
+            self.task_monitor_job = None
+        if self.task_monitor_window is not None and self.task_monitor_window.winfo_exists():
+            self.task_monitor_window.destroy()
+        self.task_monitor_window = None
+        self.task_monitor_text = None
+
+    def _refresh_task_tab(self) -> None:
+        if not hasattr(self, "running_list") or not hasattr(self, "queued_list"):
+            return
+        self.running_list.delete(0, tk.END)
+        for i, name in enumerate(self.running_task_names, 1):
+            self.running_list.insert(tk.END, f"{i}. {name}")
+        self.queued_list.delete(0, tk.END)
+        for i, item in enumerate(list(self.task_queue), 1):
+            qname = str(item[0])
+            self.queued_list.insert(tk.END, f"{i}. {qname}")
+        if hasattr(self, "btn_pause_queue"):
+            self.btn_pause_queue.configure(text="Resume Queue" if self.queue_paused else "Pause Queue")
+        if hasattr(self, "task_tab_output"):
+            self.task_tab_output.delete("1.0", tk.END)
+            self.task_tab_output.insert(
+                "1.0",
+                f"Running: {self.running_tasks}/{self._task_limit()} | Queued: {len(self.task_queue)} | Queue paused: {self.queue_paused}",
+            )
+
+    def _append_task_terminal(self, line: str) -> None:
+        if not hasattr(self, "task_terminal"):
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        msg = f"[{ts}] {line}\n"
+        self.task_terminal.insert("end", msg)
+        self.task_terminal.see("end")
+        # Keep terminal reasonably bounded in GUI memory.
+        max_lines = 1500
+        current_lines = int(self.task_terminal.index("end-1c").split(".")[0])
+        if current_lines > max_lines:
+            drop = current_lines - max_lines
+            self.task_terminal.delete("1.0", f"{drop}.0")
+
+    def _append_task_terminal_from_worker(self, line: str) -> None:
+        self.root.after(0, lambda: self._append_task_terminal(line))
+
+    def _schedule_task_tab_refresh(self) -> None:
+        if self.task_tab_job:
+            try:
+                self.root.after_cancel(self.task_tab_job)
+            except Exception:
+                pass
+        self._refresh_task_tab()
+        self.task_tab_job = self.root.after(1000, self._schedule_task_tab_refresh)
+
+    def _toggle_queue_pause(self) -> None:
+        self.queue_paused = not self.queue_paused
+        self._append_task_terminal(f"QUEUE {'PAUSED' if self.queue_paused else 'RESUMED'}")
+        self._refresh_task_tab()
+        if (not self.queue_paused) and self.running_tasks < self._task_limit() and self.task_queue:
+            self._set_busy(False, task_name="Queue resumed")
+
+    def _stop_selected_task(self) -> None:
+        qsel = self.queued_list.curselection() if hasattr(self, "queued_list") else ()
+        if qsel:
+            idx = int(qsel[0])
+            items = list(self.task_queue)
+            if 0 <= idx < len(items):
+                removed = items.pop(idx)
+                self.task_queue = deque(items)
+                self._append_settings(f"Removed queued task: {removed[0]}")
+                self._append_task_terminal(f"REMOVED queued task: {removed[0]}")
+                self._refresh_task_tab()
+                return
+        rsel = self.running_list.curselection() if hasattr(self, "running_list") else ()
+        if rsel:
+            messagebox.showinfo("Task Control", "Stopping active running tasks is not supported yet. You can remove queued tasks.")
+            return
+        messagebox.showinfo("Task Control", "Select a queued or running task first.")
+
+    def _reprioritize_queue(self, direction: int) -> None:
+        qsel = self.queued_list.curselection() if hasattr(self, "queued_list") else ()
+        if not qsel:
+            messagebox.showinfo("Queue Priority", "Select a queued task first.")
+            return
+        idx = int(qsel[0])
+        items = list(self.task_queue)
+        new_idx = idx + int(direction)
+        if new_idx < 0 or new_idx >= len(items):
+            return
+        items[idx], items[new_idx] = items[new_idx], items[idx]
+        self.task_queue = deque(items)
+        moved = str(items[new_idx][0]) if 0 <= new_idx < len(items) else "task"
+        self._append_task_terminal(f"REPRIORITIZED queued task: {moved} -> position {new_idx + 1}")
+        self._refresh_task_tab()
+        self.queued_list.selection_set(new_idx)
 
     def _bridge_for_task(self) -> EngineBridge:
         if self._task_limit() <= 1:
@@ -584,7 +910,9 @@ class CTMTGuiApp:
         self._start_run_all_panels()
 
     def _start_run_all_panels(self) -> None:
-        self._set_busy(True, "Live Dashboard (All Panels)")
+        task_name = "Live Dashboard (All Panels)"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START Live Dashboard (All Panels)")
         self.live_output.delete("1.0", tk.END)
 
         def worker():
@@ -592,6 +920,9 @@ class CTMTGuiApp:
             chunks = []
             for p in self.live_panels:
                 res = bridge.run_live_panel(asdict(p))
+                log = (res.get("log", "") or "").strip()
+                if log:
+                    self._append_task_terminal_from_worker(f"LOG [{p.name}] {log[:4000]}")
                 if not res.get("ok"):
                     chunks.append(f"=== {p.name} ===\nERROR: {res.get('error', 'unknown')}\n")
                     continue
@@ -613,7 +944,7 @@ class CTMTGuiApp:
                 chunks.append("\n".join(text) + "\n")
 
             out = "\n".join(chunks)
-            self.root.after(0, lambda: self._finish_live_output(out))
+            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -626,13 +957,18 @@ class CTMTGuiApp:
         self._start_run_live_job(panel, selected_only)
 
     def _start_run_live_job(self, panel: LivePanelConfig, selected_only: bool = False) -> None:
-        self._set_busy(True, f"Live Dashboard ({panel.name})")
+        task_name = f"Live Dashboard ({panel.name})"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal(f"START {task_name}")
         if selected_only:
             self.live_output.delete("1.0", tk.END)
 
         def worker():
             bridge = self._bridge_for_task()
             res = bridge.run_live_panel(asdict(panel))
+            log = (res.get("log", "") or "").strip()
+            if log:
+                self._append_task_terminal_from_worker(f"LOG [{panel.name}] {log[:4000]}")
             if not res.get("ok"):
                 out = f"ERROR: {res.get('error', 'unknown')}"
             else:
@@ -652,14 +988,16 @@ class CTMTGuiApp:
                     for n in notes:
                         lines.append(f"- {n}")
                 out = "\n".join(lines)
-            self.root.after(0, lambda: self._finish_live_output(out))
+            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_live_output(self, text: str) -> None:
+    def _finish_live_output(self, text: str, task_name: str = "Live Dashboard", task_id: Optional[int] = None) -> None:
         self.live_output.delete("1.0", tk.END)
         self.live_output.insert("1.0", text)
-        self._set_busy(False)
+        self._apply_color_tags(self.live_output)
+        self._append_task_terminal(f"DONE {task_name}")
+        self._finish_task(task_id, task_name=task_name)
         self._persist_state()
 
     def _start_auto_refresh(self) -> None:
@@ -690,7 +1028,9 @@ class CTMTGuiApp:
         self._start_run_backtest()
 
     def _start_run_backtest(self) -> None:
-        self._set_busy(True, "Backtest")
+        task_name = "Backtest"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START Backtest")
         self.bt_summary.delete("1.0", tk.END)
         self.bt_trades.delete("1.0", tk.END)
 
@@ -739,17 +1079,24 @@ class CTMTGuiApp:
         def worker():
             bridge = self._bridge_for_task()
             res = bridge.run_backtest(cfg)
-            self.root.after(0, lambda: self._finish_backtest_output(res))
+            log = (res.get("log", "") or "").strip()
+            if log:
+                self._append_task_terminal_from_worker(f"LOG [Backtest] {log[:6000]}")
+            self.root.after(0, lambda: self._finish_backtest_output(res, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_backtest_output(self, res: Dict[str, Any]) -> None:
+    def _finish_backtest_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
             self.bt_summary.insert("1.0", f"ERROR: {res.get('error', 'unknown')}")
+            self._append_task_terminal(f"DONE Backtest (error: {res.get('error', 'unknown')})")
         else:
             self.bt_summary.insert("1.0", res.get("summary_text", ""))
             self.bt_trades.insert("1.0", res.get("trades_text", ""))
-        self._set_busy(False)
+            self._append_task_terminal("DONE Backtest")
+        self._apply_color_tags(self.bt_summary)
+        self._apply_color_tags(self.bt_trades)
+        self._finish_task(task_id, task_name="Backtest")
 
     def _run_ai_analysis(self) -> None:
         if self._queue_if_busy("AI Analysis", self._start_run_ai_analysis):
@@ -757,12 +1104,15 @@ class CTMTGuiApp:
         self._start_run_ai_analysis()
 
     def _start_run_ai_analysis(self) -> None:
-        self._set_busy(True, "AI Analysis")
+        task_name = "AI Analysis"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START AI Analysis")
         self.ai_output.delete("1.0", tk.END)
         text = self._resolve_ai_source_text()
         if not text.strip():
             self.ai_output.insert("1.0", "No source text available.")
-            self._set_busy(False)
+            self._append_task_terminal("DONE AI Analysis (no source text)")
+            self._finish_task(task_id, task_name=task_name)
             return
         self.ai_last_source_text = text
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -771,21 +1121,26 @@ class CTMTGuiApp:
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
             if not ok:
-                self._set_busy(False)
+                self._finish_task(task_id, task_name=task_name)
                 self.ai_output.insert("1.0", "AI request canceled by user.")
+                self._append_task_terminal("DONE AI Analysis (canceled)")
                 return
 
         def worker():
             bridge = self._bridge_for_task()
             res = bridge.run_ai_analysis(text, dt, prompt_override=prompt)
-            self.root.after(0, lambda: self._finish_ai_output(res))
+            log = (res.get("log", "") or "").strip()
+            if log:
+                self._append_task_terminal_from_worker(f"LOG [AI] {log[:6000]}")
+            self.root.after(0, lambda: self._finish_ai_output(res, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_ai_output(self, res: Dict[str, Any]) -> None:
+    def _finish_ai_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
             self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n\nPrompt preview:\n\n")
             self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
+            self._append_task_terminal("DONE AI Analysis (failed/empty)")
         else:
             response = res.get("response", "")
             self.ai_output.insert("1.0", response)
@@ -793,7 +1148,8 @@ class CTMTGuiApp:
             if used_prompt:
                 self.ai_conversation.append({"role": "user", "content": used_prompt})
             self.ai_conversation.append({"role": "assistant", "content": response})
-        self._set_busy(False)
+            self._append_task_terminal("DONE AI Analysis")
+        self._finish_task(task_id, task_name="AI Analysis")
 
     def _run_ai_followup(self) -> None:
         if self._queue_if_busy("AI Follow-up", self._start_run_ai_followup):
@@ -808,7 +1164,9 @@ class CTMTGuiApp:
         if not self.ai_last_source_text.strip() and not self.ai_conversation:
             messagebox.showinfo("Follow-up", "Run an initial AI analysis first.")
             return
-        self._set_busy(True, "AI Follow-up")
+        task_name = "AI Follow-up"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START AI Follow-up")
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         history = self.ai_conversation[-6:]
         lines = [
@@ -833,7 +1191,8 @@ class CTMTGuiApp:
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Follow-up", f"Send this follow-up prompt?\n\n{preview}")
             if not ok:
-                self._set_busy(False)
+                self._finish_task(task_id, task_name=task_name)
+                self._append_task_terminal("DONE AI Follow-up (canceled)")
                 return
 
         def worker():
@@ -843,14 +1202,18 @@ class CTMTGuiApp:
                 dt,
                 prompt_override=prompt,
             )
-            self.root.after(0, lambda: self._finish_ai_followup(res, follow))
+            log = (res.get("log", "") or "").strip()
+            if log:
+                self._append_task_terminal_from_worker(f"LOG [AI Follow-up] {log[:6000]}")
+            self.root.after(0, lambda: self._finish_ai_followup(res, follow, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_ai_followup(self, res: Dict[str, Any], follow_text: str) -> None:
+    def _finish_ai_followup(self, res: Dict[str, Any], follow_text: str, task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
             self.ai_output.insert("1.0", "AI follow-up failed.\n\n")
             self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
+            self._append_task_terminal("DONE AI Follow-up (failed)")
         else:
             response = res.get("response", "")
             current = self.ai_output.get("1.0", tk.END).strip()
@@ -863,7 +1226,8 @@ class CTMTGuiApp:
             self.ai_conversation.append({"role": "user", "content": follow_text})
             self.ai_conversation.append({"role": "assistant", "content": response})
             self.ai_followup_var.set("")
-        self._set_busy(False)
+            self._append_task_terminal("DONE AI Follow-up")
+        self._finish_task(task_id, task_name="AI Follow-up")
 
     def _resolve_ai_source_text(self) -> str:
         source = self.ai_source.get().strip().lower()
@@ -918,7 +1282,8 @@ class CTMTGuiApp:
 
     def _start_run_research_job(self, standard: bool) -> None:
         task_name = "Auto-Research (Standard)" if standard else "Auto-Research (Comprehensive)"
-        self._set_busy(True, task_name)
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal(f"START {task_name}")
         self.rs_output.delete("1.0", tk.END)
 
         def worker():
@@ -933,7 +1298,13 @@ class CTMTGuiApp:
                     optuna_trials=max(1, int(self.rs_trials.get() or "10")),
                     optuna_jobs=max(1, int(self.rs_jobs.get() or "4")),
                 )
-            self.root.after(0, lambda: self._finish_research_output(out))
+            stdlog = (out.get("stdout", "") or "").strip()
+            errlog = (out.get("stderr", "") or "").strip()
+            if stdlog:
+                self._append_task_terminal_from_worker(f"LOG [{task_name}] {stdlog[:6000]}")
+            if errlog:
+                self._append_task_terminal_from_worker(f"ERR [{task_name}] {errlog[:6000]}")
+            self.root.after(0, lambda: self._finish_research_output(out, task_name, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -976,14 +1347,18 @@ class CTMTGuiApp:
                         )
         return scenarios
 
-    def _finish_research_output(self, out: Dict[str, Any]) -> None:
+    def _finish_research_output(self, out: Dict[str, Any], task_name: str = "Auto-Research", task_id: Optional[int] = None) -> None:
         lines = [f"Command: {out.get('cmd', '')}", f"Return code: {out.get('returncode', '')}", ""]
         if out.get("stdout"):
             lines += ["STDOUT:", out["stdout"], ""]
         if out.get("stderr"):
             lines += ["STDERR:", out["stderr"], ""]
         self.rs_output.insert("1.0", "\n".join(lines))
-        self._set_busy(False)
+        if out.get("ok"):
+            self._append_task_terminal("DONE Auto-Research")
+        else:
+            self._append_task_terminal("DONE Auto-Research (error)")
+        self._finish_task(task_id, task_name=task_name)
 
     def _save_dashboard_profile(self) -> None:
         name = self.dashboard_name_var.get().strip() or "default"
@@ -1021,6 +1396,129 @@ class CTMTGuiApp:
         else:
             self._append_settings(f"Profile not found: {name}")
 
+    def _refresh_ai_profiles(self) -> None:
+        res = self.bridge.list_ai_profiles()
+        if not res.get("ok"):
+            self._append_settings(f"AI refresh failed: {res.get('error', 'unknown')}")
+            return
+        profiles = res.get("profiles", []) or []
+        self._ai_profiles_cache = {p.get("name", ""): p for p in profiles if isinstance(p, dict)}
+        names = list(self._ai_profiles_cache.keys())
+        self.ai_profile_combo["values"] = names
+        active = str(res.get("active_profile", "") or "")
+        if active and active in self._ai_profiles_cache:
+            self.ai_profile_var.set(active)
+        elif names:
+            self.ai_profile_var.set(names[0])
+        else:
+            self.ai_profile_var.set("")
+        self._load_ai_profile_into_form()
+        self._append_settings(f"AI profiles loaded: {len(names)} (active: {self.ai_profile_var.get() or 'none'})")
+
+    def _load_ai_profile_into_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        prof = getattr(self, "_ai_profiles_cache", {}).get(name, {})
+        if not prof:
+            return
+        self.ai_provider_var.set(str(prof.get("provider", "xai") or "xai"))
+        self.ai_model_var.set(str(prof.get("model", "") or ""))
+        self.ai_endpoint_var.set(str(prof.get("endpoint", "") or ""))
+        self.ai_internet_var.set(bool(prof.get("internet_access", True)))
+        self.ai_temp_var.set(str(prof.get("temperature", 0.2)))
+        key_state = "set" if bool(prof.get("api_key_set", False)) else "missing"
+        key_source = str(prof.get("api_key_source", "") or "")
+        self._append_settings(f"Profile `{name}` loaded. API key: {key_state} ({key_source})")
+
+    def _save_ai_profile_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        if not name:
+            messagebox.showinfo("AI Profiles", "Enter/select a profile name first.")
+            return
+        try:
+            temp = float(self.ai_temp_var.get().strip() or "0.2")
+        except Exception:
+            temp = 0.2
+        res = self.bridge.upsert_ai_profile(
+            name=name,
+            provider=self.ai_provider_var.get().strip().lower(),
+            model=self.ai_model_var.get().strip(),
+            endpoint=self.ai_endpoint_var.get().strip(),
+            internet_access=bool(self.ai_internet_var.get()),
+            temperature=temp,
+            activate=False,
+        )
+        if not res.get("ok"):
+            self._append_settings(f"Save AI profile failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Saved AI profile: {name}")
+        self._refresh_ai_profiles()
+        self.ai_profile_var.set(name)
+        self._load_ai_profile_into_form()
+
+    def _set_active_ai_profile_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        if not name:
+            return
+        res = self.bridge.set_active_ai_profile(name)
+        if not res.get("ok"):
+            self._append_settings(f"Set active failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Active AI profile set: {name}")
+        self._refresh_ai_profiles()
+
+    def _delete_ai_profile_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        if not name:
+            return
+        ok = messagebox.askyesno("Delete AI Profile", f"Delete AI profile '{name}'?")
+        if not ok:
+            return
+        res = self.bridge.delete_ai_profile(name)
+        if not res.get("ok"):
+            self._append_settings(f"Delete AI profile failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Deleted AI profile: {name}")
+        self._refresh_ai_profiles()
+
+    def _set_ai_key_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        key = self.ai_key_var.get().strip()
+        if not name or not key:
+            messagebox.showinfo("AI API Key", "Select profile and enter API key.")
+            return
+        res = self.bridge.set_ai_profile_key(name, key)
+        if not res.get("ok"):
+            self._append_settings(f"Set API key failed: {res.get('error', 'unknown')}")
+            return
+        self.ai_key_var.set("")
+        self._append_settings(f"Stored API key for profile: {name}")
+        self._refresh_ai_profiles()
+
+    def _remove_ai_key_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        if not name:
+            return
+        res = self.bridge.remove_ai_profile_key(name)
+        if not res.get("ok"):
+            self._append_settings(f"Remove API key failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Removed stored API key for profile: {name}")
+        self._refresh_ai_profiles()
+
+    def _test_ai_profile_from_form(self) -> None:
+        name = self.ai_profile_var.get().strip()
+        if not name:
+            return
+        self._append_settings(f"Testing AI profile: {name} ...")
+        res = self.bridge.test_ai_profile(name)
+        if res.get("ok"):
+            snippet = (res.get("response", "") or "").strip()[:200]
+            self._append_settings(f"AI test OK ({name}): {snippet}")
+        else:
+            err = res.get("error", "unknown")
+            status = res.get("status", "")
+            self._append_settings(f"AI test failed ({name}) status={status}: {err}")
+
     def _show_ai_settings_hint(self) -> None:
         messagebox.showinfo(
             "AI Provider Settings",
@@ -1052,7 +1550,17 @@ def run_gui() -> None:
     root = tk.Tk()
     repo_root = Path(__file__).resolve().parents[1]
     app = CTMTGuiApp(root, repo_root=repo_root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app._persist_state(), root.destroy()))
+    def _shutdown():
+        app._close_task_monitor()
+        if app.task_tab_job:
+            try:
+                root.after_cancel(app.task_tab_job)
+            except Exception:
+                pass
+            app.task_tab_job = None
+        app._persist_state()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", _shutdown)
     root.mainloop()
 
 

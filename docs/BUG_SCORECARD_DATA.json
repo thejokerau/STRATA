@@ -1,0 +1,97 @@
+{
+  "builds": [
+    {
+      "build_id": "gui-nightly-20260410A",
+      "branch": "gui-nightly",
+      "date": "2026-04-10",
+      "notes": "Initial consolidated scoreboard snapshot from user-reported issues.",
+      "items": [
+        {
+          "id": "B001",
+          "title": "run_gui.py import path issue (ModuleNotFoundError: gui_app)",
+          "status": "Fixed"
+        },
+        {
+          "id": "B002",
+          "title": "SQLite cross-thread error in GUI",
+          "status": "Fixed"
+        },
+        {
+          "id": "B003",
+          "title": "Mixed cache date parse crash (date-only vs datetime)",
+          "status": "Fixed"
+        },
+        {
+          "id": "B004",
+          "title": "AI call not running due to missing env/API config visibility",
+          "status": "Fixed"
+        },
+        {
+          "id": "B005",
+          "title": "xAI 400 failures from model/endpoint mismatch",
+          "status": "Fixed"
+        },
+        {
+          "id": "B006",
+          "title": "Generated test/report files polluting git",
+          "status": "Fixed"
+        },
+        {
+          "id": "B007",
+          "title": "Live action label artifact (??)",
+          "status": "Fixed"
+        },
+        {
+          "id": "B008",
+          "title": "Task Monitor stale until manual click",
+          "status": "Fixed"
+        },
+        {
+          "id": "B009",
+          "title": "Task Monitor removed wrong task under overlap",
+          "status": "Fixed"
+        },
+        {
+          "id": "B010",
+          "title": "Tasks button visibility issue",
+          "status": "Fixed"
+        },
+        {
+          "id": "B011",
+          "title": "Task Monitor lacked queue operations",
+          "status": "Fixed"
+        },
+        {
+          "id": "B012",
+          "title": "Task Monitor lacked CLI-style debug output",
+          "status": "Fixed"
+        },
+        {
+          "id": "B013",
+          "title": "GUI backtest options behind CLI options",
+          "status": "Fixed"
+        },
+        {
+          "id": "B014",
+          "title": "AI GUI lacked prompt acceptance and follow-up conversation",
+          "status": "Fixed"
+        },
+        {
+          "id": "B015",
+          "title": "AI GUI lacked in-app provider/model/key management",
+          "status": "Fixed"
+        },
+        {
+          "id": "B016",
+          "title": "Stop/cancel currently running task from Task Monitor",
+          "status": "Partial"
+        },
+        {
+          "id": "B017",
+          "title": "Parallel mode high-load robustness (transient DB lock risk)",
+          "status": "Partial"
+        }
+      ]
+    }
+  ]
+}

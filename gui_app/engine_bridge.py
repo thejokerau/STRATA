@@ -43,7 +43,9 @@ class EngineBridge:
         with self._lock:
             stream = io.StringIO()
             with redirect_stdout(stream), redirect_stderr(stream):
-                return self._run_live_panel_impl(cfg)
+                out = self._run_live_panel_impl(cfg)
+            out["log"] = stream.getvalue()
+            return out
 
     def _run_live_panel_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         is_crypto = str(cfg.get("market", "crypto")).lower() == "crypto"
@@ -91,7 +93,9 @@ class EngineBridge:
         with self._lock:
             stream = io.StringIO()
             with redirect_stdout(stream), redirect_stderr(stream):
-                return self._run_backtest_impl(cfg)
+                out = self._run_backtest_impl(cfg)
+            out["log"] = stream.getvalue()
+            return out
 
     def _run_backtest_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         is_crypto = str(cfg.get("market", "crypto")).lower() == "crypto"
@@ -206,6 +210,180 @@ class EngineBridge:
         except Exception:
             return "You are Grok, built by xAI."
 
+    def list_ai_profiles(self) -> Dict[str, Any]:
+        with self._lock:
+            prefs = self.mod.load_ai_preferences()
+            secrets = self.mod.load_ai_secrets()
+            active_name, _ = self.mod.get_active_ai_profile(prefs)
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            out: List[Dict[str, Any]] = []
+            if isinstance(profiles, dict):
+                for name, profile in profiles.items():
+                    if not isinstance(name, str) or not isinstance(profile, dict):
+                        continue
+                    provider = str(profile.get("provider", "")).strip().lower()
+                    model = str(profile.get("model", self.mod.provider_default_model(provider))).strip()
+                    endpoint = str(profile.get("endpoint", self.mod.provider_default_endpoint(provider))).strip() or self.mod.provider_default_endpoint(provider)
+                    internet_access = bool(profile.get("internet_access", self.mod.provider_default_internet_access(provider)))
+                    key, key_source = self.mod.resolve_profile_api_key(profile, secrets)
+                    out.append(
+                        {
+                            "name": name,
+                            "provider": provider,
+                            "model": model,
+                            "endpoint": endpoint,
+                            "internet_access": internet_access,
+                            "temperature": float(profile.get("temperature", 0.2)),
+                            "api_key_env": str(profile.get("api_key_env", "") or ""),
+                            "api_key_name": str(profile.get("api_key_name", "") or ""),
+                            "api_key_set": bool(key),
+                            "api_key_source": key_source,
+                            "active": name == active_name,
+                        }
+                    )
+            return {"ok": True, "active_profile": active_name, "profiles": out}
+
+    def upsert_ai_profile(
+        self,
+        name: str,
+        provider: str,
+        model: str,
+        endpoint: str,
+        internet_access: bool,
+        temperature: float = 0.2,
+        api_key_env: Optional[str] = None,
+        activate: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            if not pname:
+                return {"ok": False, "error": "Profile name is required."}
+            pvd = str(provider).strip().lower()
+            if not pvd:
+                return {"ok": False, "error": "Provider is required."}
+            prefs = self.mod.load_ai_preferences()
+            if not isinstance(prefs, dict):
+                prefs = self.mod.default_ai_preferences()
+            profiles = prefs.get("profiles", {})
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles[pname] = {
+                "provider": pvd,
+                "model": str(model).strip() or self.mod.provider_default_model(pvd),
+                "endpoint": str(endpoint).strip() or self.mod.provider_default_endpoint(pvd),
+                "api_key_env": str(api_key_env or "").strip() or self.mod.provider_default_envvar(pvd),
+                "api_key_name": f"{pname}_api_key",
+                "internet_access": bool(internet_access),
+                "temperature": float(temperature),
+            }
+            prefs["profiles"] = profiles
+            if activate:
+                prefs["active_profile"] = pname
+            self.mod.save_ai_preferences(prefs)
+            return {"ok": True}
+
+    def set_active_ai_profile(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            prefs = self.mod.load_ai_preferences()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            pname = str(name).strip()
+            if not isinstance(profiles, dict) or pname not in profiles:
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prefs["active_profile"] = pname
+            self.mod.save_ai_preferences(prefs)
+            return {"ok": True}
+
+    def delete_ai_profile(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            prefs = self.mod.load_ai_preferences()
+            secrets = self.mod.load_ai_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles:
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles.pop(pname)
+            key_name = str((prof or {}).get("api_key_name", "") or "").strip()
+            if key_name and key_name in secrets:
+                del secrets[key_name]
+            if prefs.get("active_profile") == pname:
+                prefs["active_profile"] = next(iter(profiles.keys()), "")
+            prefs["profiles"] = profiles
+            self.mod.save_ai_preferences(prefs)
+            self.mod.save_ai_secrets(secrets)
+            return {"ok": True}
+
+    def set_ai_profile_key(self, name: str, api_key: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            key = str(api_key).strip()
+            if not pname or not key:
+                return {"ok": False, "error": "Profile and API key are required."}
+            prefs = self.mod.load_ai_preferences()
+            secrets = self.mod.load_ai_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles[pname]
+            key_name = str(prof.get("api_key_name", "") or "").strip() or f"{pname}_api_key"
+            prof["api_key_name"] = key_name
+            profiles[pname] = prof
+            prefs["profiles"] = profiles
+            secrets[key_name] = key
+            self.mod.save_ai_preferences(prefs)
+            self.mod.save_ai_secrets(secrets)
+            return {"ok": True}
+
+    def remove_ai_profile_key(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            prefs = self.mod.load_ai_preferences()
+            secrets = self.mod.load_ai_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            key_name = str(profiles[pname].get("api_key_name", "") or "").strip()
+            if key_name and key_name in secrets:
+                del secrets[key_name]
+                self.mod.save_ai_secrets(secrets)
+            return {"ok": True}
+
+    def test_ai_profile(self, name: str, timeout_prompt: str = "Reply with OK.") -> Dict[str, Any]:
+        with self._lock:
+            prefs = self.mod.load_ai_preferences()
+            secrets = self.mod.load_ai_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            pname = str(name).strip()
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles[pname]
+            provider = str(prof.get("provider", "")).strip().lower()
+            model = str(prof.get("model", self.mod.provider_default_model(provider))).strip()
+            endpoint = str(prof.get("endpoint", self.mod.provider_default_endpoint(provider))).strip() or self.mod.provider_default_endpoint(provider)
+            temperature = float(prof.get("temperature", 0.0))
+            internet_access = bool(prof.get("internet_access", self.mod.provider_default_internet_access(provider)))
+            system_prompt = self.mod.ONLINE_SYSTEM_PROMPT if internet_access else self.mod.OFFLINE_SYSTEM_PROMPT
+            key, key_source = self.mod.resolve_profile_api_key(prof, secrets)
+
+            if self.mod.provider_needs_api_key(provider) and not key:
+                return {"ok": False, "error": f"Missing API key ({key_source})."}
+
+            if provider in ("xai", "openai", "openai_compatible", "openclaw"):
+                text, status, err = self.mod.call_openai_style_chat(
+                    endpoint, model, timeout_prompt, system_prompt, temperature, api_key=key
+                )
+                return {"ok": bool(text), "response": text or "", "status": status, "error": err}
+            if provider == "anthropic":
+                text, status, err = self.mod.call_anthropic_chat(
+                    endpoint, model, timeout_prompt, system_prompt, temperature, api_key=key
+                )
+                return {"ok": bool(text), "response": text or "", "status": status, "error": err}
+            if provider == "ollama":
+                text, status, err = self.mod.call_ollama_chat(
+                    endpoint, model, timeout_prompt, system_prompt, temperature
+                )
+                return {"ok": bool(text), "response": text or "", "status": status, "error": err}
+            return {"ok": False, "error": f"Unsupported provider: {provider}"}
+
     def run_ai_analysis(
         self,
         dashboard_text: str,
@@ -214,18 +392,21 @@ class EngineBridge:
         system_prompt_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
-            prompt = prompt_override if (prompt_override and str(prompt_override).strip()) else self.mod.build_grok_prompt(dashboard_text, datetime_context)
-            system_prompt = (
-                system_prompt_override
-                if (system_prompt_override and str(system_prompt_override).strip())
-                else self._default_system_prompt_for_active_profile()
-            )
-            response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
+            stream = io.StringIO()
+            with redirect_stdout(stream), redirect_stderr(stream):
+                prompt = prompt_override if (prompt_override and str(prompt_override).strip()) else self.mod.build_grok_prompt(dashboard_text, datetime_context)
+                system_prompt = (
+                    system_prompt_override
+                    if (system_prompt_override and str(system_prompt_override).strip())
+                    else self._default_system_prompt_for_active_profile()
+                )
+                response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
             return {
                 "ok": bool(response),
                 "prompt": prompt,
                 "response": response or "",
                 "system_prompt": system_prompt,
+                "log": stream.getvalue(),
             }
 
     def run_standard_research(self) -> Dict[str, Any]:
