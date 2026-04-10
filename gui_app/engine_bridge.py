@@ -1066,9 +1066,30 @@ class EngineBridge:
             ledger = load_trade_ledger()
             if not isinstance(ledger, dict):
                 ledger = default_trade_ledger()
+            entries = ledger.get("entries", [])
+            if not isinstance(entries, list):
+                entries = []
             open_positions = ledger.get("open_positions", {})
             if not isinstance(open_positions, dict):
                 open_positions = {}
+            activity_guard = ledger.get("activity_guard", {})
+            if not isinstance(activity_guard, dict):
+                activity_guard = {}
+
+            # Backfill older rows where is_execution was missing.
+            entries_changed = False
+            fixed_entries: List[Dict[str, Any]] = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                ee = dict(e)
+                if "is_execution" not in ee:
+                    ee["is_execution"] = False
+                    entries_changed = True
+                else:
+                    ee["is_execution"] = bool(ee.get("is_execution", False))
+                fixed_entries.append(ee)
+
             cleaned: Dict[str, Any] = {}
             changed = False
             for k, v in open_positions.items():
@@ -1083,12 +1104,79 @@ class EngineBridge:
                     changed = True
                     continue
                 cleaned[k] = v
-            if changed:
+            if changed or entries_changed:
+                ledger["entries"] = fixed_entries
                 ledger["open_positions"] = cleaned
+                ledger["activity_guard"] = activity_guard
                 save_trade_ledger(ledger)
-            return {"ok": True, "ledger": ledger}
+            signal_entries = [x for x in fixed_entries if not bool(x.get("is_execution", False))]
+            execution_entries = [x for x in fixed_entries if bool(x.get("is_execution", False))]
+            return {
+                "ok": True,
+                "ledger": ledger,
+                "signal_entries": signal_entries,
+                "execution_entries": execution_entries,
+            }
 
-    def record_signal_event(self, event: Dict[str, Any], cooldown_minutes: int = 240, allow_duplicate: bool = False) -> Dict[str, Any]:
+    def prune_signal_only_history(self, keep_last_signals: int = 0) -> Dict[str, Any]:
+        with self._lock:
+            ledger = load_trade_ledger()
+            if not isinstance(ledger, dict):
+                ledger = default_trade_ledger()
+            entries = ledger.get("entries", [])
+            if not isinstance(entries, list):
+                entries = []
+            execution_entries: List[Dict[str, Any]] = []
+            signal_entries: List[Dict[str, Any]] = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if bool(e.get("is_execution", False)):
+                    execution_entries.append(e)
+                else:
+                    signal_entries.append(e)
+            keep_n = max(0, int(keep_last_signals))
+            if keep_n > 0:
+                signal_keep = signal_entries[-keep_n:]
+            else:
+                signal_keep = []
+            new_entries = execution_entries + signal_keep
+            # Rebuild ids sequentially.
+            for i, e in enumerate(new_entries, 1):
+                if isinstance(e, dict):
+                    e["id"] = i
+            ledger["entries"] = new_entries
+            # Also clean open positions to execution-only sane rows.
+            open_positions = ledger.get("open_positions", {})
+            if not isinstance(open_positions, dict):
+                open_positions = {}
+            clean_open = {}
+            for k, v in open_positions.items():
+                if not isinstance(k, str) or not isinstance(v, dict):
+                    continue
+                try:
+                    q = float(v.get("qty", 0.0) or 0.0)
+                except Exception:
+                    q = 0.0
+                if q > 0:
+                    clean_open[k] = v
+            ledger["open_positions"] = clean_open
+            save_trade_ledger(ledger)
+            return {
+                "ok": True,
+                "removed_signal_entries": max(0, len(signal_entries) - len(signal_keep)),
+                "kept_signal_entries": len(signal_keep),
+                "execution_entries": len(execution_entries),
+                "total_entries": len(new_entries),
+            }
+
+    def record_signal_event(
+        self,
+        event: Dict[str, Any],
+        cooldown_minutes: int = 240,
+        allow_duplicate: bool = False,
+        guard_hold_signals: bool = True,
+    ) -> Dict[str, Any]:
         with self._lock:
             ledger = load_trade_ledger()
             if not isinstance(ledger, dict):
@@ -1128,16 +1216,17 @@ class EngineBridge:
             blocked = False
             blocked_reason = ""
             if not allow_duplicate:
-                last = activity_guard.get(guard_key)
-                if isinstance(last, dict):
-                    try:
-                        last_ts = pd.to_datetime(last.get("ts", ""), utc=True)
-                        delta_min = (now - last_ts).total_seconds() / 60.0
-                    except Exception:
-                        delta_min = 10e9
-                    if delta_min < max(1, int(cooldown_minutes)):
-                        blocked = True
-                        blocked_reason = f"Duplicate signal within cooldown ({delta_min:.1f}m < {cooldown_minutes}m)."
+                if action != "HOLD" or guard_hold_signals:
+                    last = activity_guard.get(guard_key)
+                    if isinstance(last, dict):
+                        try:
+                            last_ts = pd.to_datetime(last.get("ts", ""), utc=True)
+                            delta_min = (now - last_ts).total_seconds() / 60.0
+                        except Exception:
+                            delta_min = 10e9
+                        if delta_min < max(1, int(cooldown_minutes)):
+                            blocked = True
+                            blocked_reason = f"Duplicate signal within cooldown ({delta_min:.1f}m < {cooldown_minutes}m)."
 
             if blocked:
                 return {"ok": False, "blocked": True, "reason": blocked_reason}
@@ -1158,7 +1247,8 @@ class EngineBridge:
                 "is_execution": is_execution,
             }
             entries.append(rec)
-            activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
+            if action != "HOLD" or guard_hold_signals:
+                activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
 
             pos_key = f"{market}|{timeframe}|{asset}"
             open_pos = open_positions.get(pos_key)

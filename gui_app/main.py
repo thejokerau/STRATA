@@ -412,6 +412,7 @@ class StrataGuiApp:
         self.pf_quote_var = tk.StringVar(value="USDT")
         self.pf_cooldown_min_var = tk.StringVar(value="240")
         self.pf_track_hold_var = tk.BooleanVar(value=True)
+        self.pf_guard_hold_var = tk.BooleanVar(value=False)
         self.pf_manual_asset_var = tk.StringVar(value="")
         self.pf_manual_action_var = tk.StringVar(value="BUY")
         self.pf_manual_price_var = tk.StringVar(value="")
@@ -433,8 +434,10 @@ class StrataGuiApp:
         ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
         ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(top, text="Guard HOLD duplicates", variable=self.pf_guard_hold_var).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="Import Signals from Live", command=self._import_signals_from_live).pack(side="left", padx=8)
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
+        ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
 
         pending_frame = ttk.LabelFrame(self.portfolio_tab, text="Pending Recommendations (Review & Approve)", padding=8)
         pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -527,11 +530,25 @@ class StrataGuiApp:
         pf_open_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_open_positions_text)
 
-        bottom = ttk.LabelFrame(body, text="Trade Ledger (History + Activity Guard)", padding=6)
+        bottom = ttk.LabelFrame(body, text="Trade Ledger (Signal + Execution Views)", padding=6)
         bottom.pack(fill="both", expand=True, pady=(8, 0))
-        pf_ledger_frame, self.pf_ledger_text = self._create_scrolled_text(bottom, wrap="none")
+        ledger_nb = ttk.Notebook(bottom)
+        ledger_nb.pack(fill="both", expand=True)
+        tab_overall = ttk.Frame(ledger_nb)
+        tab_signal = ttk.Frame(ledger_nb)
+        tab_exec = ttk.Frame(ledger_nb)
+        ledger_nb.add(tab_overall, text="Overall")
+        ledger_nb.add(tab_signal, text="Signal Journal")
+        ledger_nb.add(tab_exec, text="Execution Ledger")
+        pf_ledger_frame, self.pf_ledger_text = self._create_scrolled_text(tab_overall, wrap="none")
         pf_ledger_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_ledger_text)
+        pf_signal_frame, self.pf_signal_text = self._create_scrolled_text(tab_signal, wrap="none")
+        pf_signal_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_signal_text)
+        pf_exec_frame, self.pf_execution_text = self._create_scrolled_text(tab_exec, wrap="none")
+        pf_exec_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_execution_text)
 
         self._refresh_binance_profiles()
         self._refresh_ledger_view()
@@ -1933,6 +1950,7 @@ class StrataGuiApp:
                     },
                     cooldown_minutes=cooldown,
                     allow_duplicate=False,
+                    guard_hold_signals=bool(self.pf_guard_hold_var.get()),
                 )
                 if out.get("ok"):
                     logged += 1
@@ -2117,6 +2135,7 @@ class StrataGuiApp:
                 },
                 cooldown_minutes=cooldown,
                 allow_duplicate=False,
+                guard_hold_signals=bool(self.pf_guard_hold_var.get()),
             )
         self._refresh_pending_recommendations_view()
         self._refresh_ledger_view()
@@ -2300,6 +2319,7 @@ class StrataGuiApp:
                 },
                 cooldown_minutes=cooldown,
                 allow_duplicate=False,
+                guard_hold_signals=bool(self.pf_guard_hold_var.get()),
             )
             if out.get("ok"):
                 accepted += 1
@@ -2348,6 +2368,7 @@ class StrataGuiApp:
             },
             cooldown_minutes=cooldown,
             allow_duplicate=False,
+            guard_hold_signals=bool(self.pf_guard_hold_var.get()),
         )
         if out.get("ok"):
             self._append_task_terminal(f"Manual ledger event added: {action} {asset} ({tf})")
@@ -2368,6 +2389,12 @@ class StrataGuiApp:
             return
         ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
         entries = ledger.get("entries", []) if isinstance(ledger, dict) else []
+        signal_entries = out.get("signal_entries", [])
+        execution_entries = out.get("execution_entries", [])
+        if not isinstance(signal_entries, list):
+            signal_entries = []
+        if not isinstance(execution_entries, list):
+            execution_entries = []
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
 
@@ -2384,6 +2411,8 @@ class StrataGuiApp:
             self.pf_ledger_text.delete("1.0", tk.END)
             lines = []
             lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
+            lines.append(f"Signal Journal: {len(signal_entries)}")
+            lines.append(f"Execution Ledger: {len(execution_entries)}")
             lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
             lines.append("")
             if isinstance(entries, list) and entries:
@@ -2393,6 +2422,55 @@ class StrataGuiApp:
                 lines.append("No ledger entries yet.")
             self.pf_ledger_text.insert("1.0", "\n".join(lines))
             self._apply_color_tags(self.pf_ledger_text)
+
+        if hasattr(self, "pf_signal_text"):
+            self.pf_signal_text.delete("1.0", tk.END)
+            if signal_entries:
+                sig_df = pd.DataFrame(signal_entries[-200:])
+                self.pf_signal_text.insert("1.0", sig_df.to_string(index=False))
+            else:
+                self.pf_signal_text.insert("1.0", "No signal-only entries.")
+            self._apply_color_tags(self.pf_signal_text)
+
+        if hasattr(self, "pf_execution_text"):
+            self.pf_execution_text.delete("1.0", tk.END)
+            if execution_entries:
+                exe_df = pd.DataFrame(execution_entries[-200:])
+                self.pf_execution_text.insert("1.0", exe_df.to_string(index=False))
+            else:
+                self.pf_execution_text.insert("1.0", "No execution entries.")
+            self._apply_color_tags(self.pf_execution_text)
+
+    def _prune_signal_history(self) -> None:
+        keep = 0
+        if not messagebox.askyesno(
+            "Prune Signal History",
+            "Remove signal-only history from ledger?\n\n"
+            "- Execution entries are kept.\n"
+            "- Open positions with qty <= 0 are cleaned.\n"
+            "- Activity guard remains intact.",
+        ):
+            return
+        out = self.bridge.prune_signal_only_history(keep_last_signals=keep)
+        if not out.get("ok"):
+            messagebox.showerror("Prune Failed", str(out.get("error", "Unknown error")))
+            return
+        removed = int(out.get("removed_signal_entries", 0) or 0)
+        kept = int(out.get("kept_signal_entries", 0) or 0)
+        exe = int(out.get("execution_entries", 0) or 0)
+        total = int(out.get("total_entries", 0) or 0)
+        self._refresh_ledger_view()
+        self._append_task_terminal(
+            f"Ledger prune complete: removed_signal={removed}, kept_signal={kept}, "
+            f"execution={exe}, total={total}"
+        )
+        messagebox.showinfo(
+            "Prune Complete",
+            f"Removed signal entries: {removed}\n"
+            f"Kept signal entries: {kept}\n"
+            f"Execution entries kept: {exe}\n"
+            f"Total ledger entries now: {total}",
+        )
 
     def _run_standard_research(self) -> None:
         self._run_research_job(standard=True)
