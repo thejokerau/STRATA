@@ -215,6 +215,9 @@
   - selective multi-row approval/submit to Binance (user confirms before submit)
   - per-row editable quantity/order type for pending recommendations
   - pending state tracking (`PENDING/BLOCKED/SUBMITTED/FAILED`)
+  - optional auto-stage of AI recommendations after each AI run
+  - optional AI-signal logging to ledger during staging
+  - one-click Live->AI pipeline run and interval scheduler for continuous operation
 - Added open-order trade controls in GUI:
   - fetch Binance open orders
   - cancel selected open orders directly from GUI
@@ -296,7 +299,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T06:40:28+00:00
+- Last update UTC: 2026-04-10T06:55:57+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T031732Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:

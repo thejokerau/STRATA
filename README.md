@@ -117,6 +117,11 @@ GUI AI configuration:
 - GUI uses the same user-local secure preference/secret files as CLI mode.
 - AI source options include `live_all_panels` to aggregate the latest GUI live panel outputs (e.g., 4h + 12h) into one analysis input.
 - AI analysis prompt now requests a bottom-section implementation snippet (`Recommended API Snippet`) with duplicate-signal guard, entry/exit branches, and minimal ledger logic.
+- AI tab now supports workflow automation:
+  - `Auto-stage signals` after AI response
+  - optional `Log AI signals to ledger`
+  - `Run Live->AI Pipeline` (run dashboards, then AI on combined panel outputs)
+  - pipeline scheduler (interval in minutes) for continuous operation during runtime
 
 GUI Portfolio & Ledger:
 
@@ -127,6 +132,7 @@ GUI Portfolio & Ledger:
   - Manual ledger event entry (`BUY/SELL/HOLD`)
   - Current open-position tracking + historical ledger view
   - AI recommendation staging queue with selective approval/submit flow
+  - direct import of AI-interpreted signals into pending queue (with optional ledger logging)
   - open Binance order list + cancel selected orders from GUI
   - execution modes: `manual`, `semi_auto`, `full_auto` (mode-controlled behavior)
   - Binance pre-submit order validation against exchange filters:

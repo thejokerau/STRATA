@@ -97,6 +97,7 @@ class CTMTGuiApp:
         self.latest_portfolio_snapshot: Dict[str, Any] = {}
         self.pending_recommendations: List[Dict[str, Any]] = []
         self._pending_rec_seq = 0
+        self.pipeline_job: Optional[str] = None
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -313,6 +314,9 @@ class CTMTGuiApp:
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.ai_prompt_mode = tk.StringVar(value="preset_dashboard")
         self.ai_require_confirm = tk.BooleanVar(value=True)
+        self.ai_auto_stage_var = tk.BooleanVar(value=True)
+        self.ai_log_signals_var = tk.BooleanVar(value=True)
+        self.pipeline_interval_min_var = tk.StringVar(value="30")
         self.ai_backtest_path = tk.StringVar(
             value=str(self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt")
         )
@@ -335,11 +339,18 @@ class CTMTGuiApp:
             state="readonly",
         ).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Confirm before send", variable=self.ai_require_confirm).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(top, text="Auto-stage signals", variable=self.ai_auto_stage_var).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(top, text="Log AI signals to ledger", variable=self.ai_log_signals_var).pack(side="left", padx=(6, 0))
         self.btn_run_ai = ttk.Button(top, text="Run AI Analysis", command=self._run_ai_analysis)
         self.btn_run_ai.pack(side="left", padx=8)
         ttk.Button(top, text="Preview Prompt", command=self._preview_ai_prompt).pack(side="left")
         ttk.Button(top, text="Stage Recommendations", command=self._stage_ai_recommendations).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Pending", command=self._clear_pending_recommendations).pack(side="left")
+        ttk.Label(top, text="Pipeline min").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pipeline_interval_min_var, width=6).pack(side="left", padx=4)
+        ttk.Button(top, text="Run Live->AI Pipeline", command=self._run_live_ai_pipeline_now).pack(side="left", padx=4)
+        ttk.Button(top, text="Start Pipeline Scheduler", command=self._start_pipeline_scheduler).pack(side="left", padx=4)
+        ttk.Button(top, text="Stop Scheduler", command=self._stop_pipeline_scheduler).pack(side="left", padx=4)
 
         self.ai_input = tk.Text(body, height=10, wrap="word")
         self.ai_input.pack(fill="x")
@@ -1226,7 +1237,7 @@ class CTMTGuiApp:
         task_name = "Live Dashboard (All Panels)"
         task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START Live Dashboard (All Panels)")
-        self.live_output.delete("1.0", tk.END)
+        # Keep prior dashboard visible while refresh runs; replace only on completion.
 
         def worker():
             bridge = self._bridge_for_task()
@@ -1276,8 +1287,7 @@ class CTMTGuiApp:
         task_name = f"Live Dashboard ({panel.name})"
         task_id = self._set_busy(True, task_name)
         self._append_task_terminal(f"START {task_name}")
-        if selected_only:
-            self.live_output.delete("1.0", tk.END)
+        # Keep prior panel output visible until new payload is ready.
 
         def worker():
             bridge = self._bridge_for_task()
@@ -1429,11 +1439,19 @@ class CTMTGuiApp:
         self._start_run_ai_analysis()
 
     def _start_run_ai_analysis(self) -> None:
+        self._start_run_ai_analysis_internal(source_override=None, force_no_confirm=False)
+
+    def _start_run_ai_analysis_internal(self, source_override: Optional[str], force_no_confirm: bool) -> None:
         task_name = "AI Analysis"
         task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START AI Analysis")
         self.ai_output.delete("1.0", tk.END)
+        original_source = self.ai_source.get().strip()
+        if source_override:
+            self.ai_source.set(source_override)
         text = self._resolve_ai_source_text()
+        if source_override:
+            self.ai_source.set(original_source)
         if not text.strip():
             self.ai_output.insert("1.0", "No source text available.")
             self._append_task_terminal("DONE AI Analysis (no source text)")
@@ -1442,7 +1460,7 @@ class CTMTGuiApp:
         self.ai_last_source_text = text
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         prompt = self._build_ai_prompt(text, dt)
-        if self.ai_require_confirm.get():
+        if self.ai_require_confirm.get() and (not force_no_confirm):
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
             if not ok:
@@ -1461,6 +1479,43 @@ class CTMTGuiApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _run_live_ai_pipeline_now(self) -> None:
+        # Chain: run all live panels -> queue AI analysis on combined live panels.
+        self._append_task_terminal("Pipeline requested: Live dashboards -> AI analysis/staging.")
+        self._run_all_panels()
+        # AI will run after live task due to queue lock.
+        self._queue_if_busy(
+            "AI Analysis (Pipeline)",
+            lambda: self._start_run_ai_analysis_internal(source_override="live_all_panels", force_no_confirm=True),
+        )
+
+    def _pipeline_tick(self) -> None:
+        self._run_live_ai_pipeline_now()
+        if self.pipeline_job:
+            try:
+                mins = max(1, int((self.pipeline_interval_min_var.get() or "30").strip()))
+            except Exception:
+                mins = 30
+            self.pipeline_job = self.root.after(mins * 60 * 1000, self._pipeline_tick)
+
+    def _start_pipeline_scheduler(self) -> None:
+        self._stop_pipeline_scheduler()
+        try:
+            mins = max(1, int((self.pipeline_interval_min_var.get() or "30").strip()))
+        except Exception:
+            mins = 30
+        self._append_task_terminal(f"Started Live->AI pipeline scheduler ({mins} min interval).")
+        self.pipeline_job = self.root.after(1000, self._pipeline_tick)
+
+    def _stop_pipeline_scheduler(self) -> None:
+        if self.pipeline_job:
+            try:
+                self.root.after_cancel(self.pipeline_job)
+            except Exception:
+                pass
+            self.pipeline_job = None
+            self._append_task_terminal("Stopped Live->AI pipeline scheduler.")
+
     def _finish_ai_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
             self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n\nPrompt preview:\n\n")
@@ -1473,6 +1528,9 @@ class CTMTGuiApp:
             if used_prompt:
                 self.ai_conversation.append({"role": "user", "content": used_prompt})
             self.ai_conversation.append({"role": "assistant", "content": response})
+            if bool(self.ai_auto_stage_var.get()):
+                staged = self._stage_ai_recommendations(silent=True)
+                self._append_task_terminal(f"Auto-stage after AI run: {staged} recommendation(s).")
             self._append_task_terminal("DONE AI Analysis")
         self._finish_task(task_id, task_name="AI Analysis")
 
@@ -1655,25 +1713,53 @@ class CTMTGuiApp:
             )
         return recs
 
-    def _stage_ai_recommendations(self) -> None:
+    def _stage_ai_recommendations(self, silent: bool = False) -> int:
         text = self.ai_output.get("1.0", tk.END).strip()
         if not text:
-            messagebox.showinfo("AI Recommendations", "Run AI analysis first (or load AI output).")
-            return
+            if not silent:
+                messagebox.showinfo("AI Recommendations", "Run AI analysis first (or load AI output).")
+            return 0
         recs = self._extract_trade_recommendations_from_ai_text(text)
         if not recs:
-            messagebox.showinfo("AI Recommendations", "No BUY/SELL recommendations were detected in AI output.")
-            return
+            if not silent:
+                messagebox.showinfo("AI Recommendations", "No BUY/SELL recommendations were detected in AI output.")
+            return 0
         self.pending_recommendations.extend(recs)
         self._refresh_pending_recommendations_view()
         self._append_task_terminal(f"Staged {len(recs)} AI recommendation(s) into pending orders.")
+        if bool(self.ai_log_signals_var.get()):
+            try:
+                cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
+            except Exception:
+                cooldown = 240
+            logged = 0
+            for r in recs:
+                out = self.bridge.record_signal_event(
+                    {
+                        "market": "crypto",
+                        "timeframe": str(r.get("timeframe", "1d")),
+                        "panel": "ai_interpretation",
+                        "asset": str(r.get("asset", "")),
+                        "action": str(r.get("side", "")),
+                        "qty": 0.0,
+                        "note": "AI interpretation signal",
+                    },
+                    cooldown_minutes=cooldown,
+                    allow_duplicate=False,
+                )
+                if out.get("ok"):
+                    logged += 1
+            self._append_task_terminal(f"Logged {logged}/{len(recs)} AI signal(s) to ledger.")
+            self._refresh_ledger_view()
         if self.pf_exec_mode_var.get().strip().lower() == "full_auto":
             self._append_task_terminal("Execution mode FULL_AUTO: attempting auto-submit for newly staged recommendations.")
             if hasattr(self, "pending_tree"):
                 self.pending_tree.selection_set(*[str(r.get("id")) for r in recs])
             self._submit_selected_pending_orders()
-            return
-        messagebox.showinfo("AI Recommendations", f"Staged {len(recs)} recommendation(s).")
+            return len(recs)
+        if not silent:
+            messagebox.showinfo("AI Recommendations", f"Staged {len(recs)} recommendation(s).")
+        return len(recs)
 
     def _clear_pending_recommendations(self) -> None:
         self.pending_recommendations = []
@@ -2514,12 +2600,13 @@ class CTMTGuiApp:
         self.state["live_panels"] = [asdict(p) for p in self.live_panels]
         save_state(self.state)
 
-
 def run_gui() -> None:
     root = tk.Tk()
     repo_root = Path(__file__).resolve().parents[1]
     app = CTMTGuiApp(root, repo_root=repo_root)
+
     def _shutdown():
+        app._stop_pipeline_scheduler()
         app._close_task_monitor()
         if app.task_tab_job:
             try:
@@ -2529,6 +2616,7 @@ def run_gui() -> None:
             app.task_tab_job = None
         app._persist_state()
         root.destroy()
+
     root.protocol("WM_DELETE_WINDOW", _shutdown)
     root.mainloop()
 
