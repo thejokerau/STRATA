@@ -1939,6 +1939,8 @@ class StrataGuiApp:
             "allowed_intents": [
                 "buy",
                 "scan_allocate",
+                "portfolio_pnl",
+                "portfolio_balance",
                 "open_view",
                 "scheduler",
                 "status",
@@ -1955,7 +1957,7 @@ class StrataGuiApp:
             "Do not include commentary.\n\n"
             "BEGIN_STRATA_AGENT_INTENT_JSON\n"
             "{\n"
-            "  \"intent\": \"buy|scan_allocate|open_view|scheduler|status|set_context|execute_staged|unknown\",\n"
+            "  \"intent\": \"buy|scan_allocate|portfolio_pnl|portfolio_balance|open_view|scheduler|status|set_context|execute_staged|unknown\",\n"
             "  \"asset\": \"BTC\",\n"
             "  \"symbol\": \"BTCUSDT\",\n"
             "  \"timeframe\": \"4h\",\n"
@@ -2004,7 +2006,7 @@ class StrataGuiApp:
         if not isinstance(parsed, dict):
             return {"intent": "unknown", "error": "AI intent payload is not an object."}
         intent = str(parsed.get("intent", "unknown")).strip().lower()
-        allowed = {"buy", "scan_allocate", "open_view", "scheduler", "status", "set_context", "execute_staged", "unknown"}
+        allowed = {"buy", "scan_allocate", "portfolio_pnl", "portfolio_balance", "open_view", "scheduler", "status", "set_context", "execute_staged", "unknown"}
         if intent not in allowed:
             return {"intent": "unknown", "error": f"AI returned unsupported intent: {intent}"}
         parsed["intent"] = intent
@@ -2053,6 +2055,37 @@ class StrataGuiApp:
             return {"intent": "scheduler", "scheduler_action": "stop"}
         if re.search(r"\b(status|show status|agent status)\b", c):
             return {"intent": "status"}
+        if re.search(r"\b(pnl|profit|performance|return)\b", c):
+            window = "all"
+            n = 20
+            m_last = re.search(r"\blast\s+(\d+)\b", c)
+            if m_last:
+                window = "last_n"
+                try:
+                    n = max(1, min(500, int(m_last.group(1))))
+                except Exception:
+                    n = 20
+            if re.search(r"\b(today|24h)\b", c):
+                window = "today"
+            return {"intent": "portfolio_pnl", "window": window, "last_n": n}
+        if re.search(r"\b(how much|balance|holdings?|position|portfolio)\b", c):
+            asset = ""
+            m_asset = re.search(r"\b(?:of|for|in)\s+([a-z0-9]{2,12})\b", c)
+            if m_asset:
+                asset = str(m_asset.group(1) or "").upper()
+            if not asset:
+                tokens = [t.upper() for t in re.findall(r"\b[a-z0-9]{2,12}\b", c)]
+                ignore = {
+                    "HOW", "MUCH", "DO", "I", "HAVE", "MY", "BALANCE", "HOLDING", "HOLDINGS",
+                    "POSITION", "PORTFOLIO", "SHOW", "IN", "OF", "FOR", "THE", "A", "AN", "PLEASE",
+                }
+                for t in tokens:
+                    if t in ignore:
+                        continue
+                    if t in COMMON_CRYPTO_BASES or t in {"USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "BNB"}:
+                        asset = t
+                        break
+            return {"intent": "portfolio_balance", "asset": asset}
 
         m_excl = re.search(r"\bexclude\s+([a-z0-9,\s]+)$", c)
         if m_excl:
@@ -2194,6 +2227,130 @@ class StrataGuiApp:
                     "scheduler_minutes": int(float(mins or 30)),
                 }
             return {"ok": True, "text": "Stopping Live->AI pipeline scheduler.", "scheduler_action": "stop"}
+        if intent == "portfolio_balance":
+            profile = self.pf_binance_profile_var.get().strip() or None
+            if not profile:
+                return {"ok": False, "error": "Select a Binance profile first."}
+            fres = bridge.fetch_binance_portfolio(profile_name=profile)
+            if not fres.get("ok"):
+                return {"ok": False, "error": str(fres.get("error", "Failed to fetch portfolio."))}
+            asset = str(parsed.get("asset", "") or "").strip().upper()
+            balances = fres.get("balances", []) if isinstance(fres.get("balances"), list) else []
+            total_est_usd = float(fres.get("total_est_usd", 0.0) or 0.0)
+            if asset:
+                row = None
+                for b in balances:
+                    if isinstance(b, dict) and str(b.get("asset", "")).upper() == asset:
+                        row = b
+                        break
+                if row is None:
+                    return {
+                        "ok": True,
+                        "text": (
+                            f"Holding check ({profile})\n"
+                            f"- {asset}: free=0, locked=0, total=0\n"
+                            f"- Portfolio est USD: {total_est_usd:,.2f}"
+                        ),
+                        "open_view": "portfolio",
+                    }
+                free = float(row.get("free", 0.0) or 0.0)
+                locked = float(row.get("locked", 0.0) or 0.0)
+                total = float(row.get("total", 0.0) or 0.0)
+                est_usd = float(row.get("est_usd", 0.0) or 0.0)
+                return {
+                    "ok": True,
+                    "text": (
+                        f"Holding check ({profile})\n"
+                        f"- {asset}: free={free:.8f}, locked={locked:.8f}, total={total:.8f}\n"
+                        f"- Est USD value: {est_usd:,.2f}\n"
+                        f"- Portfolio est USD: {total_est_usd:,.2f}"
+                    ),
+                    "open_view": "portfolio",
+                }
+            lines = [
+                f"Portfolio balance summary ({profile})",
+                f"- Total est USD: {total_est_usd:,.2f}",
+                "- Top holdings:",
+            ]
+            for b in balances[:10]:
+                if not isinstance(b, dict):
+                    continue
+                a = str(b.get("asset", "")).upper()
+                t = float(b.get("total", 0.0) or 0.0)
+                u = float(b.get("est_usd", 0.0) or 0.0)
+                lines.append(f"  - {a}: total={t:.8f} (~${u:,.2f})")
+            return {"ok": True, "text": "\n".join(lines), "open_view": "portfolio"}
+        if intent == "portfolio_pnl":
+            out = bridge.get_trade_ledger()
+            if not out.get("ok"):
+                return {"ok": False, "error": str(out.get("error", "Failed to load trade ledger."))}
+            execution_entries = out.get("execution_entries", [])
+            if not isinstance(execution_entries, list):
+                execution_entries = []
+            rows: List[Dict[str, Any]] = []
+            for e in execution_entries:
+                if not isinstance(e, dict):
+                    continue
+                pq_raw = e.get("pnl_quote", None)
+                pd_raw = e.get("pnl_display", None)
+                if pq_raw is None and pd_raw is None:
+                    continue
+                ee = dict(e)
+                try:
+                    ee["_pnl_quote"] = float(pq_raw or 0.0)
+                except Exception:
+                    ee["_pnl_quote"] = 0.0
+                try:
+                    ee["_pnl_display"] = float(pd_raw or 0.0)
+                except Exception:
+                    ee["_pnl_display"] = ee["_pnl_quote"]
+                ee["_ts"] = pd.to_datetime(ee.get("ts", ""), utc=True, errors="coerce")
+                rows.append(ee)
+            if not rows:
+                return {"ok": True, "text": "PnL summary: no realized execution PnL entries yet.", "open_view": "portfolio"}
+
+            window = str(parsed.get("window", "all") or "all").strip().lower()
+            last_n = int(parsed.get("last_n", 20) or 20)
+            filt = rows
+            if window == "today":
+                local_today = pd.Timestamp.now(tz="Australia/Sydney").date()
+                tmp = []
+                for r in rows:
+                    ts = r.get("_ts")
+                    if isinstance(ts, pd.Timestamp) and not pd.isna(ts):
+                        try:
+                            if ts.tz_convert("Australia/Sydney").date() == local_today:
+                                tmp.append(r)
+                        except Exception:
+                            pass
+                filt = tmp
+            elif window == "last_n":
+                filt = sorted(rows, key=lambda x: x.get("_ts", pd.Timestamp.min), reverse=True)[:last_n]
+
+            if not filt:
+                if window == "today":
+                    return {"ok": True, "text": "PnL summary (today): no realized entries today.", "open_view": "portfolio"}
+                return {"ok": True, "text": f"PnL summary: no entries for selected window ({window}).", "open_view": "portfolio"}
+
+            qsum = float(sum([float(r.get("_pnl_quote", 0.0) or 0.0) for r in filt]))
+            dsum = float(sum([float(r.get("_pnl_display", 0.0) or 0.0) for r in filt]))
+            wins = sum([1 for r in filt if float(r.get("_pnl_quote", 0.0) or 0.0) > 0])
+            losses = sum([1 for r in filt if float(r.get("_pnl_quote", 0.0) or 0.0) < 0])
+            total = len(filt)
+            win_rate = (wins / total * 100.0) if total > 0 else 0.0
+            scope = "all realized executions"
+            if window == "today":
+                scope = "today"
+            elif window == "last_n":
+                scope = f"last {last_n} realized executions"
+            txt = (
+                "PnL Summary\n"
+                f"- Scope: {scope}\n"
+                f"- Trades: {total} (wins={wins}, losses={losses}, win-rate={win_rate:.1f}%)\n"
+                f"- Realized PnL (Quote): {qsum:,.4f}\n"
+                f"- Realized PnL (Display): {dsum:,.4f}"
+            )
+            return {"ok": True, "text": txt, "open_view": "portfolio"}
         if intent == "execute_staged":
             return {"ok": True, "text": "Executing latest staged recommendations.", "execute_last_staged": True}
         if intent == "open_view":

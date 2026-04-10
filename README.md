@@ -146,6 +146,7 @@ GUI AI configuration:
     - "run every 30 minutes" / "pause scheduler" / "stop scheduler" / "agent status"
     - "exclude TRX DOGE" / "clear exclusions"
     - "execute staged"
+    - "show pnl" / "pnl today" / "pnl last 10 trades"
   - agent now emits a deterministic plan card before staging/execution so parsed intent is transparent.
   - optional `AI fallback` in Agent Console:
     - deterministic parser runs first
