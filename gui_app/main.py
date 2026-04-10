@@ -81,6 +81,9 @@ class CTMTGuiApp:
         self.task_queue = deque()
         self.ai_last_source_text = ""
         self.ai_conversation: List[Dict[str, str]] = []
+        self.task_monitor_window: Optional[tk.Toplevel] = None
+        self.task_monitor_text: Optional[tk.Text] = None
+        self.task_monitor_job: Optional[str] = None
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -582,10 +585,36 @@ class CTMTGuiApp:
         return {"running": running, "queued": queued}
 
     def _show_task_status(self) -> None:
+        if self.task_monitor_window is not None and self.task_monitor_window.winfo_exists():
+            self.task_monitor_window.lift()
+            self.task_monitor_window.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Task Monitor")
+        win.geometry("640x360")
+        self.task_monitor_window = win
+        text = tk.Text(win, wrap="word")
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.task_monitor_text = text
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_row, text="Refresh Now", command=self._refresh_task_monitor).pack(side="left")
+        ttk.Button(btn_row, text="Close", command=self._close_task_monitor).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", self._close_task_monitor)
+        self._refresh_task_monitor()
+
+    def _refresh_task_monitor(self) -> None:
+        if self.task_monitor_window is None or not self.task_monitor_window.winfo_exists():
+            return
         snap = self._task_snapshot()
         running = snap["running"]
         queued = snap["queued"]
         lines: List[str] = []
+        lines.append(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Running slots: {self.running_tasks}/{self._task_limit()}")
+        lines.append("")
         lines.append("Current Running Tasks:")
         if running:
             for i, name in enumerate(running, 1):
@@ -599,7 +628,27 @@ class CTMTGuiApp:
                 lines.append(f"{i}. {name}")
         else:
             lines.append("None")
-        messagebox.showinfo("Task Monitor", "\n".join(lines))
+        if self.task_monitor_text is not None:
+            self.task_monitor_text.delete("1.0", tk.END)
+            self.task_monitor_text.insert("1.0", "\n".join(lines))
+        if self.task_monitor_job:
+            try:
+                self.root.after_cancel(self.task_monitor_job)
+            except Exception:
+                pass
+        self.task_monitor_job = self.root.after(1000, self._refresh_task_monitor)
+
+    def _close_task_monitor(self) -> None:
+        if self.task_monitor_job:
+            try:
+                self.root.after_cancel(self.task_monitor_job)
+            except Exception:
+                pass
+            self.task_monitor_job = None
+        if self.task_monitor_window is not None and self.task_monitor_window.winfo_exists():
+            self.task_monitor_window.destroy()
+        self.task_monitor_window = None
+        self.task_monitor_text = None
 
     def _bridge_for_task(self) -> EngineBridge:
         if self._task_limit() <= 1:
@@ -1241,7 +1290,7 @@ def run_gui() -> None:
     root = tk.Tk()
     repo_root = Path(__file__).resolve().parents[1]
     app = CTMTGuiApp(root, repo_root=repo_root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app._persist_state(), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", lambda: (app._close_task_monitor(), app._persist_state(), root.destroy()))
     root.mainloop()
 
 

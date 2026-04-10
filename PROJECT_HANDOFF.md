@@ -178,6 +178,7 @@
 - Added GUI task monitor method:
   - status-bar `Tasks` button now shows currently running tasks and queued tasks
   - supports operational visibility while parallel mode and queueing are active
+  - upgraded to a live Task Monitor window that auto-refreshes every second
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -239,7 +240,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T02:39:32+00:00
+- Last update UTC: 2026-04-10T02:41:24+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T020023Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:
