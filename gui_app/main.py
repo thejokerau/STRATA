@@ -1,10 +1,11 @@
 import threading
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 import re
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from typing import Any, Dict, List, Optional
 
 from .engine_bridge import EngineBridge
@@ -73,6 +74,7 @@ class CTMTGuiApp:
         self.auto_refresh_job: Optional[str] = None
         self.auto_refresh_running = False
         self.busy = False
+        self.task_queue = deque()
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -258,15 +260,29 @@ class CTMTGuiApp:
 
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.ai_backtest_path = tk.StringVar(
+            value=str(self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt")
+        )
         ttk.Label(top, text="Date/Time Context").pack(side="left")
         ttk.Entry(top, textvariable=self.ai_datetime, width=24).pack(side="left", padx=4)
         ttk.Label(top, text="Source").pack(side="left", padx=(12, 0))
-        ttk.Combobox(top, textvariable=self.ai_source, values=["live", "backtest", "paste"], width=12, state="readonly").pack(side="left", padx=4)
+        ttk.Combobox(
+            top,
+            textvariable=self.ai_source,
+            values=["live", "backtest_latest", "backtest_file", "paste"],
+            width=16,
+            state="readonly",
+        ).pack(side="left", padx=4)
         self.btn_run_ai = ttk.Button(top, text="Run AI Analysis", command=self._run_ai_analysis)
         self.btn_run_ai.pack(side="left", padx=8)
 
         self.ai_input = tk.Text(body, height=14, wrap="word")
         self.ai_input.pack(fill="x")
+        ai_file_row = ttk.Frame(body)
+        ai_file_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(ai_file_row, text="Backtest file").pack(side="left")
+        ttk.Entry(ai_file_row, textvariable=self.ai_backtest_path, width=90).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(ai_file_row, text="Browse...", command=self._browse_ai_backtest_file).pack(side="left")
         self.ai_output = tk.Text(body, wrap="word")
         self.ai_output.pack(fill="both", expand=True, pady=(8, 0))
 
@@ -401,7 +417,19 @@ class CTMTGuiApp:
         return p
 
     def _notify_busy(self, task_name: str) -> None:
-        messagebox.showinfo("Task Running", f"A task is already running. Please wait before starting {task_name}.")
+        messagebox.showinfo(
+            "Task Queued",
+            f"A task is already running. '{task_name}' has been queued and will start automatically.",
+        )
+
+    def _queue_or_run(self, task_name: str, starter) -> bool:
+        if self.busy:
+            self.task_queue.append((task_name, starter))
+            self.status_var.set(f"Running with {len(self.task_queue)} queued")
+            self._notify_busy(task_name)
+            return True
+        starter()
+        return False
 
     def _set_busy(self, busy: bool, task_name: str = "") -> None:
         self.busy = busy
@@ -423,7 +451,22 @@ class CTMTGuiApp:
             self.status_progress.start(10)
         else:
             self.status_progress.stop()
-            self.status_var.set("Ready")
+            if self.task_queue:
+                next_name, next_job = self.task_queue.popleft()
+                self.status_var.set(f"Starting queued task: {next_name} ({len(self.task_queue)} remaining)")
+                self.root.after(100, next_job)
+            else:
+                self.status_var.set("Ready")
+
+    def _browse_ai_backtest_file(self) -> None:
+        initial_dir = self.repo_root / "experiments" / "backtest_snapshots"
+        path = filedialog.askopenfilename(
+            title="Select Backtest Result File",
+            initialdir=str(initial_dir),
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if path:
+            self.ai_backtest_path.set(path)
 
     def _add_panel(self) -> None:
         self.live_panels.append(self._panel_from_form())
@@ -454,9 +497,11 @@ class CTMTGuiApp:
         self._run_live_job(self.live_panels[idx], selected_only=True)
 
     def _run_all_panels(self) -> None:
-        if self.busy:
-            self._notify_busy("Run All Panels")
+        if self._queue_or_run("Run All Panels", self._start_run_all_panels):
             return
+        self._start_run_all_panels()
+
+    def _start_run_all_panels(self) -> None:
         self._set_busy(True, "Live Dashboard (All Panels)")
         self.live_output.delete("1.0", tk.END)
 
@@ -490,9 +535,14 @@ class CTMTGuiApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_live_job(self, panel: LivePanelConfig, selected_only: bool = False) -> None:
-        if self.busy:
-            self._notify_busy("Live Dashboard refresh")
+        if self._queue_or_run(
+            f"Live Dashboard ({panel.name})",
+            lambda p=panel, s=selected_only: self._start_run_live_job(p, s),
+        ):
             return
+        self._start_run_live_job(panel, selected_only)
+
+    def _start_run_live_job(self, panel: LivePanelConfig, selected_only: bool = False) -> None:
         self._set_busy(True, f"Live Dashboard ({panel.name})")
         if selected_only:
             self.live_output.delete("1.0", tk.END)
@@ -551,9 +601,11 @@ class CTMTGuiApp:
         self._persist_state()
 
     def _run_backtest(self) -> None:
-        if self.busy:
-            self._notify_busy("Backtest")
+        if self._queue_or_run("Backtest", self._start_run_backtest):
             return
+        self._start_run_backtest()
+
+    def _start_run_backtest(self) -> None:
         self._set_busy(True, "Backtest")
         self.bt_summary.delete("1.0", tk.END)
         self.bt_trades.delete("1.0", tk.END)
@@ -615,17 +667,22 @@ class CTMTGuiApp:
         self._set_busy(False)
 
     def _run_ai_analysis(self) -> None:
-        if self.busy:
-            self._notify_busy("AI Analysis")
+        if self._queue_or_run("AI Analysis", self._start_run_ai_analysis):
             return
+        self._start_run_ai_analysis()
+
+    def _start_run_ai_analysis(self) -> None:
         self._set_busy(True, "AI Analysis")
         self.ai_output.delete("1.0", tk.END)
         source = self.ai_source.get().strip().lower()
         if source == "live":
             path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
             text = path.read_text(encoding="utf-8") if path.exists() else ""
-        elif source == "backtest":
+        elif source == "backtest_latest":
             path = self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt"
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        elif source == "backtest_file":
+            path = Path(self.ai_backtest_path.get().strip())
             text = path.read_text(encoding="utf-8") if path.exists() else ""
         else:
             text = self.ai_input.get("1.0", tk.END).strip()
@@ -656,10 +713,14 @@ class CTMTGuiApp:
         self._run_research_job(standard=False)
 
     def _run_research_job(self, standard: bool) -> None:
-        if self.busy:
-            self._notify_busy("Auto-Research")
+        task_name = "Auto-Research (Standard)" if standard else "Auto-Research (Comprehensive)"
+        if self._queue_or_run(task_name, lambda s=standard: self._start_run_research_job(s)):
             return
-        self._set_busy(True, "Auto-Research")
+        self._start_run_research_job(standard)
+
+    def _start_run_research_job(self, standard: bool) -> None:
+        task_name = "Auto-Research (Standard)" if standard else "Auto-Research (Comprehensive)"
+        self._set_busy(True, task_name)
         self.rs_output.delete("1.0", tk.END)
 
         def worker():

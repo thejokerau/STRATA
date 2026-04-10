@@ -212,13 +212,13 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T01:58:59+00:00
-- Latest experiment artifact: `experiments/runs/run_20260409T224249Z.json`
+- Last update UTC: 2026-04-10T02:01:41+00:00
+- Latest experiment artifact: `experiments/runs/run_20260410T020023Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:
-- `crypto_1d_12m_top20`: selected `tuned`, return +37.23%, maxDD 34.50%, sharpe 0.89
-- `crypto_8h_12m_top20`: selected `tuned`, return +60.08%, maxDD 35.76%, sharpe 1.12
-- `crypto_8h_24m_top10`: selected `baseline`, return +88.06%, maxDD 30.47%, sharpe 0.99
-- `crypto_12h_24m_top10`: selected `tuned`, return +83.32%, maxDD 32.27%, sharpe 0.96
+- `crypto_1d_12m_top20`: selected `baseline`, return +37.77%, maxDD 35.62%, sharpe 0.89
+- `crypto_8h_12m_top20`: selected `baseline`, return +56.01%, maxDD 28.10%, sharpe 1.11
+- `crypto_8h_24m_top10`: selected `tuned`, return +74.71%, maxDD 35.67%, sharpe 1.04
+- `crypto_12h_24m_top10`: selected `tuned`, return +74.99%, maxDD 40.38%, sharpe 1.21
 <!-- AUTO_HANDBACK_END -->
 
