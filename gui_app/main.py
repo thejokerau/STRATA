@@ -1540,7 +1540,15 @@ class StrataGuiApp:
             return
         self.ai_last_source_text = text
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = self._build_ai_prompt(text, dt)
+        try:
+            prompt = self._build_ai_prompt(text, dt)
+        except Exception as exc:
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Failed to build AI prompt: {type(exc).__name__}: {exc}")
+            self._append_task_terminal(f"DONE AI Analysis (prompt build error: {type(exc).__name__})")
+            messagebox.showerror("AI Prompt Error", f"{type(exc).__name__}: {exc}")
+            self._finish_task(task_id, task_name=task_name)
+            return
         if self.ai_require_confirm.get() and (not force_no_confirm):
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
@@ -1754,7 +1762,14 @@ class StrataGuiApp:
             )
             return
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = self._build_ai_prompt(source_text, dt)
+        try:
+            prompt = self._build_ai_prompt(source_text, dt)
+        except Exception as exc:
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Failed to build prompt: {type(exc).__name__}: {exc}")
+            self._append_task_terminal(f"PROMPT PREVIEW failed ({type(exc).__name__})")
+            messagebox.showerror("Show Prompt Failed", f"{type(exc).__name__}: {exc}")
+            return
         self.ai_output.delete("1.0", tk.END)
         self.ai_output.insert("1.0", "PROMPT PREVIEW\n" + ("=" * 60) + "\n" + prompt)
         self._append_task_terminal("PROMPT PREVIEW generated")

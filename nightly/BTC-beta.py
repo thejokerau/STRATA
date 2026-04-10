@@ -3103,10 +3103,12 @@ def load_latest_backtest_snapshot() -> Optional[str]:
 
 
 def build_grok_prompt(dashboard_text: str, datetime_context: str) -> str:
-    return GROK_ANALYSIS_INSTRUCTION.format(
-        datetime_context=datetime_context,
-        dashboard_text=dashboard_text,
-    )
+    # Use token replacement instead of str.format because the instruction text
+    # intentionally contains many JSON braces.
+    prompt = str(GROK_ANALYSIS_INSTRUCTION)
+    prompt = prompt.replace("{datetime_context}", str(datetime_context))
+    prompt = prompt.replace("{dashboard_text}", str(dashboard_text))
+    return prompt
 
 
 def call_xai_grok(prompt: str) -> Optional[str]:
