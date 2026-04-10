@@ -187,11 +187,46 @@ class EngineBridge:
             "metrics": metrics,
         }
 
-    def run_ai_analysis(self, dashboard_text: str, datetime_context: str) -> Dict[str, Any]:
+    def build_dashboard_prompt(self, dashboard_text: str, datetime_context: str) -> str:
         with self._lock:
-            prompt = self.mod.build_grok_prompt(dashboard_text, datetime_context)
-            response = self.mod.call_active_ai_provider(prompt, system_prompt="You are Grok, built by xAI.")
-            return {"ok": bool(response), "prompt": prompt, "response": response or ""}
+            return self.mod.build_grok_prompt(dashboard_text, datetime_context)
+
+    def _default_system_prompt_for_active_profile(self) -> str:
+        try:
+            prefs = self.mod.load_ai_preferences()
+            profile_name, profile = self.mod.get_active_ai_profile(prefs)
+            provider = str(profile.get("provider", "")).strip().lower()
+            internet_access = bool(
+                profile.get(
+                    "internet_access",
+                    self.mod.provider_default_internet_access(provider),
+                )
+            )
+            return self.mod.ONLINE_SYSTEM_PROMPT if internet_access else self.mod.OFFLINE_SYSTEM_PROMPT
+        except Exception:
+            return "You are Grok, built by xAI."
+
+    def run_ai_analysis(
+        self,
+        dashboard_text: str,
+        datetime_context: str,
+        prompt_override: Optional[str] = None,
+        system_prompt_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            prompt = prompt_override if (prompt_override and str(prompt_override).strip()) else self.mod.build_grok_prompt(dashboard_text, datetime_context)
+            system_prompt = (
+                system_prompt_override
+                if (system_prompt_override and str(system_prompt_override).strip())
+                else self._default_system_prompt_for_active_profile()
+            )
+            response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
+            return {
+                "ok": bool(response),
+                "prompt": prompt,
+                "response": response or "",
+                "system_prompt": system_prompt,
+            }
 
     def run_standard_research(self) -> Dict[str, Any]:
         cmd = [sys.executable, str(self.scripts_dir / "auto_research_cycle.py")]

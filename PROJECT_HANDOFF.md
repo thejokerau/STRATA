@@ -156,6 +156,13 @@
   - switched from numeric-only country display to readable region labels
   - added type-to-search filtering in selector
   - added manual country-code override field for advanced/custom routing
+- Added branch-sync guardrail for required core-script propagation:
+  - new helper script `scripts/sync_core_to_nightly.py`
+  - checks `gui-nightly` vs `nightly` for required core file deltas (`nightly/BTC-beta.py`)
+  - optional minimal patch generation for controlled sync handoff
+- Added branch sync documentation:
+  - `docs/BRANCH_SYNC.md` with policy and operational flow
+  - `README.md` updated with core-sync command examples
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -171,6 +178,8 @@
 - `gui_app/engine_bridge.py`
 - `gui_app/state.py`
 - `scripts/run_gui.py`
+- `scripts/sync_core_to_nightly.py`
+- `docs/BRANCH_SYNC.md`
 
 ## Known Issues / Risks
 - Some CoinGecko symbols still may not be usable across all data providers; filtering now favors Binance tradability for crypto.
@@ -192,6 +201,7 @@
 - Legacy cache rows with malformed/unparseable dates are now dropped at read time; affected rows may need cache refresh if large.
 - GUI runtime behavior has not yet been fully integration-tested in this environment due desktop/display constraints.
 - GUI currently uses text-first output panes; richer native tables/charts and embedded chart views are pending.
+- Branch sync helper is workflow guidance/tooling, not an enforced git hook; manual execution is still required before promotion.
 
 ## Run / Validate
 - Syntax check:
@@ -201,8 +211,8 @@
 
 ## Recommended Next Tasks
 1. Run end-to-end manual GUI acceptance tests on target desktop (live/backtest/AI/research tabs).
-2. Upgrade GUI tables/charts from text panes to richer native widgets and chart embeds.
-3. Add full parity coverage for every advanced CLI setting in GUI forms (with validation/presets).
+2. Add an optional pre-push hook/CI check that runs `python scripts/sync_core_to_nightly.py --base nightly` on `gui-nightly`.
+3. Upgrade GUI tables/charts from text panes to richer native widgets and chart embeds.
 
 ## Process Rule (Required)
 - For every future code change in this project, update this file in the same change set:
@@ -212,7 +222,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T02:01:41+00:00
+- Last update UTC: 2026-04-10T02:09:36+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T020023Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:

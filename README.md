@@ -13,6 +13,25 @@ Recommended workflow:
 2. Merge feature branches into `nightly` first for CLI/core work.
 3. Merge GUI-focused work into `gui-nightly`, then promote to `gui-stable`.
 4. Promote tested non-GUI changes from `nightly` into `main` on cadence.
+
+### Core Sync Guardrail (`gui-nightly` -> `nightly`)
+
+When changing core strategy/runtime behavior in `gui-nightly`, sync only required core edits into `nightly` (not GUI-only files).
+
+Core-sync helper:
+
+```bash
+python scripts/sync_core_to_nightly.py --base nightly
+```
+
+Optional patch generation for minimal sync:
+
+```bash
+python scripts/sync_core_to_nightly.py --base nightly --create-patch --patch-path experiments/reports/core_sync.patch
+```
+
+Detailed policy: `docs/BRANCH_SYNC.md`
+
 ## Script Layout
 
 To mirror the channels in the repo structure:

@@ -75,6 +75,8 @@ class CTMTGuiApp:
         self.auto_refresh_running = False
         self.busy = False
         self.task_queue = deque()
+        self.ai_last_source_text = ""
+        self.ai_conversation: List[Dict[str, str]] = []
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -260,6 +262,8 @@ class CTMTGuiApp:
 
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.ai_prompt_mode = tk.StringVar(value="preset_dashboard")
+        self.ai_require_confirm = tk.BooleanVar(value=True)
         self.ai_backtest_path = tk.StringVar(
             value=str(self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt")
         )
@@ -273,16 +277,35 @@ class CTMTGuiApp:
             width=16,
             state="readonly",
         ).pack(side="left", padx=4)
+        ttk.Label(top, text="Prompt").pack(side="left", padx=(12, 0))
+        ttk.Combobox(
+            top,
+            textvariable=self.ai_prompt_mode,
+            values=["preset_dashboard", "custom_prompt"],
+            width=16,
+            state="readonly",
+        ).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="Confirm before send", variable=self.ai_require_confirm).pack(side="left", padx=(6, 0))
         self.btn_run_ai = ttk.Button(top, text="Run AI Analysis", command=self._run_ai_analysis)
         self.btn_run_ai.pack(side="left", padx=8)
+        ttk.Button(top, text="Preview Prompt", command=self._preview_ai_prompt).pack(side="left")
 
-        self.ai_input = tk.Text(body, height=14, wrap="word")
+        self.ai_input = tk.Text(body, height=10, wrap="word")
         self.ai_input.pack(fill="x")
         ai_file_row = ttk.Frame(body)
         ai_file_row.pack(fill="x", pady=(6, 0))
         ttk.Label(ai_file_row, text="Backtest file").pack(side="left")
         ttk.Entry(ai_file_row, textvariable=self.ai_backtest_path, width=90).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(ai_file_row, text="Browse...", command=self._browse_ai_backtest_file).pack(side="left")
+        ttk.Label(body, text="Custom prompt (used when Prompt=custom_prompt)").pack(anchor="w", pady=(8, 0))
+        self.ai_custom_prompt = tk.Text(body, height=8, wrap="word")
+        self.ai_custom_prompt.pack(fill="x")
+        follow_row = ttk.Frame(body)
+        follow_row.pack(fill="x", pady=(8, 0))
+        self.ai_followup_var = tk.StringVar(value="")
+        ttk.Label(follow_row, text="Follow-up").pack(side="left")
+        ttk.Entry(follow_row, textvariable=self.ai_followup_var, width=100).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(follow_row, text="Send Follow-up", command=self._run_ai_followup).pack(side="left")
         self.ai_output = tk.Text(body, wrap="word")
         self.ai_output.pack(fill="both", expand=True, pady=(8, 0))
 
@@ -422,13 +445,12 @@ class CTMTGuiApp:
             f"A task is already running. '{task_name}' has been queued and will start automatically.",
         )
 
-    def _queue_or_run(self, task_name: str, starter) -> bool:
+    def _queue_if_busy(self, task_name: str, starter) -> bool:
         if self.busy:
             self.task_queue.append((task_name, starter))
             self.status_var.set(f"Running with {len(self.task_queue)} queued")
             self._notify_busy(task_name)
             return True
-        starter()
         return False
 
     def _set_busy(self, busy: bool, task_name: str = "") -> None:
@@ -497,7 +519,7 @@ class CTMTGuiApp:
         self._run_live_job(self.live_panels[idx], selected_only=True)
 
     def _run_all_panels(self) -> None:
-        if self._queue_or_run("Run All Panels", self._start_run_all_panels):
+        if self._queue_if_busy("Run All Panels", self._start_run_all_panels):
             return
         self._start_run_all_panels()
 
@@ -535,7 +557,7 @@ class CTMTGuiApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_live_job(self, panel: LivePanelConfig, selected_only: bool = False) -> None:
-        if self._queue_or_run(
+        if self._queue_if_busy(
             f"Live Dashboard ({panel.name})",
             lambda p=panel, s=selected_only: self._start_run_live_job(p, s),
         ):
@@ -601,7 +623,7 @@ class CTMTGuiApp:
         self._persist_state()
 
     def _run_backtest(self) -> None:
-        if self._queue_or_run("Backtest", self._start_run_backtest):
+        if self._queue_if_busy("Backtest", self._start_run_backtest):
             return
         self._start_run_backtest()
 
@@ -667,33 +689,31 @@ class CTMTGuiApp:
         self._set_busy(False)
 
     def _run_ai_analysis(self) -> None:
-        if self._queue_or_run("AI Analysis", self._start_run_ai_analysis):
+        if self._queue_if_busy("AI Analysis", self._start_run_ai_analysis):
             return
         self._start_run_ai_analysis()
 
     def _start_run_ai_analysis(self) -> None:
         self._set_busy(True, "AI Analysis")
         self.ai_output.delete("1.0", tk.END)
-        source = self.ai_source.get().strip().lower()
-        if source == "live":
-            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
-        elif source == "backtest_latest":
-            path = self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt"
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
-        elif source == "backtest_file":
-            path = Path(self.ai_backtest_path.get().strip())
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
-        else:
-            text = self.ai_input.get("1.0", tk.END).strip()
+        text = self._resolve_ai_source_text()
         if not text.strip():
             self.ai_output.insert("1.0", "No source text available.")
             self._set_busy(False)
             return
+        self.ai_last_source_text = text
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prompt = self._build_ai_prompt(text, dt)
+        if self.ai_require_confirm.get():
+            preview = prompt[:2000]
+            ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
+            if not ok:
+                self._set_busy(False)
+                self.ai_output.insert("1.0", "AI request canceled by user.")
+                return
 
         def worker():
-            res = self.bridge.run_ai_analysis(text, dt)
+            res = self.bridge.run_ai_analysis(text, dt, prompt_override=prompt)
             self.root.after(0, lambda: self._finish_ai_output(res))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -703,8 +723,121 @@ class CTMTGuiApp:
             self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n\nPrompt preview:\n\n")
             self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
         else:
-            self.ai_output.insert("1.0", res.get("response", ""))
+            response = res.get("response", "")
+            self.ai_output.insert("1.0", response)
+            used_prompt = res.get("prompt", "")
+            if used_prompt:
+                self.ai_conversation.append({"role": "user", "content": used_prompt})
+            self.ai_conversation.append({"role": "assistant", "content": response})
         self._set_busy(False)
+
+    def _run_ai_followup(self) -> None:
+        if self._queue_if_busy("AI Follow-up", self._start_run_ai_followup):
+            return
+        self._start_run_ai_followup()
+
+    def _start_run_ai_followup(self) -> None:
+        follow = self.ai_followup_var.get().strip()
+        if not follow:
+            messagebox.showinfo("Follow-up", "Enter a follow-up question first.")
+            return
+        if not self.ai_last_source_text.strip() and not self.ai_conversation:
+            messagebox.showinfo("Follow-up", "Run an initial AI analysis first.")
+            return
+        self._set_busy(True, "AI Follow-up")
+        dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        history = self.ai_conversation[-6:]
+        lines = [
+            "Continue the prior analysis conversation using the same style and constraints.",
+            f"Date/time context: {dt}",
+        ]
+        if self.ai_last_source_text.strip():
+            lines.extend(["", "Reference dashboard/backtest text:", self.ai_last_source_text[:12000]])
+        if history:
+            lines.append("")
+            lines.append("Recent conversation:")
+            for turn in history:
+                role = turn.get("role", "user").upper()
+                lines.append(f"{role}:")
+                lines.append(turn.get("content", ""))
+                lines.append("")
+        lines.append("New user follow-up:")
+        lines.append(follow)
+        prompt = "\n".join(lines)
+
+        if self.ai_require_confirm.get():
+            preview = prompt[:2000]
+            ok = messagebox.askyesno("Confirm AI Follow-up", f"Send this follow-up prompt?\n\n{preview}")
+            if not ok:
+                self._set_busy(False)
+                return
+
+        def worker():
+            res = self.bridge.run_ai_analysis(
+                self.ai_last_source_text,
+                dt,
+                prompt_override=prompt,
+            )
+            self.root.after(0, lambda: self._finish_ai_followup(res, follow))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ai_followup(self, res: Dict[str, Any], follow_text: str) -> None:
+        if not res.get("ok"):
+            self.ai_output.insert("1.0", "AI follow-up failed.\n\n")
+            self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
+        else:
+            response = res.get("response", "")
+            current = self.ai_output.get("1.0", tk.END).strip()
+            stitched = (
+                (current + "\n\n" if current else "")
+                + f"FOLLOW-UP QUESTION:\n{follow_text}\n\nFOLLOW-UP RESPONSE:\n{response}"
+            )
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", stitched)
+            self.ai_conversation.append({"role": "user", "content": follow_text})
+            self.ai_conversation.append({"role": "assistant", "content": response})
+            self.ai_followup_var.set("")
+        self._set_busy(False)
+
+    def _resolve_ai_source_text(self) -> str:
+        source = self.ai_source.get().strip().lower()
+        if source == "live":
+            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        if source == "backtest_latest":
+            path = self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt"
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        if source == "backtest_file":
+            path = Path(self.ai_backtest_path.get().strip())
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        return self.ai_input.get("1.0", tk.END).strip()
+
+    def _build_ai_prompt(self, source_text: str, datetime_context: str) -> str:
+        mode = self.ai_prompt_mode.get().strip().lower()
+        if mode == "custom_prompt":
+            custom = self.ai_custom_prompt.get("1.0", tk.END).strip()
+            if custom:
+                return "\n\n".join(
+                    [
+                        custom,
+                        f"Date/time context: {datetime_context}",
+                        "Input text:",
+                        source_text,
+                    ]
+                )
+        return self.bridge.build_dashboard_prompt(source_text, datetime_context)
+
+    def _preview_ai_prompt(self) -> None:
+        source_text = self._resolve_ai_source_text()
+        if not source_text.strip():
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", "No source text available for prompt preview.")
+            return
+        dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prompt = self._build_ai_prompt(source_text, dt)
+        self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", "PROMPT PREVIEW\n" + ("=" * 60) + "\n" + prompt)
 
     def _run_standard_research(self) -> None:
         self._run_research_job(standard=True)
@@ -714,7 +847,7 @@ class CTMTGuiApp:
 
     def _run_research_job(self, standard: bool) -> None:
         task_name = "Auto-Research (Standard)" if standard else "Auto-Research (Comprehensive)"
-        if self._queue_or_run(task_name, lambda s=standard: self._start_run_research_job(s)):
+        if self._queue_if_busy(task_name, lambda s=standard: self._start_run_research_job(s)):
             return
         self._start_run_research_job(standard)
 
