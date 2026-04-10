@@ -106,6 +106,11 @@ GUI dashboard readability:
 
 - Live/Backtest text outputs now apply color highlighting for key sections and action states (`BUY/HOLD/SELL`) to improve scanability.
 - Major GUI tabs now support both vertical and horizontal scrolling at tab level, improving access to full config/action areas on smaller screens.
+- Console usability/debugging:
+  - right-click context menu on text consoles (`Copy`, `Select All`, `Clear`)
+  - `Ctrl+A` / `Ctrl+C` support in text areas, and copy-selected-row support in tables
+  - dedicated copy buttons for Live/Backtest/AI/Task/Settings consoles
+  - optional `Verbose terminal logging (debug mode)` in Settings for deeper task/runtime traces
 
 GUI AI configuration:
 
@@ -117,6 +122,21 @@ GUI AI configuration:
   - test profile connectivity
 - GUI uses the same user-local secure preference/secret files as CLI mode.
 - AI source options include `live_all_panels` to aggregate the latest GUI live panel outputs (e.g., 4h + 12h) into one analysis input.
+- New AI pipeline option: `Run Live->Backtest->AI`
+  - captures current live dashboard snapshot
+  - runs targeted backtests on assets currently signaled in live output (grouped by market/timeframe)
+  - sends combined live + targeted-backtest context to AI for recommendation generation
+
+Quote lock + local-currency ledger:
+
+- In GUI Settings:
+  - set `Primary Quote` (for example `USDT`, `USDC`, `FDUSD`)
+  - enable `Lock primary quote across crypto dashboards/trades`
+- When enabled, crypto live dashboards/backtests/trade-plan symbol normalization are aligned to the selected primary quote.
+- Ledger execution rows now carry:
+  - `quote_currency` (execution quote, e.g. `USDT`)
+  - `display_currency` (user local currency from Settings, e.g. `AUD`/`JPY`)
+  - realized `pnl_quote` and converted `pnl_display` (when quote is USD-like).
 - AI analysis prompt now requests a bottom-section implementation snippet (`Recommended API Snippet`) with duplicate-signal guard, entry/exit branches, and minimal ledger logic.
 - AI tab now supports workflow automation:
   - `Auto-stage signals` after AI response
@@ -134,14 +154,26 @@ GUI Portfolio & Ledger:
 
 - New `Portfolio & Ledger` tab:
   - Binance account portfolio snapshot (balances + estimated USD value)
+  - `Reconcile Fills` action to backfill missing execution rows/open positions from Binance trade history
+  - `Review Open Positions (MTF)` action:
+    - evaluates open-position assets across `4h/8h/12h/1d`
+    - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)
   - Signal import from latest live dashboard output
   - Duplicate-signal activity guard (cooldown-based) to reduce repeated same-signal actions
   - Manual ledger event entry (`BUY/SELL/HOLD`)
   - Current open-position tracking + historical ledger view
   - AI recommendation staging queue with selective approval/submit flow
+  - auto-sizing for selected pending trades:
+    - BUY uses configurable `%` of available quote balance (for example USDT)
+    - SELL uses configurable `%` of available base-asset balance
+    - optional confidence weighting from AI recommendation confidence
+    - final quantity is validated/normalized against Binance symbol filters before submit
   - direct import of AI-interpreted signals into pending queue (with optional ledger logging)
   - open Binance order list + cancel selected orders from GUI
   - execution modes: `manual`, `semi_auto`, `full_auto` (mode-controlled behavior)
+  - optional protective stop placement on BUY execution:
+    - if AI structured recommendation includes `invalidation`/`stop_loss_price`, GUI stores it
+    - submit flow attempts a `STOP_LOSS_LIMIT` protective SELL order after BUY fill
   - Binance pre-submit order validation against exchange filters:
     - quantity step size / min-max qty
     - limit-price tick size / min-max price
@@ -151,6 +183,10 @@ GUI Portfolio & Ledger:
     - only execution-grade events (`is_execution=true` with non-zero qty) create/close open positions
     - signal-only entries (e.g., AI interpretation/imported signals) are kept in history but do not pollute open positions
     - invalid legacy zero-qty open positions are auto-cleaned on ledger read
+  - ledger views now split into:
+    - `Overall`
+    - `Signal Journal`
+    - `Execution Ledger`
 - Binance profiles can be managed in GUI Settings (similar to AI profiles):
   - create/update/set active/delete profile
   - secure key+secret storage outside repo

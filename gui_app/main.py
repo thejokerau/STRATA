@@ -253,6 +253,10 @@ class StrataGuiApp:
         live_frame, self.live_output = self._create_scrolled_text(right, wrap="none")
         live_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.live_output)
+        live_copy_row = ttk.Frame(right)
+        live_copy_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(live_copy_row, text="Copy Output", command=lambda: self._copy_text_widget(self.live_output, "Live output")).pack(side="left")
+        ttk.Button(live_copy_row, text="Clear Output", command=lambda: self.live_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_backtest_tab(self) -> None:
         top = ttk.Frame(self.backtest_tab, padding=8)
@@ -330,9 +334,13 @@ class StrataGuiApp:
         bt_summary_frame, self.bt_summary = self._create_scrolled_text(out, height=10, wrap="none")
         bt_summary_frame.pack(fill="x")
         self._configure_dashboard_tags(self.bt_summary)
+        bt_btns = ttk.Frame(out)
+        bt_btns.pack(fill="x", pady=(4, 4))
+        ttk.Button(bt_btns, text="Copy Summary", command=lambda: self._copy_text_widget(self.bt_summary, "Backtest summary")).pack(side="left")
         bt_trades_frame, self.bt_trades = self._create_scrolled_text(out, wrap="none")
         bt_trades_frame.pack(fill="both", expand=True, pady=(8, 0))
         self._configure_dashboard_tags(self.bt_trades)
+        ttk.Button(bt_btns, text="Copy Trades", command=lambda: self._copy_text_widget(self.bt_trades, "Backtest trades")).pack(side="left", padx=6)
 
     def _build_ai_tab(self) -> None:
         top = ttk.Frame(self.ai_tab, padding=8)
@@ -343,7 +351,7 @@ class StrataGuiApp:
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.ai_prompt_mode = tk.StringVar(value="preset_dashboard")
-        self.ai_require_confirm = tk.BooleanVar(value=True)
+        self.ai_require_confirm = tk.BooleanVar(value=False)
         self.ai_auto_stage_var = tk.BooleanVar(value=True)
         self.ai_log_signals_var = tk.BooleanVar(value=True)
         self.pipeline_interval_min_var = tk.StringVar(value="30")
@@ -373,12 +381,13 @@ class StrataGuiApp:
         ttk.Checkbutton(top, text="Log AI signals to ledger", variable=self.ai_log_signals_var).pack(side="left", padx=(6, 0))
         self.btn_run_ai = ttk.Button(top, text="Run AI Analysis", command=self._run_ai_analysis)
         self.btn_run_ai.pack(side="left", padx=8)
-        ttk.Button(top, text="Preview Prompt", command=self._preview_ai_prompt).pack(side="left")
+        ttk.Button(top, text="Show Prompt", command=self._preview_ai_prompt).pack(side="left")
         ttk.Button(top, text="Stage Recommendations", command=self._stage_ai_recommendations).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Pending", command=self._clear_pending_recommendations).pack(side="left")
         ttk.Label(top, text="Pipeline min").pack(side="left", padx=(10, 0))
         ttk.Entry(top, textvariable=self.pipeline_interval_min_var, width=6).pack(side="left", padx=4)
         ttk.Button(top, text="Run Live->AI Pipeline", command=self._run_live_ai_pipeline_now).pack(side="left", padx=4)
+        ttk.Button(top, text="Run Live->Backtest->AI", command=self._run_live_backtest_ai_pipeline).pack(side="left", padx=4)
         ttk.Button(top, text="Start Pipeline Scheduler", command=self._start_pipeline_scheduler).pack(side="left", padx=4)
         ttk.Button(top, text="Stop Scheduler", command=self._stop_pipeline_scheduler).pack(side="left", padx=4)
 
@@ -400,6 +409,10 @@ class StrataGuiApp:
         ttk.Button(follow_row, text="Send Follow-up", command=self._run_ai_followup).pack(side="left")
         ai_output_frame, self.ai_output = self._create_scrolled_text(body, wrap="none")
         ai_output_frame.pack(fill="both", expand=True, pady=(8, 0))
+        ai_btns = ttk.Frame(body)
+        ai_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(ai_btns, text="Copy AI Output", command=lambda: self._copy_text_widget(self.ai_output, "AI output")).pack(side="left")
+        ttk.Button(ai_btns, text="Clear AI Output", command=lambda: self.ai_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
         top = ttk.Frame(self.portfolio_tab, padding=8)
@@ -412,6 +425,7 @@ class StrataGuiApp:
         self.pf_quote_var = tk.StringVar(value="USDT")
         self.pf_cooldown_min_var = tk.StringVar(value="240")
         self.pf_track_hold_var = tk.BooleanVar(value=True)
+        self.pf_guard_hold_var = tk.BooleanVar(value=False)
         self.pf_manual_asset_var = tk.StringVar(value="")
         self.pf_manual_action_var = tk.StringVar(value="BUY")
         self.pf_manual_price_var = tk.StringVar(value="")
@@ -420,6 +434,9 @@ class StrataGuiApp:
         self.pf_manual_note_var = tk.StringVar(value="")
         self.pf_pending_qty_var = tk.StringVar(value="0")
         self.pf_pending_type_var = tk.StringVar(value="MARKET")
+        self.pf_auto_buy_pct_var = tk.StringVar(value="10")
+        self.pf_auto_sell_pct_var = tk.StringVar(value="100")
+        self.pf_auto_confidence_var = tk.BooleanVar(value=True)
 
         ttk.Label(top, text="Binance Profile").pack(side="left")
         self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
@@ -430,17 +447,21 @@ class StrataGuiApp:
         ttk.Combobox(top, textvariable=self.pf_quote_var, values=["USDT", "USD", "BTC", "ETH", "BNB"], width=8, state="readonly").pack(side="left", padx=4)
         ttk.Button(top, text="Refresh Profiles", command=self._refresh_binance_profiles).pack(side="left", padx=(4, 8))
         ttk.Button(top, text="Refresh Portfolio", command=self._refresh_portfolio).pack(side="left")
+        ttk.Button(top, text="Reconcile Fills", command=self._reconcile_binance_fills).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Review Open Positions (MTF)", command=self._review_open_positions_mtf).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
         ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(top, text="Guard HOLD duplicates", variable=self.pf_guard_hold_var).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="Import Signals from Live", command=self._import_signals_from_live).pack(side="left", padx=8)
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
+        ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
 
         pending_frame = ttk.LabelFrame(self.portfolio_tab, text="Pending Recommendations (Review & Approve)", padding=8)
         pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
-            columns=("id", "symbol", "side", "type", "qty", "tf", "conf", "status", "reason"),
+            columns=("id", "symbol", "side", "type", "qty", "stop", "tf", "conf", "status", "reason"),
             show="headings",
             height=6,
             selectmode="extended",
@@ -451,6 +472,7 @@ class StrataGuiApp:
             ("side", 60),
             ("type", 70),
             ("qty", 80),
+            ("stop", 90),
             ("tf", 50),
             ("conf", 60),
             ("status", 90),
@@ -466,6 +488,12 @@ class StrataGuiApp:
         ttk.Label(pending_btns_row1, text="type").pack(side="left")
         ttk.Combobox(pending_btns_row1, textvariable=self.pf_pending_type_var, values=["MARKET", "LIMIT"], width=8, state="readonly").pack(side="left", padx=4)
         ttk.Button(pending_btns_row1, text="Apply to Selected", command=self._apply_pending_edit_to_selected).pack(side="left", padx=6)
+        ttk.Label(pending_btns_row1, text="Auto BUY %").pack(side="left", padx=(10, 0))
+        ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_buy_pct_var, width=6).pack(side="left", padx=4)
+        ttk.Label(pending_btns_row1, text="Auto SELL %").pack(side="left")
+        ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_sell_pct_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(pending_btns_row1, text="Weight by confidence", variable=self.pf_auto_confidence_var).pack(side="left", padx=(6, 0))
+        ttk.Button(pending_btns_row1, text="Auto-size Selected", command=self._auto_size_selected_pending_orders).pack(side="left", padx=6)
         pending_btns_row2 = ttk.Frame(pending_frame)
         pending_btns_row2.pack(fill="x")
         ttk.Button(pending_btns_row2, text="Submit Selected", command=self._submit_selected_pending_orders).pack(side="left")
@@ -527,11 +555,25 @@ class StrataGuiApp:
         pf_open_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_open_positions_text)
 
-        bottom = ttk.LabelFrame(body, text="Trade Ledger (History + Activity Guard)", padding=6)
+        bottom = ttk.LabelFrame(body, text="Trade Ledger (Signal + Execution Views)", padding=6)
         bottom.pack(fill="both", expand=True, pady=(8, 0))
-        pf_ledger_frame, self.pf_ledger_text = self._create_scrolled_text(bottom, wrap="none")
+        ledger_nb = ttk.Notebook(bottom)
+        ledger_nb.pack(fill="both", expand=True)
+        tab_overall = ttk.Frame(ledger_nb)
+        tab_signal = ttk.Frame(ledger_nb)
+        tab_exec = ttk.Frame(ledger_nb)
+        ledger_nb.add(tab_overall, text="Overall")
+        ledger_nb.add(tab_signal, text="Signal Journal")
+        ledger_nb.add(tab_exec, text="Execution Ledger")
+        pf_ledger_frame, self.pf_ledger_text = self._create_scrolled_text(tab_overall, wrap="none")
         pf_ledger_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_ledger_text)
+        pf_signal_frame, self.pf_signal_text = self._create_scrolled_text(tab_signal, wrap="none")
+        pf_signal_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_signal_text)
+        pf_exec_frame, self.pf_execution_text = self._create_scrolled_text(tab_exec, wrap="none")
+        pf_exec_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_execution_text)
 
         self._refresh_binance_profiles()
         self._refresh_ledger_view()
@@ -605,6 +647,10 @@ class StrataGuiApp:
         )
         task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
+        term_btns = ttk.Frame(body)
+        term_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(term_btns, text="Copy Terminal", command=lambda: self._copy_text_widget(self.task_terminal, "Task terminal")).pack(side="left")
+        ttk.Button(term_btns, text="Clear Terminal", command=lambda: self.task_terminal.delete("1.0", tk.END)).pack(side="left", padx=6)
         self._refresh_task_tab()
         self._schedule_task_tab_refresh()
 
@@ -614,14 +660,24 @@ class StrataGuiApp:
 
         self.display_currency_var = tk.StringVar(value=self.state.get("display_currency", "USD"))
         self._labeled_combo(frame, "Display Currency", self.display_currency_var, ["USD", "AUD", "EUR", "GBP", "CAD", "JPY", "NZD", "SGD", "HKD", "CHF"])
+        self.primary_quote_var = tk.StringVar(value=self.state.get("primary_quote_asset", "USDT"))
+        self.quote_lock_var = tk.BooleanVar(value=bool(self.state.get("lock_primary_quote", False)))
+        self._labeled_combo(frame, "Primary Quote", self.primary_quote_var, ["USDT", "USDC", "BUSD", "FDUSD", "USD", "BTC", "ETH", "BNB"])
+        ttk.Checkbutton(frame, text="Lock primary quote across crypto dashboards/trades", variable=self.quote_lock_var).pack(anchor="w", pady=(2, 6))
         self.parallel_mode_var = tk.BooleanVar(value=bool(self.state.get("parallel_mode_enabled", False)))
         self.parallel_jobs_var = tk.StringVar(value=str(self.state.get("parallel_max_jobs", 2)))
+        self.verbose_logging_var = tk.BooleanVar(value=bool(self.state.get("verbose_terminal_logging", True)))
         ttk.Checkbutton(
             frame,
             text="Advanced Mode: Parallel jobs (experimental)",
             variable=self.parallel_mode_var,
             command=lambda: self._update_run_controls_and_status(),
         ).pack(anchor="w", pady=(8, 2))
+        ttk.Checkbutton(
+            frame,
+            text="Verbose terminal logging (debug mode)",
+            variable=self.verbose_logging_var,
+        ).pack(anchor="w", pady=(2, 2))
         self._labeled_entry(frame, "Max parallel jobs", self.parallel_jobs_var)
 
         ai_frame = ttk.LabelFrame(frame, text="AI Profiles", padding=8)
@@ -691,6 +747,9 @@ class StrataGuiApp:
 
         settings_frame, self.settings_output = self._create_scrolled_text(frame, height=8, wrap="none")
         settings_frame.pack(fill="both", expand=True, pady=(8, 0))
+        settings_btns = ttk.Frame(frame)
+        settings_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(settings_btns, text="Copy Settings Log", command=lambda: self._copy_text_widget(self.settings_output, "Settings log")).pack(side="left")
         self._append_settings("Settings are stored under %USERPROFILE%\\.ctmt\\gui\\gui_state.json")
         self.ai_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_ai_profile_into_form())
         self.bn_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_binance_profile_into_form())
@@ -714,6 +773,7 @@ class StrataGuiApp:
         text.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
+        self._install_text_console_bindings(text)
         return frame, text
 
     def _create_scrolled_tree(self, parent, **tree_kwargs):
@@ -727,7 +787,66 @@ class StrataGuiApp:
         tree.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
+        self._install_tree_bindings(tree)
         return frame, tree
+
+    def _install_text_console_bindings(self, text: tk.Text) -> None:
+        menu = tk.Menu(text, tearoff=0)
+        menu.add_command(label="Copy", command=lambda: text.event_generate("<<Copy>>"))
+        menu.add_command(label="Select All", command=lambda: text.tag_add("sel", "1.0", tk.END))
+        menu.add_separator()
+        menu.add_command(label="Clear", command=lambda: text.delete("1.0", tk.END))
+
+        def _popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        text.bind("<Button-3>", _popup)
+        text.bind("<Control-a>", lambda e: (text.tag_add("sel", "1.0", tk.END), "break"))
+        text.bind("<Control-A>", lambda e: (text.tag_add("sel", "1.0", tk.END), "break"))
+
+    def _install_tree_bindings(self, tree: ttk.Treeview) -> None:
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Copy Selected Rows", command=lambda: self._copy_tree_selection(tree, "Tree rows"))
+
+        def _popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        tree.bind("<Button-3>", _popup)
+        tree.bind("<Control-c>", lambda e: (self._copy_tree_selection(tree, "Tree rows"), "break"))
+        tree.bind("<Control-C>", lambda e: (self._copy_tree_selection(tree, "Tree rows"), "break"))
+
+    def _copy_text_widget(self, widget: tk.Text, label: str = "Text") -> None:
+        try:
+            txt = widget.get("1.0", tk.END).strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            self._append_task_terminal(f"{label}: nothing to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(txt)} chars).")
+
+    def _copy_tree_selection(self, tree: ttk.Treeview, label: str = "Rows") -> None:
+        rows = []
+        cols = list(tree["columns"]) if "columns" in tree.keys() else []
+        for iid in tree.selection():
+            vals = tree.item(iid, "values")
+            rows.append("\t".join([str(v) for v in vals]))
+        if not rows:
+            self._append_task_terminal(f"{label}: no selected rows to copy.")
+            return
+        head = "\t".join([str(c) for c in cols]) if cols else ""
+        payload = (head + "\n" if head else "") + "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(payload)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
 
     def _configure_dashboard_tags(self, widget: tk.Text) -> None:
         # Section/header emphasis
@@ -972,7 +1091,25 @@ class StrataGuiApp:
             display_currency=self.display_currency_var.get().strip() or "USD",
         )
         p.country = parse_country_code(self.country_var.get(), self.country_manual_var.get())
+        if p.market.lower() == "crypto" and self._is_primary_quote_locked():
+            p.quote_currency = self._primary_quote_asset()
         return p
+
+    def _primary_quote_asset(self) -> str:
+        return str(getattr(self, "primary_quote_var", tk.StringVar(value="USDT")).get() or "USDT").strip().upper() or "USDT"
+
+    def _is_primary_quote_locked(self) -> bool:
+        v = getattr(self, "quote_lock_var", None)
+        return bool(v.get()) if v is not None else False
+
+    def _effective_crypto_quote(self, fallback: str = "USDT") -> str:
+        if self._is_primary_quote_locked():
+            return self._primary_quote_asset()
+        try:
+            q = str(self.quote_var.get() or "").strip().upper()
+            return q or fallback
+        except Exception:
+            return fallback
 
     def _notify_busy(self, task_name: str) -> None:
         messagebox.showinfo("Task Queued", f"Task queued: {task_name}")
@@ -1189,6 +1326,19 @@ class StrataGuiApp:
             drop = current_lines - max_lines
             self.task_terminal.delete("1.0", f"{drop}.0")
 
+    def _is_verbose_logging(self) -> bool:
+        v = getattr(self, "verbose_logging_var", None)
+        if v is not None:
+            try:
+                return bool(v.get())
+            except Exception:
+                pass
+        return bool(self.state.get("verbose_terminal_logging", True))
+
+    def _vlog(self, line: str) -> None:
+        if self._is_verbose_logging():
+            self._append_task_terminal(f"VERBOSE {line}")
+
     def _append_task_terminal_from_worker(self, line: str) -> None:
         self.root.after(0, lambda: self._append_task_terminal(line))
 
@@ -1302,12 +1452,20 @@ class StrataGuiApp:
             chunks = []
             panel_text_map: Dict[str, str] = {}
             for p in self.live_panels:
-                res = bridge.run_live_panel(asdict(p))
+                cfg = asdict(p)
+                cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+                if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
+                    cfg["quote_currency"] = self._primary_quote_asset()
+                self._append_task_terminal_from_worker(
+                    f"VERBOSE Live panel start: name={cfg.get('name')} market={cfg.get('market')} tf={cfg.get('timeframe')} quote={cfg.get('quote_currency')} top_n={cfg.get('top_n')}"
+                )
+                res = bridge.run_live_panel(cfg)
                 log = (res.get("log", "") or "").strip()
                 if log:
                     self._append_task_terminal_from_worker(f"LOG [{p.name}] {log[:4000]}")
                 if not res.get("ok"):
                     chunks.append(f"=== {p.name} ===\nERROR: {res.get('error', 'unknown')}\n")
+                    self._append_task_terminal_from_worker(f"VERBOSE Live panel failed: {p.name} -> {res.get('error', 'unknown')}")
                     continue
                 text = [
                     f"=== {p.name} ({res['market']} {res['timeframe']}) ===",
@@ -1327,6 +1485,9 @@ class StrataGuiApp:
                 panel_blob = "\n".join(text) + "\n"
                 panel_text_map[p.name] = panel_blob
                 chunks.append(panel_blob)
+                self._append_task_terminal_from_worker(
+                    f"VERBOSE Live panel done: {p.name} loaded={res.get('loaded_assets')}/{res.get('requested_assets')}"
+                )
 
             out = "\n".join(chunks)
             self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id, panel_text_map))
@@ -1349,7 +1510,14 @@ class StrataGuiApp:
 
         def worker():
             bridge = self._bridge_for_task()
-            res = bridge.run_live_panel(asdict(panel))
+            cfg = asdict(panel)
+            cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+            if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
+                cfg["quote_currency"] = self._primary_quote_asset()
+            self._append_task_terminal_from_worker(
+                f"VERBOSE Live single start: name={cfg.get('name')} market={cfg.get('market')} tf={cfg.get('timeframe')} quote={cfg.get('quote_currency')} top_n={cfg.get('top_n')}"
+            )
+            res = bridge.run_live_panel(cfg)
             log = (res.get("log", "") or "").strip()
             if log:
                 self._append_task_terminal_from_worker(f"LOG [{panel.name}] {log[:4000]}")
@@ -1439,12 +1607,15 @@ class StrataGuiApp:
             except Exception:
                 return default
 
+        bt_quote = self.bt_quote.get()
+        if self.bt_market.get().strip().lower() == "crypto" and self._is_primary_quote_locked():
+            bt_quote = self._primary_quote_asset()
         cfg = {
             "market": self.bt_market.get(),
             "timeframe": self.bt_tf.get(),
             "months": _to_int(self.bt_months.get(), 12),
             "top_n": _to_int(self.bt_topn.get(), 20),
-            "quote_currency": self.bt_quote.get(),
+            "quote_currency": bt_quote,
             "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()),
             "initial_capital": _to_float(self.bt_initial.get(), 10000.0),
             "stop_loss_pct": _to_float(self.bt_stop_loss.get(), 8.0),
@@ -1468,6 +1639,10 @@ class StrataGuiApp:
             "sell_threshold": _to_int(self.bt_sell_threshold.get(), -2),
             "display_currency": self.display_currency_var.get() or "USD",
         }
+        try:
+            self._vlog("Backtest config: " + json.dumps(cfg, indent=2))
+        except Exception:
+            self._vlog(f"Backtest config built (market={cfg.get('market')} tf={cfg.get('timeframe')}).")
 
         def worker():
             bridge = self._bridge_for_task()
@@ -1504,6 +1679,7 @@ class StrataGuiApp:
         task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START AI Analysis")
         self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", "Preparing AI request...\n")
         original_source = self.ai_source.get().strip()
         if source_override:
             self.ai_source.set(source_override)
@@ -1513,11 +1689,28 @@ class StrataGuiApp:
         if not text.strip():
             self.ai_output.insert("1.0", "No source text available.")
             self._append_task_terminal("DONE AI Analysis (no source text)")
+            messagebox.showinfo(
+                "AI Analysis",
+                "No source text available.\n\n"
+                "Tip: run a Live/Backtest first or switch AI Source to 'paste' and provide input text.",
+            )
             self._finish_task(task_id, task_name=task_name)
             return
         self.ai_last_source_text = text
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = self._build_ai_prompt(text, dt)
+        try:
+            prompt = self._build_ai_prompt(text, dt)
+        except Exception as exc:
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Failed to build AI prompt: {type(exc).__name__}: {exc}")
+            self._append_task_terminal(f"DONE AI Analysis (prompt build error: {type(exc).__name__})")
+            messagebox.showerror("AI Prompt Error", f"{type(exc).__name__}: {exc}")
+            self._finish_task(task_id, task_name=task_name)
+            return
+        self._vlog(
+            f"AI request prepared: source={source_override or self.ai_source.get().strip()} "
+            f"prompt_mode={self.ai_prompt_mode.get().strip()} chars_source={len(text)} chars_prompt={len(prompt)}"
+        )
         if self.ai_require_confirm.get() and (not force_no_confirm):
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
@@ -1546,6 +1739,172 @@ class StrataGuiApp:
             "AI Analysis (Pipeline)",
             lambda: self._start_run_ai_analysis_internal(source_override="live_all_panels", force_no_confirm=True),
         )
+
+    def _run_live_backtest_ai_pipeline(self) -> None:
+        if self._queue_if_busy("Live->Backtest->AI Pipeline", self._start_live_backtest_ai_pipeline):
+            return
+        self._start_live_backtest_ai_pipeline()
+
+    def _start_live_backtest_ai_pipeline(self) -> None:
+        task_name = "Live->Backtest->AI Pipeline"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START Live->Backtest->AI Pipeline")
+        self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", "Running live/backtest/AI pipeline...\n")
+
+        def worker():
+            bridge = self._bridge_for_task()
+            live_chunks: List[str] = []
+            signal_map: Dict[Tuple[str, str], set] = {}
+            for p in self.live_panels:
+                cfg = asdict(p)
+                cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+                if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
+                    cfg["quote_currency"] = self._primary_quote_asset()
+                res = bridge.run_live_panel(cfg)
+                if not res.get("ok"):
+                    self._append_task_terminal_from_worker(f"LOG [Pipeline Live] {p.name} failed: {res.get('error', 'unknown')}")
+                    continue
+                blob = "\n".join(
+                    [
+                        f"=== {p.name} ({res['market']} {res['timeframe']}) ===",
+                        f"Assets loaded: {res['loaded_assets']}/{res['requested_assets']}",
+                        "",
+                        res["table_text"],
+                        "",
+                        "RISK SCORE BREAKDOWN",
+                        res["risk_text"],
+                    ]
+                )
+                live_chunks.append(blob)
+                for s in self._extract_signals_from_live_text(blob):
+                    mkt = str(s.get("market", "crypto")).strip().lower()
+                    tf = str(s.get("timeframe", "1d")).strip().lower()
+                    asset = str(s.get("asset", "")).strip().upper()
+                    if not asset:
+                        continue
+                    signal_map.setdefault((mkt, tf), set()).add(asset)
+
+            live_text = "\n\n".join(live_chunks).strip()
+            if not live_text:
+                self.root.after(
+                    0,
+                    lambda: self._finish_live_backtest_ai_pipeline(
+                        {"ok": False, "error": "No live panel output available for pipeline."},
+                        task_id,
+                        task_name,
+                    ),
+                )
+                return
+
+            def _to_int(v: str, default: int) -> int:
+                try:
+                    return int(str(v).strip())
+                except Exception:
+                    return default
+
+            def _to_float(v: str, default: float) -> float:
+                try:
+                    return float(str(v).strip())
+                except Exception:
+                    return default
+
+            months = _to_int(self.bt_months.get(), 12)
+            quote = self._effective_crypto_quote("USDT")
+            targeted_parts: List[str] = []
+            for (mkt, tf), assets in sorted(signal_map.items()):
+                aset = sorted(list(assets))
+                if not aset:
+                    continue
+                if mkt == "crypto":
+                    tks = [f"{a}-{quote}" for a in aset]
+                else:
+                    tks = aset
+                bt_cfg = {
+                    "market": mkt,
+                    "timeframe": tf,
+                    "months": months,
+                    "top_n": max(1, len(tks)),
+                    "tickers": tks,
+                    "quote_currency": quote,
+                    "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()),
+                    "initial_capital": _to_float(self.bt_initial.get(), 10000.0),
+                    "stop_loss_pct": _to_float(self.bt_stop_loss.get(), 8.0),
+                    "take_profit_pct": _to_float(self.bt_take_profit.get(), 20.0),
+                    "max_hold_days": _to_int(self.bt_max_hold_days.get(), 45),
+                    "min_hold_bars": _to_int(self.bt_min_hold_bars.get(), 2),
+                    "cooldown_bars": _to_int(self.bt_cooldown_bars.get(), 1),
+                    "same_asset_cooldown_bars": _to_int(self.bt_same_asset_cooldown.get(), 3),
+                    "max_consecutive_same_asset_entries": _to_int(self.bt_max_same_asset_entries.get(), 3),
+                    "fee_pct": _to_float(self.bt_fee_pct.get(), 0.10),
+                    "slippage_pct": _to_float(self.bt_slippage_pct.get(), 0.05),
+                    "position_size": max(0.01, min(1.0, _to_float(self.bt_position_size_pct.get(), 30.0) / 100.0)),
+                    "atr_multiplier": _to_float(self.bt_atr_mult.get(), 2.2),
+                    "adx_threshold": _to_float(self.bt_adx_threshold.get(), 25.0),
+                    "cmf_threshold": _to_float(self.bt_cmf_threshold.get(), 0.02),
+                    "obv_slope_threshold": _to_float(self.bt_obv_threshold.get(), 0.0),
+                    "max_drawdown_limit_pct": _to_float(self.bt_max_dd_target_pct.get(), 35.0),
+                    "max_exposure_pct": max(0.01, min(1.0, _to_float(self.bt_max_exposure_pct.get(), 40.0) / 100.0)),
+                    "cache_workers": _to_int(self.bt_cache_workers.get(), 8),
+                    "buy_threshold": _to_int(self.bt_buy_threshold.get(), 2),
+                    "sell_threshold": _to_int(self.bt_sell_threshold.get(), -2),
+                    "display_currency": self.display_currency_var.get() or "USD",
+                }
+                bt_res = bridge.run_backtest(bt_cfg)
+                if not bt_res.get("ok"):
+                    targeted_parts.append(f"## {mkt.upper()} {tf} (assets={len(tks)})\nBACKTEST ERROR: {bt_res.get('error', 'unknown')}\n")
+                else:
+                    targeted_parts.append(
+                        "\n".join(
+                            [
+                                f"## {mkt.upper()} {tf} (assets={len(tks)})",
+                                bt_res.get("summary_text", ""),
+                                "",
+                                "TRADE SAMPLE",
+                                bt_res.get("trades_text", ""),
+                            ]
+                        )
+                    )
+
+            combined_source = (
+                "LIVE DASHBOARD SNAPSHOT\n"
+                + ("=" * 80)
+                + "\n"
+                + live_text
+                + "\n\nTARGETED BACKTEST REVIEW\n"
+                + ("=" * 80)
+                + "\n"
+                + ("\n\n".join(targeted_parts) if targeted_parts else "No targeted backtest output.")
+            )
+            dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            prompt = self._build_ai_prompt(combined_source, dt)
+            ai_res = bridge.run_ai_analysis(combined_source, dt, prompt_override=prompt)
+            ai_res["combined_source"] = combined_source
+            self.root.after(0, lambda: self._finish_live_backtest_ai_pipeline(ai_res, task_id, task_name))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_live_backtest_ai_pipeline(self, res: Dict[str, Any], task_id: Optional[int], task_name: str) -> None:
+        if not res.get("ok"):
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Pipeline failed: {res.get('error', 'unknown')}")
+            self._append_task_terminal(f"DONE {task_name} (error)")
+            self._finish_task(task_id, task_name=task_name)
+            return
+        response = str(res.get("response", "") or "").strip()
+        self.ai_last_source_text = str(res.get("combined_source", "") or "")
+        self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", response or "AI returned empty response.")
+        used_prompt = str(res.get("prompt", "") or "")
+        if used_prompt:
+            self.ai_conversation.append({"role": "user", "content": used_prompt})
+        if response:
+            self.ai_conversation.append({"role": "assistant", "content": response})
+        if bool(self.ai_auto_stage_var.get()) and response:
+            staged = self._stage_ai_recommendations(silent=True)
+            self._append_task_terminal(f"Auto-stage after pipeline: {staged} recommendation(s).")
+        self._append_task_terminal(f"DONE {task_name}")
+        self._finish_task(task_id, task_name=task_name)
 
     def _pipeline_tick(self) -> None:
         self._run_live_ai_pipeline_now()
@@ -1576,9 +1935,16 @@ class StrataGuiApp:
 
     def _finish_ai_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
-            self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n\nPrompt preview:\n\n")
+            err = str(res.get("error", "") or "").strip()
+            self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n")
+            if err:
+                self.ai_output.insert("end", f"\nError: {err}\n")
+            self.ai_output.insert("end", "\nPrompt preview:\n\n")
             self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
             self._append_task_terminal("DONE AI Analysis (failed/empty)")
+            if err:
+                messagebox.showerror("AI Analysis Failed", err)
+            self._vlog(f"AI failed: {err or 'empty response'}")
         else:
             response = res.get("response", "")
             self.ai_output.insert("1.0", response)
@@ -1589,6 +1955,7 @@ class StrataGuiApp:
             if bool(self.ai_auto_stage_var.get()):
                 staged = self._stage_ai_recommendations(silent=True)
                 self._append_task_terminal(f"Auto-stage after AI run: {staged} recommendation(s).")
+            self._vlog(f"AI success: response_chars={len(response)}")
             self._append_task_terminal("DONE AI Analysis")
         self._finish_task(task_id, task_name="AI Analysis")
 
@@ -1717,11 +2084,25 @@ class StrataGuiApp:
         if not source_text.strip():
             self.ai_output.delete("1.0", tk.END)
             self.ai_output.insert("1.0", "No source text available for prompt preview.")
+            self._append_task_terminal("PROMPT PREVIEW skipped (no source text)")
+            messagebox.showinfo(
+                "Show Prompt",
+                "No source text available for prompt preview.\n\n"
+                "Run a Live/Backtest first, load a backtest file, or use Source='paste'.",
+            )
             return
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = self._build_ai_prompt(source_text, dt)
+        try:
+            prompt = self._build_ai_prompt(source_text, dt)
+        except Exception as exc:
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Failed to build prompt: {type(exc).__name__}: {exc}")
+            self._append_task_terminal(f"PROMPT PREVIEW failed ({type(exc).__name__})")
+            messagebox.showerror("Show Prompt Failed", f"{type(exc).__name__}: {exc}")
+            return
         self.ai_output.delete("1.0", tk.END)
         self.ai_output.insert("1.0", "PROMPT PREVIEW\n" + ("=" * 60) + "\n" + prompt)
+        self._append_task_terminal("PROMPT PREVIEW generated")
 
     def _extract_trade_recommendations_from_ai_text(self, text: str) -> List[Dict[str, Any]]:
         recs: List[Dict[str, Any]] = []
@@ -1731,11 +2112,7 @@ class StrataGuiApp:
         structured = self._extract_structured_trade_plan_from_ai_text(text)
         if structured:
             return structured
-        quote_default = "USDT"
-        try:
-            quote_default = (self.quote_var.get().strip().upper() or "USDT")
-        except Exception:
-            pass
+        quote_default = self._effective_crypto_quote("USDT")
         allowed_assets: set[str] = set()
         for s in self._extract_signals_from_live_text((self.latest_live_output_text or "").strip()):
             a = str(s.get("asset", "")).strip().upper()
@@ -1764,6 +2141,7 @@ class StrataGuiApp:
                     continue
             q = str(m.group(3) or quote_default).upper()
             symbol = f"{base}{q}"
+            symbol = self._normalize_symbol_quote(symbol)
             key = (symbol, side)
             if key in seen:
                 continue
@@ -1781,6 +2159,7 @@ class StrataGuiApp:
                     "side": side,
                     "order_type": "MARKET",
                     "quantity": 0.0,
+                    "stop_loss_price": 0.0,
                     "timeframe": (self.timeframe_var.get().strip() or "1d"),
                     "confidence": conf,
                     "status": "PENDING",
@@ -1825,11 +2204,7 @@ class StrataGuiApp:
         if not isinstance(trades, list):
             return []
 
-        quote_default = "USDT"
-        try:
-            quote_default = (self.quote_var.get().strip().upper() or "USDT")
-        except Exception:
-            pass
+        quote_default = self._effective_crypto_quote("USDT")
         allowed_assets: set[str] = set()
         for s in self._extract_signals_from_live_text((self.latest_live_output_text or "").strip()):
             a = str(s.get("asset", "")).strip().upper()
@@ -1849,6 +2224,7 @@ class StrataGuiApp:
 
             if not symbol and asset:
                 symbol = f"{asset}{quote_default}"
+            symbol = self._normalize_symbol_quote(symbol)
             if not asset and symbol:
                 asset = self._base_asset_from_symbol(symbol)
             if not symbol or not asset:
@@ -1873,6 +2249,7 @@ class StrataGuiApp:
             timeframe = str(tr.get("timeframe", "") or "").strip().lower() or (self.timeframe_var.get().strip() or "1d")
             confidence = str(tr.get("confidence", "") or "").strip()
             reason = str(tr.get("reason", "") or "").strip()
+            invalidation = str(tr.get("invalidation", "") or "").strip()
             qty = 0.0
             for qk in ("quantity", "qty", "size_qty"):
                 try:
@@ -1882,6 +2259,18 @@ class StrataGuiApp:
                 if qv > 0:
                     qty = qv
                     break
+            stop_loss = 0.0
+            try:
+                stop_loss = float(tr.get("stop_loss_price", 0.0) or 0.0)
+            except Exception:
+                stop_loss = 0.0
+            if stop_loss <= 0 and invalidation:
+                mm = re.search(r"([0-9]+(?:\.[0-9]+)?)", invalidation.replace(",", ""))
+                if mm:
+                    try:
+                        stop_loss = float(mm.group(1))
+                    except Exception:
+                        stop_loss = 0.0
 
             self._pending_rec_seq += 1
             recs.append(
@@ -1896,6 +2285,8 @@ class StrataGuiApp:
                     "confidence": confidence,
                     "status": "PENDING",
                     "reason": (reason or "Structured trade-plan recommendation")[:300],
+                    "invalidation": invalidation,
+                    "stop_loss_price": (stop_loss if stop_loss > 0 else 0.0),
                 }
             )
         return recs
@@ -1911,9 +2302,13 @@ class StrataGuiApp:
             if not silent:
                 messagebox.showinfo("AI Recommendations", "No BUY/SELL recommendations were detected in AI output.")
             return 0
+        recs, skipped_sell = self._filter_sells_without_holdings(recs)
         self.pending_recommendations.extend(recs)
         self._refresh_pending_recommendations_view()
-        self._append_task_terminal(f"Staged {len(recs)} AI recommendation(s) into pending orders.")
+        self._append_task_terminal(
+            f"Staged {len(recs)} AI recommendation(s) into pending orders."
+            + (f" Skipped SELL (no holdings): {skipped_sell}." if skipped_sell > 0 else "")
+        )
         if bool(self.ai_log_signals_var.get()):
             try:
                 cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
@@ -1929,10 +2324,13 @@ class StrataGuiApp:
                         "asset": str(r.get("asset", "")),
                         "action": str(r.get("side", "")),
                         "qty": 0.0,
+                        "quote_currency": self._quote_asset_from_symbol(str(r.get("symbol", ""))),
+                        "display_currency": self.display_currency_var.get().strip() or "USD",
                         "note": "AI interpretation signal",
                     },
                     cooldown_minutes=cooldown,
                     allow_duplicate=False,
+                    guard_hold_signals=bool(self.pf_guard_hold_var.get()),
                 )
                 if out.get("ok"):
                     logged += 1
@@ -1945,8 +2343,50 @@ class StrataGuiApp:
             self._submit_selected_pending_orders()
             return len(recs)
         if not silent:
-            messagebox.showinfo("AI Recommendations", f"Staged {len(recs)} recommendation(s).")
+            msg = f"Staged {len(recs)} recommendation(s)."
+            if skipped_sell > 0:
+                msg += f"\nSkipped SELL (no holdings): {skipped_sell}"
+            messagebox.showinfo("AI Recommendations", msg)
         return len(recs)
+
+    def _filter_sells_without_holdings(self, recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        profile = self.pf_binance_profile_var.get().strip() if hasattr(self, "pf_binance_profile_var") else ""
+        if not profile:
+            return recs, 0
+        # Ensure we have fresh holdings for filtering.
+        out = self.bridge.fetch_binance_portfolio(profile_name=profile)
+        if out.get("ok"):
+            self.latest_portfolio_snapshot = out
+        balances = self.latest_portfolio_snapshot.get("balances", []) if isinstance(self.latest_portfolio_snapshot, dict) else []
+        if not isinstance(balances, list) or not balances:
+            return recs, 0
+        free_by_asset: Dict[str, float] = {}
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            a = str(b.get("asset", "")).strip().upper()
+            if not a:
+                continue
+            try:
+                free_by_asset[a] = float(b.get("free", 0.0) or 0.0)
+            except Exception:
+                free_by_asset[a] = 0.0
+        kept: List[Dict[str, Any]] = []
+        skipped = 0
+        for r in recs:
+            side = str(r.get("side", "")).strip().upper()
+            if side != "SELL":
+                kept.append(r)
+                continue
+            sym = str(r.get("symbol", "")).strip().upper()
+            base = self._base_asset_from_symbol(sym)
+            held = float(free_by_asset.get(base, 0.0) or 0.0)
+            if held <= 0:
+                skipped += 1
+                self._vlog(f"Skipped SELL recommendation (no holdings): {sym}")
+                continue
+            kept.append(r)
+        return kept, skipped
 
     def _clear_pending_recommendations(self) -> None:
         self.pending_recommendations = []
@@ -1987,6 +2427,7 @@ class StrataGuiApp:
                     r.get("side", ""),
                     r.get("order_type", "MARKET"),
                     r.get("quantity", 0),
+                    r.get("stop_loss_price", ""),
                     r.get("timeframe", ""),
                     r.get("confidence", ""),
                     r.get("status", "PENDING"),
@@ -2043,6 +2484,263 @@ class StrataGuiApp:
                 return s[: -len(q)]
         return s
 
+    def _quote_asset_from_symbol(self, symbol: str) -> str:
+        s = str(symbol).strip().upper()
+        for q in ["USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB"]:
+            if s.endswith(q) and len(s) > len(q):
+                return q
+        if self._is_primary_quote_locked():
+            return self._primary_quote_asset()
+        return str(self.pf_quote_var.get() or self._effective_crypto_quote("USDT")).strip().upper()
+
+    def _normalize_symbol_quote(self, symbol: str) -> str:
+        s = str(symbol).strip().upper()
+        if not s:
+            return s
+        if not self._is_primary_quote_locked():
+            return s
+        base = self._base_asset_from_symbol(s)
+        if not base or base == s:
+            return s
+        return f"{base}{self._primary_quote_asset()}"
+
+    def _parse_min_notional_from_error(self, err_text: str) -> Optional[float]:
+        txt = str(err_text or "")
+        m = re.search(r"minNotional\s+([0-9]+(?:\.[0-9]+)?)", txt, flags=re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def _balances_free_map(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        snap = self.latest_portfolio_snapshot if isinstance(self.latest_portfolio_snapshot, dict) else {}
+        rows = snap.get("balances", []) if isinstance(snap, dict) else []
+        if not isinstance(rows, list):
+            return out
+        for b in rows:
+            if not isinstance(b, dict):
+                continue
+            a = str(b.get("asset", "")).strip().upper()
+            if not a:
+                continue
+            try:
+                out[a] = float(b.get("free", 0.0) or 0.0)
+            except Exception:
+                out[a] = 0.0
+        return out
+
+    def _attempt_min_notional_qty_adjustment(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        min_notional: float,
+        profile: Optional[str],
+        free_by_asset: Dict[str, float],
+    ) -> Tuple[Optional[float], str]:
+        if min_notional <= 0:
+            return None, "Invalid minNotional."
+        p = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+        if not p.get("ok"):
+            return None, str(p.get("error", "Failed to fetch market price for minNotional adjustment."))
+        try:
+            px = float(p.get("price", 0.0) or 0.0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            return None, "Invalid market price for minNotional adjustment."
+        # Small buffer above minNotional to avoid rounding underflow.
+        target_notional = float(min_notional) * 1.02
+        qty_guess = target_notional / px
+        v = self.bridge.validate_binance_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=qty_guess,
+            profile_name=profile,
+        )
+        if not v.get("ok"):
+            return None, str(v.get("error", "Adjusted quantity still fails validation."))
+        try:
+            nq = float(v.get("normalized_quantity", 0.0) or 0.0)
+        except Exception:
+            nq = 0.0
+        if nq <= 0:
+            return None, "Adjusted quantity normalized to zero."
+
+        quote = self._quote_asset_from_symbol(symbol)
+        base = self._base_asset_from_symbol(symbol)
+        if side == "BUY":
+            need_quote = nq * px
+            free_q = float(free_by_asset.get(quote, 0.0) or 0.0)
+            if free_q > 0 and need_quote > free_q:
+                return None, f"Need ~{need_quote:.6f} {quote} for minNotional-adjusted BUY, available {free_q:.6f}."
+        if side == "SELL":
+            free_b = float(free_by_asset.get(base, 0.0) or 0.0)
+            if free_b > 0 and nq > free_b:
+                return None, f"Need ~{nq:.8f} {base} for minNotional-adjusted SELL, available {free_b:.8f}."
+        return nq, f"Auto-adjusted qty to satisfy minNotional ({min_notional}) at px {px:.6f}."
+
+    def _confidence_multiplier(self, raw: Any) -> float:
+        if not bool(self.pf_auto_confidence_var.get()):
+            return 1.0
+        try:
+            s = str(raw or "").strip().replace("%", "")
+            if not s:
+                return 1.0
+            v = float(s)
+            if v > 1.0:
+                v = v / 100.0
+            v = max(0.0, min(1.0, v))
+            # Keep sizing bounded but responsive.
+            return max(0.5, min(1.25, 0.5 + (v * 0.75)))
+        except Exception:
+            return 1.0
+
+    def _auto_size_selected_pending_orders(self) -> None:
+        ids = self._selected_pending_ids()
+        if not ids:
+            messagebox.showinfo("Auto-size", "Select one or more pending rows first.")
+            return
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Auto-size", "Select a Binance profile first.")
+            return
+        try:
+            buy_pct = max(0.0, min(100.0, float((self.pf_auto_buy_pct_var.get() or "10").strip())))
+        except Exception:
+            buy_pct = 10.0
+        try:
+            sell_pct = max(0.0, min(100.0, float((self.pf_auto_sell_pct_var.get() or "100").strip())))
+        except Exception:
+            sell_pct = 100.0
+
+        if not self.latest_portfolio_snapshot or not bool(self.latest_portfolio_snapshot.get("ok")):
+            res = self.bridge.fetch_binance_portfolio(profile_name=profile)
+            if not res.get("ok"):
+                messagebox.showerror("Auto-size", str(res.get("error", "Failed to fetch Binance portfolio.")))
+                return
+            self.latest_portfolio_snapshot = res
+            self._finish_refresh_portfolio(res, task_id=None)
+
+        balances = self.latest_portfolio_snapshot.get("balances", []) or []
+        free_by_asset: Dict[str, float] = {}
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            a = str(b.get("asset", "")).strip().upper()
+            if not a:
+                continue
+            try:
+                free_by_asset[a] = float(b.get("free", 0.0) or 0.0)
+            except Exception:
+                free_by_asset[a] = 0.0
+
+        updated = 0
+        blocked = 0
+        for rid in ids:
+            rec = next((r for r in self.pending_recommendations if int(r.get("id", -1)) == int(rid)), None)
+            if not rec:
+                continue
+            symbol = str(rec.get("symbol", "")).strip().upper()
+            side = str(rec.get("side", "")).strip().upper()
+            otype = str(rec.get("order_type", "MARKET")).strip().upper()
+            if not symbol or side not in ("BUY", "SELL"):
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = "Missing symbol/side for auto-size."
+                continue
+
+            base = self._base_asset_from_symbol(symbol)
+            quote = self._quote_asset_from_symbol(symbol)
+            mult = self._confidence_multiplier(rec.get("confidence", ""))
+
+            qty_guess = 0.0
+            if side == "BUY":
+                free_quote = float(free_by_asset.get(quote, 0.0) or 0.0)
+                spend = free_quote * (buy_pct / 100.0) * mult
+                if spend <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = f"No available {quote} balance to auto-size BUY."
+                    continue
+                p = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+                if not p.get("ok"):
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = str(p.get("error", "Failed to fetch last price."))
+                    continue
+                px = float(p.get("price", 0.0) or 0.0)
+                if px <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = "Invalid market price for auto-size."
+                    continue
+                qty_guess = spend / px
+            else:
+                free_base = float(free_by_asset.get(base, 0.0) or 0.0)
+                qty_guess = free_base * (sell_pct / 100.0) * mult
+                if qty_guess <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = f"No available {base} balance to auto-size SELL."
+                    continue
+
+            v = self.bridge.validate_binance_order(
+                symbol=symbol,
+                side=side,
+                order_type=otype,
+                quantity=qty_guess,
+                profile_name=profile,
+            )
+            if not v.get("ok"):
+                min_n = self._parse_min_notional_from_error(str(v.get("error", "")))
+                if min_n is not None:
+                    adj_qty, adj_note = self._attempt_min_notional_qty_adjustment(
+                        symbol=symbol,
+                        side=side,
+                        order_type=otype,
+                        min_notional=min_n,
+                        profile=profile,
+                        free_by_asset=free_by_asset,
+                    )
+                    if adj_qty is not None and adj_qty > 0:
+                        rec["quantity"] = adj_qty
+                        rec["status"] = "PENDING"
+                        rec["reason"] = adj_note
+                        updated += 1
+                        continue
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = str(v.get("error", "Auto-size failed validation."))
+                continue
+
+            nqty = float(v.get("normalized_quantity", 0.0) or 0.0)
+            if nqty <= 0:
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = "Auto-size normalized qty is zero."
+                continue
+            rec["quantity"] = nqty
+            rec["status"] = "PENDING"
+            rec["reason"] = f"Auto-sized ({side}) using available balance and Binance filters."
+            updated += 1
+
+        self._refresh_pending_recommendations_view()
+        self._append_task_terminal(
+            f"Auto-size completed -> updated={updated}, blocked={blocked}, "
+            f"buy_pct={buy_pct:.1f}%, sell_pct={sell_pct:.1f}%, confidence_weight={bool(self.pf_auto_confidence_var.get())}"
+        )
+        messagebox.showinfo(
+            "Auto-size complete",
+            f"Updated: {updated}\nBlocked: {blocked}\n\n"
+            f"BUY sizing: {buy_pct:.1f}% of available quote balance\n"
+            f"SELL sizing: {sell_pct:.1f}% of available base balance",
+        )
+
     def _submit_selected_pending_orders(self) -> None:
         ids = self._selected_pending_ids()
         if not ids:
@@ -2066,6 +2764,13 @@ class StrataGuiApp:
         submitted = 0
         blocked = 0
         failed = 0
+        free_by_asset = self._balances_free_map()
+        if not free_by_asset:
+            # Best effort refresh for balance-aware retry logic.
+            fres = self.bridge.fetch_binance_portfolio(profile_name=profile)
+            if fres.get("ok"):
+                self.latest_portfolio_snapshot = fres
+                free_by_asset = self._balances_free_map()
         for rid in ids:
             rec = next((r for r in self.pending_recommendations if int(r.get("id", -1)) == int(rid)), None)
             if not rec:
@@ -2082,8 +2787,41 @@ class StrataGuiApp:
             if qty <= 0:
                 rec["status"] = "BLOCKED"
                 rec["reason"] = "Quantity is 0. Edit quantity before submit."
+                self._vlog(f"Submit blocked: {symbol} {side} qty={qty}")
                 blocked += 1
                 continue
+            # Pre-submit balance sanity check to reduce exchange rejects.
+            base = self._base_asset_from_symbol(symbol)
+            quote = self._quote_asset_from_symbol(symbol)
+            if side == "SELL":
+                free_base = float(free_by_asset.get(base, 0.0) or 0.0)
+                if free_base > 0 and qty > free_base:
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = f"Insufficient {base} free balance ({free_base:.8f}) for qty {qty:.8f}."
+                    self._vlog(f"Submit blocked pre-check: {symbol} SELL qty={qty} free_{base}={free_base}")
+                    blocked += 1
+                    continue
+            elif side == "BUY":
+                free_quote = float(free_by_asset.get(quote, 0.0) or 0.0)
+                p = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+                try:
+                    px = float(p.get("price", 0.0) or 0.0) if p.get("ok") else 0.0
+                except Exception:
+                    px = 0.0
+                if free_quote > 0 and px > 0:
+                    est_cost = qty * px * 1.003  # small fee/slippage safety
+                    if est_cost > free_quote:
+                        rec["status"] = "BLOCKED"
+                        rec["reason"] = (
+                            f"Insufficient {quote} free balance ({free_quote:.6f}) for est cost {est_cost:.6f}. "
+                            f"Use Auto-size or lower qty."
+                        )
+                        self._vlog(
+                            f"Submit blocked pre-check: {symbol} BUY qty={qty} px={px} est_cost={est_cost} free_{quote}={free_quote}"
+                        )
+                        blocked += 1
+                        continue
+            self._vlog(f"Submitting order: symbol={symbol} side={side} type={order_type} qty={qty}")
             out = self.bridge.submit_binance_order(
                 symbol=symbol,
                 side=side,
@@ -2092,10 +2830,38 @@ class StrataGuiApp:
                 profile_name=profile,
             )
             if not out.get("ok"):
-                rec["status"] = "FAILED"
-                rec["reason"] = str(out.get("error", "submit failed"))
-                failed += 1
-                continue
+                err_text = str(out.get("error", "submit failed"))
+                min_n = self._parse_min_notional_from_error(err_text)
+                if min_n is not None:
+                    adj_qty, adj_note = self._attempt_min_notional_qty_adjustment(
+                        symbol=symbol,
+                        side=side,
+                        order_type=order_type,
+                        min_notional=min_n,
+                        profile=profile,
+                        free_by_asset=free_by_asset,
+                    )
+                    if adj_qty is not None and adj_qty > 0:
+                        self._vlog(f"Retry submit with minNotional-adjusted qty: {adj_qty} ({symbol})")
+                        out2 = self.bridge.submit_binance_order(
+                            symbol=symbol,
+                            side=side,
+                            order_type=order_type,
+                            quantity=adj_qty,
+                            profile_name=profile,
+                        )
+                        if out2.get("ok"):
+                            out = out2
+                            qty = adj_qty
+                            rec["reason"] = f"{rec.get('reason','')} | {adj_note}".strip(" |")
+                        else:
+                            err_text = f"{err_text} | retry failed: {out2.get('error', 'submit failed')}"
+                if not out.get("ok"):
+                    rec["status"] = "FAILED"
+                    rec["reason"] = err_text
+                    self._vlog(f"Submit failed: symbol={symbol} error={rec['reason']}")
+                    failed += 1
+                    continue
             rec["status"] = "SUBMITTED"
             nq = out.get("normalized_quantity", None)
             npv = out.get("normalized_price", None)
@@ -2104,7 +2870,32 @@ class StrataGuiApp:
             if npv is not None:
                 rec["reason"] = f"{rec.get('reason','')} | normalized px={npv}"
             submitted += 1
-            self.bridge.record_signal_event(
+            self._vlog(
+                f"Submit ok: symbol={symbol} side={side} normalized_qty={out.get('normalized_quantity')} normalized_px={out.get('normalized_price')}"
+            )
+            if side == "BUY":
+                try:
+                    sl = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                except Exception:
+                    sl = 0.0
+                if sl > 0:
+                    stop_limit = sl * 0.995
+                    stop_out = self.bridge.submit_binance_order(
+                        symbol=symbol,
+                        side="SELL",
+                        order_type="STOP_LOSS_LIMIT",
+                        quantity=float(out.get("normalized_quantity", qty) or qty),
+                        profile_name=profile,
+                        price=stop_limit,
+                        stop_price=sl,
+                    )
+                    if stop_out.get("ok"):
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | protective stop set @{sl:.8f}").strip(" |")
+                        self._vlog(f"Protective stop placed: {symbol} stop={sl:.8f} limit={stop_limit:.8f}")
+                    else:
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | stop set failed: {stop_out.get('error', 'unknown')}").strip(" |")
+                        self._vlog(f"Protective stop failed: {symbol} err={stop_out.get('error', 'unknown')}")
+            lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
                     "timeframe": str(rec.get("timeframe", "1d")),
@@ -2112,12 +2903,19 @@ class StrataGuiApp:
                     "asset": self._base_asset_from_symbol(symbol),
                     "action": side,
                     "qty": qty,
+                    "price": float(out.get("normalized_price", 0.0) or 0.0),
+                    "quote_currency": self._quote_asset_from_symbol(symbol),
+                    "display_currency": self.display_currency_var.get().strip() or "USD",
                     "note": f"Submitted to Binance ({symbol})",
                     "is_execution": True,
                 },
                 cooldown_minutes=cooldown,
-                allow_duplicate=False,
+                # Execution events must be recorded even if a recent signal exists.
+                allow_duplicate=True,
+                guard_hold_signals=bool(self.pf_guard_hold_var.get()),
             )
+            if not lg.get("ok"):
+                self._vlog(f"Execution ledger write failed for {symbol}: {lg.get('error') or lg.get('reason') or 'unknown'}")
         self._refresh_pending_recommendations_view()
         self._refresh_ledger_view()
         self._append_task_terminal(
@@ -2155,6 +2953,111 @@ class StrataGuiApp:
                 ),
             )
         self._append_task_terminal(f"Open orders refreshed ({len(out.get('orders', []) or [])} rows).")
+
+    def _reconcile_binance_fills(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Reconcile Fills", "Select a Binance profile first.")
+            return
+
+        symbols: set[str] = set()
+        # Include pending/recent symbols first.
+        for r in self.pending_recommendations:
+            if not isinstance(r, dict):
+                continue
+            s = str(r.get("symbol", "")).strip().upper()
+            if s:
+                symbols.add(s)
+
+        # Include current holdings mapped to configured quote.
+        if not self.latest_portfolio_snapshot or not bool(self.latest_portfolio_snapshot.get("ok")):
+            fres = self.bridge.fetch_binance_portfolio(profile_name=profile)
+            if fres.get("ok"):
+                self.latest_portfolio_snapshot = fres
+        rows = self.latest_portfolio_snapshot.get("balances", []) if isinstance(self.latest_portfolio_snapshot, dict) else []
+        quote = self._primary_quote_asset() if self._is_primary_quote_locked() else (self.pf_quote_var.get().strip().upper() or "USDT")
+        stables = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD"}
+        if isinstance(rows, list):
+            for b in rows:
+                if not isinstance(b, dict):
+                    continue
+                a = str(b.get("asset", "")).strip().upper()
+                if not a or a in stables:
+                    continue
+                try:
+                    total = float(b.get("total", 0.0) or 0.0)
+                except Exception:
+                    total = 0.0
+                if total > 0:
+                    symbols.add(f"{a}{quote}")
+
+        if not symbols:
+            messagebox.showinfo("Reconcile Fills", "No symbols found to reconcile yet.")
+            return
+
+        self._append_task_terminal(f"START Reconcile Fills ({len(symbols)} symbols)")
+        out = self.bridge.reconcile_binance_fills(
+            profile_name=profile,
+            symbols=sorted(symbols),
+            max_trades_per_symbol=200,
+            display_currency=self.display_currency_var.get().strip() or "USD",
+        )
+        if not out.get("ok"):
+            self._append_task_terminal(f"DONE Reconcile Fills (error: {out.get('error', 'unknown')})")
+            messagebox.showerror("Reconcile Fills", str(out.get("error", "Failed to reconcile fills.")))
+            return
+        self._refresh_ledger_view()
+        added = int(out.get("added_entries", 0) or 0)
+        dup = int(out.get("duplicates_skipped", 0) or 0)
+        fetched = int(out.get("fetched_trades", 0) or 0)
+        errs = out.get("errors", []) or []
+        self._append_task_terminal(
+            f"DONE Reconcile Fills -> fetched={fetched}, added={added}, duplicates={dup}, errors={len(errs)}"
+        )
+        if errs:
+            self._vlog("Reconcile errors: " + " | ".join([str(e) for e in errs[:5]]))
+        msg = f"Fetched trades: {fetched}\nAdded ledger entries: {added}\nDuplicates skipped: {dup}\nErrors: {len(errs)}"
+        if errs:
+            msg += f"\n\nFirst error:\n{errs[0]}"
+        messagebox.showinfo("Reconcile Fills", msg)
+
+    def _review_open_positions_mtf(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
+            return
+        self._append_task_terminal("START Open Position Review (4h/8h/12h/1d)")
+        out = self.bridge.analyze_open_positions_multi_tf(
+            profile_name=profile,
+            timeframes=["4h", "8h", "12h", "1d"],
+            display_currency=self.display_currency_var.get().strip() or "USD",
+        )
+        if not out.get("ok"):
+            self._append_task_terminal(f"DONE Open Position Review (error: {out.get('error', 'unknown')})")
+            messagebox.showerror("Open Position Review", str(out.get("error", "Failed to analyze open positions.")))
+            return
+        rows = out.get("rows", []) or []
+        if not rows:
+            note = str(out.get("note", "") or "No open positions to analyze.")
+            self._append_task_terminal(f"DONE Open Position Review ({note})")
+            messagebox.showinfo("Open Position Review", note)
+            return
+        lines = []
+        lines.append("OPEN POSITION MTF REVIEW")
+        lines.append("=" * 90)
+        for r in rows:
+            actions = r.get("actions", {}) if isinstance(r.get("actions"), dict) else {}
+            lines.append(
+                f"{r.get('asset','')} ({r.get('symbol','')}) qty={r.get('qty',0)} stance={r.get('stance','HOLD')} "
+                f"| BUY/HOLD/SELL votes={r.get('buy_votes',0)}/{r.get('hold_votes',0)}/{r.get('sell_votes',0)}"
+            )
+            lines.append(
+                f"  4h:{actions.get('4h','N/A')}  8h:{actions.get('8h','N/A')}  12h:{actions.get('12h','N/A')}  1d:{actions.get('1d','N/A')}"
+            )
+        blob = "\n".join(lines)
+        self._append_task_terminal(blob)
+        self._append_task_terminal(f"DONE Open Position Review ({len(rows)} positions)")
+        messagebox.showinfo("Open Position Review", f"Reviewed {len(rows)} open position(s).\nSee Task Terminal for detailed breakdown.")
 
     def _cancel_selected_open_orders(self) -> None:
         if not hasattr(self, "open_orders_tree"):
@@ -2296,10 +3199,13 @@ class StrataGuiApp:
                     "panel": s.get("panel", "live"),
                     "asset": s.get("asset", ""),
                     "action": action,
+                    "quote_currency": self._effective_crypto_quote("USDT"),
+                    "display_currency": self.display_currency_var.get().strip() or "USD",
                     "note": "Imported from latest live dashboard",
                 },
                 cooldown_minutes=cooldown,
                 allow_duplicate=False,
+                guard_hold_signals=bool(self.pf_guard_hold_var.get()),
             )
             if out.get("ok"):
                 accepted += 1
@@ -2343,11 +3249,14 @@ class StrataGuiApp:
                 "action": action,
                 "price": price,
                 "qty": qty,
+                "quote_currency": self._effective_crypto_quote("USDT"),
+                "display_currency": self.display_currency_var.get().strip() or "USD",
                 "note": note,
                 "is_execution": bool(qty > 0),
             },
             cooldown_minutes=cooldown,
             allow_duplicate=False,
+            guard_hold_signals=bool(self.pf_guard_hold_var.get()),
         )
         if out.get("ok"):
             self._append_task_terminal(f"Manual ledger event added: {action} {asset} ({tf})")
@@ -2368,6 +3277,12 @@ class StrataGuiApp:
             return
         ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
         entries = ledger.get("entries", []) if isinstance(ledger, dict) else []
+        signal_entries = out.get("signal_entries", [])
+        execution_entries = out.get("execution_entries", [])
+        if not isinstance(signal_entries, list):
+            signal_entries = []
+        if not isinstance(execution_entries, list):
+            execution_entries = []
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
 
@@ -2384,7 +3299,35 @@ class StrataGuiApp:
             self.pf_ledger_text.delete("1.0", tk.END)
             lines = []
             lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
+            lines.append(f"Signal Journal: {len(signal_entries)}")
+            lines.append(f"Execution Ledger: {len(execution_entries)}")
             lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
+            # Realized PnL summary in quote/display currencies (execution rows only).
+            realized_quote: Dict[str, float] = {}
+            realized_display: Dict[str, float] = {}
+            for e in execution_entries:
+                if not isinstance(e, dict):
+                    continue
+                try:
+                    pq = float(e.get("pnl_quote", 0.0) or 0.0)
+                except Exception:
+                    pq = 0.0
+                if abs(pq) > 0:
+                    qc = str(e.get("quote_currency", "USD") or "USD").strip().upper()
+                    realized_quote[qc] = realized_quote.get(qc, 0.0) + pq
+                try:
+                    pdv = float(e.get("pnl_display", 0.0) or 0.0)
+                except Exception:
+                    pdv = 0.0
+                if abs(pdv) > 0:
+                    dc = str(e.get("display_currency", self.display_currency_var.get() or "USD") or "USD").strip().upper()
+                    realized_display[dc] = realized_display.get(dc, 0.0) + pdv
+            if realized_quote:
+                qtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_quote.items())])
+                lines.append(f"Realized PnL (Quote): {qtxt}")
+            if realized_display:
+                dtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_display.items())])
+                lines.append(f"Realized PnL (Display): {dtxt}")
             lines.append("")
             if isinstance(entries, list) and entries:
                 df = pd.DataFrame(entries[-200:])
@@ -2393,6 +3336,55 @@ class StrataGuiApp:
                 lines.append("No ledger entries yet.")
             self.pf_ledger_text.insert("1.0", "\n".join(lines))
             self._apply_color_tags(self.pf_ledger_text)
+
+        if hasattr(self, "pf_signal_text"):
+            self.pf_signal_text.delete("1.0", tk.END)
+            if signal_entries:
+                sig_df = pd.DataFrame(signal_entries[-200:])
+                self.pf_signal_text.insert("1.0", sig_df.to_string(index=False))
+            else:
+                self.pf_signal_text.insert("1.0", "No signal-only entries.")
+            self._apply_color_tags(self.pf_signal_text)
+
+        if hasattr(self, "pf_execution_text"):
+            self.pf_execution_text.delete("1.0", tk.END)
+            if execution_entries:
+                exe_df = pd.DataFrame(execution_entries[-200:])
+                self.pf_execution_text.insert("1.0", exe_df.to_string(index=False))
+            else:
+                self.pf_execution_text.insert("1.0", "No execution entries.")
+            self._apply_color_tags(self.pf_execution_text)
+
+    def _prune_signal_history(self) -> None:
+        keep = 0
+        if not messagebox.askyesno(
+            "Prune Signal History",
+            "Remove signal-only history from ledger?\n\n"
+            "- Execution entries are kept.\n"
+            "- Open positions with qty <= 0 are cleaned.\n"
+            "- Activity guard remains intact.",
+        ):
+            return
+        out = self.bridge.prune_signal_only_history(keep_last_signals=keep)
+        if not out.get("ok"):
+            messagebox.showerror("Prune Failed", str(out.get("error", "Unknown error")))
+            return
+        removed = int(out.get("removed_signal_entries", 0) or 0)
+        kept = int(out.get("kept_signal_entries", 0) or 0)
+        exe = int(out.get("execution_entries", 0) or 0)
+        total = int(out.get("total_entries", 0) or 0)
+        self._refresh_ledger_view()
+        self._append_task_terminal(
+            f"Ledger prune complete: removed_signal={removed}, kept_signal={kept}, "
+            f"execution={exe}, total={total}"
+        )
+        messagebox.showinfo(
+            "Prune Complete",
+            f"Removed signal entries: {removed}\n"
+            f"Kept signal entries: {kept}\n"
+            f"Execution entries kept: {exe}\n"
+            f"Total ledger entries now: {total}",
+        )
 
     def _run_standard_research(self) -> None:
         self._run_research_job(standard=True)
@@ -2777,10 +3769,13 @@ class StrataGuiApp:
 
     def _persist_state(self) -> None:
         self.state["display_currency"] = self.display_currency_var.get().strip() or "USD"
+        self.state["primary_quote_asset"] = self._primary_quote_asset()
+        self.state["lock_primary_quote"] = self._is_primary_quote_locked()
         self.state["auto_refresh_seconds"] = int(self.refresh_secs_var.get().strip() or "120")
         mode_var = getattr(self, "parallel_mode_var", None)
         jobs_var = getattr(self, "parallel_jobs_var", None)
         self.state["parallel_mode_enabled"] = bool(mode_var.get()) if mode_var is not None else False
+        self.state["verbose_terminal_logging"] = bool(self.verbose_logging_var.get()) if hasattr(self, "verbose_logging_var") else True
         try:
             raw_jobs = str(jobs_var.get()).strip() if jobs_var is not None else "2"
             self.state["parallel_max_jobs"] = max(1, int(raw_jobs or "2"))
