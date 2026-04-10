@@ -447,6 +447,7 @@ class StrataGuiApp:
         ttk.Button(top, text="Refresh Profiles", command=self._refresh_binance_profiles).pack(side="left", padx=(4, 8))
         ttk.Button(top, text="Refresh Portfolio", command=self._refresh_portfolio).pack(side="left")
         ttk.Button(top, text="Reconcile Fills", command=self._reconcile_binance_fills).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Review Open Positions (MTF)", command=self._review_open_positions_mtf).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
         ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
@@ -459,7 +460,7 @@ class StrataGuiApp:
         pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
-            columns=("id", "symbol", "side", "type", "qty", "tf", "conf", "status", "reason"),
+            columns=("id", "symbol", "side", "type", "qty", "stop", "tf", "conf", "status", "reason"),
             show="headings",
             height=6,
             selectmode="extended",
@@ -470,6 +471,7 @@ class StrataGuiApp:
             ("side", 60),
             ("type", 70),
             ("qty", 80),
+            ("stop", 90),
             ("tf", 50),
             ("conf", 60),
             ("status", 90),
@@ -1990,6 +1992,7 @@ class StrataGuiApp:
                     "side": side,
                     "order_type": "MARKET",
                     "quantity": 0.0,
+                    "stop_loss_price": 0.0,
                     "timeframe": (self.timeframe_var.get().strip() or "1d"),
                     "confidence": conf,
                     "status": "PENDING",
@@ -2079,6 +2082,7 @@ class StrataGuiApp:
             timeframe = str(tr.get("timeframe", "") or "").strip().lower() or (self.timeframe_var.get().strip() or "1d")
             confidence = str(tr.get("confidence", "") or "").strip()
             reason = str(tr.get("reason", "") or "").strip()
+            invalidation = str(tr.get("invalidation", "") or "").strip()
             qty = 0.0
             for qk in ("quantity", "qty", "size_qty"):
                 try:
@@ -2088,6 +2092,18 @@ class StrataGuiApp:
                 if qv > 0:
                     qty = qv
                     break
+            stop_loss = 0.0
+            try:
+                stop_loss = float(tr.get("stop_loss_price", 0.0) or 0.0)
+            except Exception:
+                stop_loss = 0.0
+            if stop_loss <= 0 and invalidation:
+                mm = re.search(r"([0-9]+(?:\.[0-9]+)?)", invalidation.replace(",", ""))
+                if mm:
+                    try:
+                        stop_loss = float(mm.group(1))
+                    except Exception:
+                        stop_loss = 0.0
 
             self._pending_rec_seq += 1
             recs.append(
@@ -2102,6 +2118,8 @@ class StrataGuiApp:
                     "confidence": confidence,
                     "status": "PENDING",
                     "reason": (reason or "Structured trade-plan recommendation")[:300],
+                    "invalidation": invalidation,
+                    "stop_loss_price": (stop_loss if stop_loss > 0 else 0.0),
                 }
             )
         return recs
@@ -2242,6 +2260,7 @@ class StrataGuiApp:
                     r.get("side", ""),
                     r.get("order_type", "MARKET"),
                     r.get("quantity", 0),
+                    r.get("stop_loss_price", ""),
                     r.get("timeframe", ""),
                     r.get("confidence", ""),
                     r.get("status", "PENDING"),
@@ -2687,6 +2706,28 @@ class StrataGuiApp:
             self._vlog(
                 f"Submit ok: symbol={symbol} side={side} normalized_qty={out.get('normalized_quantity')} normalized_px={out.get('normalized_price')}"
             )
+            if side == "BUY":
+                try:
+                    sl = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                except Exception:
+                    sl = 0.0
+                if sl > 0:
+                    stop_limit = sl * 0.995
+                    stop_out = self.bridge.submit_binance_order(
+                        symbol=symbol,
+                        side="SELL",
+                        order_type="STOP_LOSS_LIMIT",
+                        quantity=float(out.get("normalized_quantity", qty) or qty),
+                        profile_name=profile,
+                        price=stop_limit,
+                        stop_price=sl,
+                    )
+                    if stop_out.get("ok"):
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | protective stop set @{sl:.8f}").strip(" |")
+                        self._vlog(f"Protective stop placed: {symbol} stop={sl:.8f} limit={stop_limit:.8f}")
+                    else:
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | stop set failed: {stop_out.get('error', 'unknown')}").strip(" |")
+                        self._vlog(f"Protective stop failed: {symbol} err={stop_out.get('error', 'unknown')}")
             lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
@@ -2812,6 +2853,44 @@ class StrataGuiApp:
         if errs:
             msg += f"\n\nFirst error:\n{errs[0]}"
         messagebox.showinfo("Reconcile Fills", msg)
+
+    def _review_open_positions_mtf(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
+            return
+        self._append_task_terminal("START Open Position Review (4h/8h/12h/1d)")
+        out = self.bridge.analyze_open_positions_multi_tf(
+            profile_name=profile,
+            timeframes=["4h", "8h", "12h", "1d"],
+            display_currency=self.display_currency_var.get().strip() or "USD",
+        )
+        if not out.get("ok"):
+            self._append_task_terminal(f"DONE Open Position Review (error: {out.get('error', 'unknown')})")
+            messagebox.showerror("Open Position Review", str(out.get("error", "Failed to analyze open positions.")))
+            return
+        rows = out.get("rows", []) or []
+        if not rows:
+            note = str(out.get("note", "") or "No open positions to analyze.")
+            self._append_task_terminal(f"DONE Open Position Review ({note})")
+            messagebox.showinfo("Open Position Review", note)
+            return
+        lines = []
+        lines.append("OPEN POSITION MTF REVIEW")
+        lines.append("=" * 90)
+        for r in rows:
+            actions = r.get("actions", {}) if isinstance(r.get("actions"), dict) else {}
+            lines.append(
+                f"{r.get('asset','')} ({r.get('symbol','')}) qty={r.get('qty',0)} stance={r.get('stance','HOLD')} "
+                f"| BUY/HOLD/SELL votes={r.get('buy_votes',0)}/{r.get('hold_votes',0)}/{r.get('sell_votes',0)}"
+            )
+            lines.append(
+                f"  4h:{actions.get('4h','N/A')}  8h:{actions.get('8h','N/A')}  12h:{actions.get('12h','N/A')}  1d:{actions.get('1d','N/A')}"
+            )
+        blob = "\n".join(lines)
+        self._append_task_terminal(blob)
+        self._append_task_terminal(f"DONE Open Position Review ({len(rows)} positions)")
+        messagebox.showinfo("Open Position Review", f"Reviewed {len(rows)} open position(s).\nSee Task Terminal for detailed breakdown.")
 
     def _cancel_selected_open_orders(self) -> None:
         if not hasattr(self, "open_orders_tree"):

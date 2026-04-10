@@ -151,6 +151,9 @@ GUI Portfolio & Ledger:
 - New `Portfolio & Ledger` tab:
   - Binance account portfolio snapshot (balances + estimated USD value)
   - `Reconcile Fills` action to backfill missing execution rows/open positions from Binance trade history
+  - `Review Open Positions (MTF)` action:
+    - evaluates open-position assets across `4h/8h/12h/1d`
+    - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)
   - Signal import from latest live dashboard output
   - Duplicate-signal activity guard (cooldown-based) to reduce repeated same-signal actions
   - Manual ledger event entry (`BUY/SELL/HOLD`)
@@ -164,6 +167,9 @@ GUI Portfolio & Ledger:
   - direct import of AI-interpreted signals into pending queue (with optional ledger logging)
   - open Binance order list + cancel selected orders from GUI
   - execution modes: `manual`, `semi_auto`, `full_auto` (mode-controlled behavior)
+  - optional protective stop placement on BUY execution:
+    - if AI structured recommendation includes `invalidation`/`stop_loss_price`, GUI stores it
+    - submit flow attempts a `STOP_LOSS_LIMIT` protective SELL order after BUY fill
   - Binance pre-submit order validation against exchange filters:
     - quantity step size / min-max qty
     - limit-price tick size / min-max price

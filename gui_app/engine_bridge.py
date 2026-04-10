@@ -590,14 +590,15 @@ class EngineBridge:
         quantity: float,
         profile_name: Optional[str] = None,
         price: Optional[float] = None,
+        stop_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         sym = str(symbol).strip().upper()
         s = str(side).strip().upper()
         t = str(order_type).strip().upper()
         if not sym or s not in ("BUY", "SELL"):
             return {"ok": False, "error": "Valid symbol and side (BUY/SELL) are required."}
-        if t not in ("MARKET", "LIMIT"):
-            return {"ok": False, "error": "order_type must be MARKET or LIMIT."}
+        if t not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT"):
+            return {"ok": False, "error": "order_type must be MARKET, LIMIT, or STOP_LOSS_LIMIT."}
 
         qty = self._to_decimal(quantity)
         if qty <= Decimal("0"):
@@ -655,10 +656,11 @@ class EngineBridge:
             return {"ok": False, "error": f"Quantity {norm_qty} above maxQty {max_qty}."}
 
         norm_price: Optional[Decimal] = None
-        if t == "LIMIT":
+        norm_stop: Optional[Decimal] = None
+        if t in ("LIMIT", "STOP_LOSS_LIMIT"):
             p = self._to_decimal(price or 0)
             if p <= Decimal("0"):
-                return {"ok": False, "error": "Limit orders require positive price."}
+                return {"ok": False, "error": f"{t} orders require positive price."}
             tick = self._to_decimal(price_f.get("tickSize", "0"))
             min_p = self._to_decimal(price_f.get("minPrice", "0"))
             max_p = self._to_decimal(price_f.get("maxPrice", "0"))
@@ -667,6 +669,15 @@ class EngineBridge:
                 return {"ok": False, "error": f"Price {norm_price} below minPrice {min_p}."}
             if max_p > Decimal("0") and norm_price > max_p:
                 return {"ok": False, "error": f"Price {norm_price} above maxPrice {max_p}."}
+            if t == "STOP_LOSS_LIMIT":
+                sp = self._to_decimal(stop_price or 0)
+                if sp <= Decimal("0"):
+                    return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                norm_stop = self._round_to_step(sp, tick) if tick > Decimal("0") else sp
+                if min_p > Decimal("0") and norm_stop < min_p:
+                    return {"ok": False, "error": f"Stop price {norm_stop} below minPrice {min_p}."}
+                if max_p > Decimal("0") and norm_stop > max_p:
+                    return {"ok": False, "error": f"Stop price {norm_stop} above maxPrice {max_p}."}
 
         # Notional checks (order value).
         check_price = norm_price
@@ -715,6 +726,7 @@ class EngineBridge:
             "order_type": t,
             "normalized_quantity": float(norm_qty),
             "normalized_price": (float(norm_price) if norm_price is not None else None),
+            "normalized_stop_price": (float(norm_stop) if norm_stop is not None else None),
             "note": "Validated against Binance symbol filters.",
         }
 
@@ -1053,6 +1065,7 @@ class EngineBridge:
         quantity: float,
         profile_name: Optional[str] = None,
         price: Optional[float] = None,
+        stop_price: Optional[float] = None,
         time_in_force: str = "GTC",
     ) -> Dict[str, Any]:
         with self._lock:
@@ -1063,6 +1076,7 @@ class EngineBridge:
                 quantity=quantity,
                 profile_name=profile_name,
                 price=price,
+                stop_price=stop_price,
             )
             if not v.get("ok"):
                 return {"ok": False, "error": v.get("error", "Binance order validation failed.")}
@@ -1071,6 +1085,7 @@ class EngineBridge:
             t = str(v.get("order_type", "")).upper()
             qty = float(v.get("normalized_quantity", 0.0) or 0.0)
             px_norm = v.get("normalized_price", None)
+            sp_norm = v.get("normalized_stop_price", None)
             active, profile, creds, err = self._resolve_active_binance_profile(profile_name)
             if err:
                 return {"ok": False, "error": err}
@@ -1081,15 +1096,23 @@ class EngineBridge:
                 "type": t,
                 "quantity": f"{qty:.8f}".rstrip("0").rstrip("."),
             }
-            if t == "LIMIT":
+            if t in ("LIMIT", "STOP_LOSS_LIMIT"):
                 try:
                     px = float(px_norm if px_norm is not None else (price or 0.0))
                 except Exception:
                     px = 0.0
                 if px <= 0:
-                    return {"ok": False, "error": "Limit orders require positive price."}
+                    return {"ok": False, "error": f"{t} orders require positive price."}
                 params["price"] = f"{px:.8f}".rstrip("0").rstrip(".")
                 params["timeInForce"] = str(time_in_force or "GTC").upper()
+                if t == "STOP_LOSS_LIMIT":
+                    try:
+                        sp = float(sp_norm if sp_norm is not None else (stop_price or 0.0))
+                    except Exception:
+                        sp = 0.0
+                    if sp <= 0:
+                        return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                    params["stopPrice"] = f"{sp:.8f}".rstrip("0").rstrip(".")
             out = self._signed_binance_request(
                 "POST",
                 endpoint,
@@ -1106,7 +1129,94 @@ class EngineBridge:
                 "data": out.get("data", {}),
                 "normalized_quantity": qty,
                 "normalized_price": px_norm,
+                "normalized_stop_price": sp_norm,
             }
+
+    def analyze_open_positions_multi_tf(
+        self,
+        profile_name: Optional[str] = None,
+        timeframes: Optional[List[str]] = None,
+        display_currency: str = "USD",
+    ) -> Dict[str, Any]:
+        with self._lock:
+            tf_list = [str(x).strip().lower() for x in (timeframes or ["4h", "8h", "12h", "1d"]) if str(x).strip()]
+            if not tf_list:
+                tf_list = ["4h", "8h", "12h", "1d"]
+
+            ledger = load_trade_ledger()
+            if not isinstance(ledger, dict):
+                ledger = default_trade_ledger()
+            open_positions = ledger.get("open_positions", {})
+            if not isinstance(open_positions, dict) or not open_positions:
+                return {"ok": True, "rows": [], "note": "No open positions in ledger."}
+
+            _, profile, _, err = self._resolve_active_binance_profile(profile_name)
+            if err:
+                return {"ok": False, "error": err}
+            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+
+            rows: List[Dict[str, Any]] = []
+            for _, pos in open_positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                base = str(pos.get("asset", "")).strip().upper()
+                quote = str(pos.get("quote_currency", "USDT")).strip().upper() or "USDT"
+                if not base:
+                    continue
+                symbol = f"{base}{quote}"
+                info = self._get_symbol_exchange_info(endpoint, symbol)
+                if not info:
+                    # skip non-Binance spot symbols in this monitor.
+                    continue
+                tf_actions: Dict[str, str] = {}
+                tf_scores: Dict[str, str] = {}
+                for tf in tf_list:
+                    tkr = f"{base}-{quote}"
+                    df = self.mod.fetch_with_cache(tkr, tf, is_crypto=True, years=2.2)
+                    if df is None or len(df) < 60:
+                        tf_actions[tf] = "N/A"
+                        tf_scores[tf] = "N/A"
+                        continue
+                    enriched = self.mod.build_indicator_cache({tkr: df}, tf, max_workers=1, verbose=False)
+                    if not enriched:
+                        tf_actions[tf] = "N/A"
+                        tf_scores[tf] = "N/A"
+                        continue
+                    table, _ = self.mod.build_live_tables(enriched, True, self.mod.TunedParams(), tf)
+                    if table is None or table.empty:
+                        tf_actions[tf] = "N/A"
+                        tf_scores[tf] = "N/A"
+                        continue
+                    row = table.iloc[0]
+                    tf_actions[tf] = str(row.get("Action", "N/A"))
+                    tf_scores[tf] = str(row.get("Score", "N/A"))
+
+                sell_votes = sum([1 for v in tf_actions.values() if "SELL" in str(v).upper()])
+                hold_votes = sum([1 for v in tf_actions.values() if "HOLD" in str(v).upper()])
+                buy_votes = sum([1 for v in tf_actions.values() if "BUY" in str(v).upper()])
+                stance = "HOLD"
+                if sell_votes >= 3:
+                    stance = "REDUCE/EXIT"
+                elif buy_votes >= 3:
+                    stance = "HOLD/ADD"
+                rows.append(
+                    {
+                        "asset": base,
+                        "symbol": symbol,
+                        "qty": float(pos.get("qty", 0.0) or 0.0),
+                        "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
+                        "stance": stance,
+                        "buy_votes": buy_votes,
+                        "hold_votes": hold_votes,
+                        "sell_votes": sell_votes,
+                        "actions": tf_actions,
+                        "scores": tf_scores,
+                        "display_currency": str(display_currency or "USD").strip().upper() or "USD",
+                    }
+                )
+
+            rows = sorted(rows, key=lambda r: int(r.get("sell_votes", 0)), reverse=True)
+            return {"ok": True, "rows": rows}
 
     def reconcile_binance_fills(
         self,
