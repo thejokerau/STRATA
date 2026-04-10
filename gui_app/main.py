@@ -84,6 +84,8 @@ class CTMTGuiApp:
         self.queue_paused = False
         self.ai_last_source_text = ""
         self.ai_conversation: List[Dict[str, str]] = []
+        self.latest_live_output_text = ""
+        self.latest_live_panel_texts: Dict[str, str] = {}
         self.task_monitor_window: Optional[tk.Toplevel] = None
         self.task_monitor_text: Optional[tk.Text] = None
         self.task_monitor_job: Optional[str] = None
@@ -296,7 +298,7 @@ class CTMTGuiApp:
         ttk.Combobox(
             top,
             textvariable=self.ai_source,
-            values=["live", "backtest_latest", "backtest_file", "paste"],
+            values=["live", "live_all_panels", "backtest_latest", "backtest_file", "paste"],
             width=16,
             state="readonly",
         ).pack(side="left", padx=4)
@@ -918,6 +920,7 @@ class CTMTGuiApp:
         def worker():
             bridge = self._bridge_for_task()
             chunks = []
+            panel_text_map: Dict[str, str] = {}
             for p in self.live_panels:
                 res = bridge.run_live_panel(asdict(p))
                 log = (res.get("log", "") or "").strip()
@@ -941,10 +944,12 @@ class CTMTGuiApp:
                     text.append("PORTFOLIO CONTEXT")
                     for n in notes:
                         text.append(f"- {n}")
-                chunks.append("\n".join(text) + "\n")
+                panel_blob = "\n".join(text) + "\n"
+                panel_text_map[p.name] = panel_blob
+                chunks.append(panel_blob)
 
             out = "\n".join(chunks)
-            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id))
+            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id, panel_text_map))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -992,10 +997,19 @@ class CTMTGuiApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_live_output(self, text: str, task_name: str = "Live Dashboard", task_id: Optional[int] = None) -> None:
+    def _finish_live_output(
+        self,
+        text: str,
+        task_name: str = "Live Dashboard",
+        task_id: Optional[int] = None,
+        panel_text_map: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.live_output.delete("1.0", tk.END)
         self.live_output.insert("1.0", text)
         self._apply_color_tags(self.live_output)
+        self.latest_live_output_text = text
+        if panel_text_map is not None:
+            self.latest_live_panel_texts = dict(panel_text_map)
         self._append_task_terminal(f"DONE {task_name}")
         self._finish_task(task_id, task_name=task_name)
         self._persist_state()
@@ -1232,6 +1246,20 @@ class CTMTGuiApp:
     def _resolve_ai_source_text(self) -> str:
         source = self.ai_source.get().strip().lower()
         if source == "live":
+            live_text = (self.latest_live_output_text or "").strip()
+            if live_text:
+                return live_text
+            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        if source == "live_all_panels":
+            if self.latest_live_panel_texts:
+                blocks = []
+                for name in sorted(self.latest_live_panel_texts.keys()):
+                    blocks.append(self.latest_live_panel_texts[name])
+                return "\n".join(blocks).strip()
+            live_text = (self.latest_live_output_text or "").strip()
+            if live_text:
+                return live_text
             path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
             return path.read_text(encoding="utf-8") if path.exists() else ""
         if source == "backtest_latest":

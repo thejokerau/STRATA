@@ -175,6 +175,9 @@
   - set/remove stored API key from GUI
   - run profile-level connectivity test from GUI
   - GUI uses same user-local preference/secret files as nightly CLI
+- Added multi-panel live AI input aggregation in GUI:
+  - new AI source mode `live_all_panels`
+  - AI can now ingest combined latest GUI live outputs across multiple panels/timeframes (e.g., 4h + 12h) in one request
 - Added GUI task monitor method:
   - status-bar `Tasks` button now shows currently running tasks and queued tasks
   - supports operational visibility while parallel mode and queueing are active
@@ -260,7 +263,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T03:24:14+00:00
+- Last update UTC: 2026-04-10T03:30:42+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T031732Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:

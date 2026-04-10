@@ -105,6 +105,7 @@ GUI AI configuration:
   - store/remove API key securely
   - test profile connectivity
 - GUI uses the same user-local secure preference/secret files as CLI mode.
+- AI source options include `live_all_panels` to aggregate the latest GUI live panel outputs (e.g., 4h + 12h) into one analysis input.
 
 GUI traditional-region UX:
 
