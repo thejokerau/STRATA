@@ -411,14 +411,26 @@ class EngineBridge:
     ) -> Dict[str, Any]:
         with self._lock:
             stream = io.StringIO()
-            with redirect_stdout(stream), redirect_stderr(stream):
-                prompt = prompt_override if (prompt_override and str(prompt_override).strip()) else self.mod.build_grok_prompt(dashboard_text, datetime_context)
-                system_prompt = (
-                    system_prompt_override
-                    if (system_prompt_override and str(system_prompt_override).strip())
-                    else self._default_system_prompt_for_active_profile()
-                )
-                response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
+            prompt = ""
+            system_prompt = ""
+            try:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    prompt = prompt_override if (prompt_override and str(prompt_override).strip()) else self.mod.build_grok_prompt(dashboard_text, datetime_context)
+                    system_prompt = (
+                        system_prompt_override
+                        if (system_prompt_override and str(system_prompt_override).strip())
+                        else self._default_system_prompt_for_active_profile()
+                    )
+                    response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "prompt": prompt,
+                    "response": "",
+                    "system_prompt": system_prompt,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "log": stream.getvalue(),
+                }
             return {
                 "ok": bool(response),
                 "prompt": prompt,

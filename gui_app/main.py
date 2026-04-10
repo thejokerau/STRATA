@@ -343,7 +343,7 @@ class StrataGuiApp:
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.ai_prompt_mode = tk.StringVar(value="preset_dashboard")
-        self.ai_require_confirm = tk.BooleanVar(value=True)
+        self.ai_require_confirm = tk.BooleanVar(value=False)
         self.ai_auto_stage_var = tk.BooleanVar(value=True)
         self.ai_log_signals_var = tk.BooleanVar(value=True)
         self.pipeline_interval_min_var = tk.StringVar(value="30")
@@ -373,7 +373,7 @@ class StrataGuiApp:
         ttk.Checkbutton(top, text="Log AI signals to ledger", variable=self.ai_log_signals_var).pack(side="left", padx=(6, 0))
         self.btn_run_ai = ttk.Button(top, text="Run AI Analysis", command=self._run_ai_analysis)
         self.btn_run_ai.pack(side="left", padx=8)
-        ttk.Button(top, text="Preview Prompt", command=self._preview_ai_prompt).pack(side="left")
+        ttk.Button(top, text="Show Prompt", command=self._preview_ai_prompt).pack(side="left")
         ttk.Button(top, text="Stage Recommendations", command=self._stage_ai_recommendations).pack(side="left", padx=6)
         ttk.Button(top, text="Clear Pending", command=self._clear_pending_recommendations).pack(side="left")
         ttk.Label(top, text="Pipeline min").pack(side="left", padx=(10, 0))
@@ -1521,6 +1521,7 @@ class StrataGuiApp:
         task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START AI Analysis")
         self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", "Preparing AI request...\n")
         original_source = self.ai_source.get().strip()
         if source_override:
             self.ai_source.set(source_override)
@@ -1530,6 +1531,11 @@ class StrataGuiApp:
         if not text.strip():
             self.ai_output.insert("1.0", "No source text available.")
             self._append_task_terminal("DONE AI Analysis (no source text)")
+            messagebox.showinfo(
+                "AI Analysis",
+                "No source text available.\n\n"
+                "Tip: run a Live/Backtest first or switch AI Source to 'paste' and provide input text.",
+            )
             self._finish_task(task_id, task_name=task_name)
             return
         self.ai_last_source_text = text
@@ -1593,9 +1599,15 @@ class StrataGuiApp:
 
     def _finish_ai_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
         if not res.get("ok"):
-            self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n\nPrompt preview:\n\n")
+            err = str(res.get("error", "") or "").strip()
+            self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n")
+            if err:
+                self.ai_output.insert("end", f"\nError: {err}\n")
+            self.ai_output.insert("end", "\nPrompt preview:\n\n")
             self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
             self._append_task_terminal("DONE AI Analysis (failed/empty)")
+            if err:
+                messagebox.showerror("AI Analysis Failed", err)
         else:
             response = res.get("response", "")
             self.ai_output.insert("1.0", response)
@@ -1734,11 +1746,18 @@ class StrataGuiApp:
         if not source_text.strip():
             self.ai_output.delete("1.0", tk.END)
             self.ai_output.insert("1.0", "No source text available for prompt preview.")
+            self._append_task_terminal("PROMPT PREVIEW skipped (no source text)")
+            messagebox.showinfo(
+                "Show Prompt",
+                "No source text available for prompt preview.\n\n"
+                "Run a Live/Backtest first, load a backtest file, or use Source='paste'.",
+            )
             return
         dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         prompt = self._build_ai_prompt(source_text, dt)
         self.ai_output.delete("1.0", tk.END)
         self.ai_output.insert("1.0", "PROMPT PREVIEW\n" + ("=" * 60) + "\n" + prompt)
+        self._append_task_terminal("PROMPT PREVIEW generated")
 
     def _extract_trade_recommendations_from_ai_text(self, text: str) -> List[Dict[str, Any]]:
         recs: List[Dict[str, Any]] = []
