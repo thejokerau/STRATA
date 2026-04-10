@@ -111,10 +111,6 @@ class StrataGuiApp:
         self._update_run_controls_and_status()
 
     def _build_ui(self) -> None:
-        topbar = ttk.Frame(self.root, padding=(8, 4))
-        topbar.pack(side="top", fill="x")
-        ttk.Button(topbar, text="Tasks", command=self._open_task_monitor_tab).pack(side="right")
-
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True)
         self._tab_scroll_canvases: Dict[str, tk.Canvas] = {}
