@@ -106,6 +106,13 @@ class StrataGuiApp:
         self.pending_recommendations: List[Dict[str, Any]] = []
         self._pending_rec_seq = 0
         self.pipeline_job: Optional[str] = None
+        self.agent_last_staged_ids: List[int] = []
+        self.agent_context: Dict[str, Any] = dict(self.state.get("agent_context", {})) if isinstance(self.state.get("agent_context", {}), dict) else {}
+        self.agent_context.setdefault("timeframe", "4h")
+        self.agent_context.setdefault("top_n", 10)
+        self.agent_context.setdefault("quote_asset", self._effective_crypto_quote("USDT"))
+        self.agent_context.setdefault("stop_pct", 5.0)
+        self.agent_context.setdefault("exclude_assets", [])
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -424,6 +431,7 @@ class StrataGuiApp:
 
         self.agent_mode_var = tk.StringVar(value="plan")
         self.agent_cmd_var = tk.StringVar(value="find me the best buys across the top 10 crypto coins on 4h and keep risk tight")
+        self.agent_ai_fallback_var = tk.BooleanVar(value=bool(self.state.get("agent_ai_fallback_enabled", True)))
         self.agent_guard_enabled_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_enabled", True)))
         self.agent_guard_require_stop_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_require_stop", True)))
         self.agent_guard_max_daily_loss_var = tk.StringVar(value=str(self.state.get("agent_guard_max_daily_loss_pct", 5.0)))
@@ -434,6 +442,7 @@ class StrataGuiApp:
         ttk.Label(top, text="Command").pack(side="left", padx=(10, 0))
         ttk.Entry(top, textvariable=self.agent_cmd_var, width=120).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(top, text="Run Command", command=self._run_agent_command).pack(side="left", padx=6)
+        ttk.Checkbutton(top, text="AI fallback", variable=self.agent_ai_fallback_var).pack(side="left", padx=(6, 0))
 
         guard = ttk.LabelFrame(self.agent_tab, text="Agent Guardrails", padding=8)
         guard.pack(fill="x", padx=8, pady=(0, 8))
@@ -452,6 +461,8 @@ class StrataGuiApp:
         btns.pack(fill="x", pady=(6, 0))
         ttk.Button(btns, text="Copy Output", command=lambda: self._copy_text_widget(self.agent_output, "Agent output")).pack(side="left")
         ttk.Button(btns, text="Clear Output", command=lambda: self.agent_output.delete("1.0", tk.END)).pack(side="left", padx=6)
+        ttk.Button(btns, text="Execute Last Staged", command=self._execute_last_agent_staged).pack(side="left", padx=6)
+        ttk.Button(btns, text="Show Agent Status", command=self._show_agent_status).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
         top = ttk.Frame(self.portfolio_tab, padding=8)
@@ -1752,6 +1763,7 @@ class StrataGuiApp:
         staged = out.get("staged_recs", []) or []
         if staged:
             self.pending_recommendations.extend(staged)
+            self.agent_last_staged_ids = [int(r.get("id", 0) or 0) for r in staged if int(r.get("id", 0) or 0) > 0]
             self._refresh_pending_recommendations_view()
             self._append_task_terminal(f"Agent staged {len(staged)} recommendation(s).")
         if out.get("auto_size", False) and staged:
@@ -1809,6 +1821,16 @@ class StrataGuiApp:
                 self._submit_selected_pending_orders()
         if out.get("refresh_ledger", False):
             self._refresh_ledger_view()
+        if bool(out.get("execute_last_staged", False)):
+            self._execute_last_agent_staged()
+        sched = str(out.get("scheduler_action", "") or "").strip().lower()
+        if sched == "start":
+            mins = out.get("scheduler_minutes")
+            if isinstance(mins, (int, float)) and float(mins) > 0:
+                self.pipeline_interval_min_var.set(str(int(float(mins))))
+            self._start_pipeline_scheduler()
+        elif sched in ("stop", "pause"):
+            self._stop_pipeline_scheduler()
         view = str(out.get("open_view", "") or "").strip().lower()
         if view in ("portfolio", "ledger", "detailed"):
             try:
@@ -1817,6 +1839,51 @@ class StrataGuiApp:
                 pass
         self._append_task_terminal("DONE Agent Command")
         self._finish_task(task_id, task_name="Agent Command")
+
+    def _show_agent_status(self) -> None:
+        excl = self.agent_context.get("exclude_assets", []) or []
+        ex_txt = ", ".join([str(x) for x in excl[:12]]) if excl else "none"
+        sched = "running" if bool(self.pipeline_job) else "stopped"
+        msg = (
+            "Agent Status\n"
+            f"- Context timeframe: {self.agent_context.get('timeframe', '4h')}\n"
+            f"- Context top_n: {self.agent_context.get('top_n', 10)}\n"
+            f"- Context quote: {self.agent_context.get('quote_asset', self._effective_crypto_quote('USDT'))}\n"
+            f"- Context stop %: {self.agent_context.get('stop_pct', 5.0)}\n"
+            f"- Exclusions: {ex_txt}\n"
+            f"- Scheduler: {sched} (interval {self.pipeline_interval_min_var.get().strip() or '30'} min)\n"
+            f"- Last staged ids: {len(self.agent_last_staged_ids)}"
+        )
+        self.agent_output.delete("1.0", tk.END)
+        self.agent_output.insert("1.0", msg)
+
+    def _execute_last_agent_staged(self) -> None:
+        ids = [int(x) for x in (self.agent_last_staged_ids or []) if int(x) > 0]
+        if not ids:
+            messagebox.showinfo("Agent", "No staged recommendations from the latest agent run.")
+            return
+        sel = []
+        for rec in self.pending_recommendations:
+            try:
+                rid = int(rec.get("id", 0) or 0)
+            except Exception:
+                rid = 0
+            if rid in ids:
+                sel.append(str(rid))
+        if not sel:
+            messagebox.showinfo("Agent", "Latest staged recommendations are no longer pending.")
+            return
+        try:
+            self.pending_tree.selection_set(*sel)
+        except Exception:
+            pass
+        self._auto_size_selected_pending_orders()
+        if str(self.agent_mode_var.get() or "").strip().lower() == "auto_execute":
+            self._submit_selected_pending_orders()
+            self._refresh_ledger_view()
+            self._append_task_terminal(f"Agent executed {len(sel)} staged recommendation(s).")
+            return
+        self._append_task_terminal(f"Agent prepared {len(sel)} staged recommendation(s). Review then Submit Selected.")
 
     def _resolve_agent_quote_from_text(self, cmd_lower: str) -> str:
         m = re.search(r"\b(usdt|usdc|fdusd|busd|usd|btc|eth|bnb)\b", cmd_lower)
@@ -1848,27 +1915,116 @@ class StrataGuiApp:
             lines.append(f"- Spend: {float(intent.get('amount_value', 0.0) or 0.0):.2f}% of free {q or 'QUOTE'}")
         if bool(intent.get("expand_until_found", False)):
             lines.append("- Search Strategy: expand top-N tiers until BUY signal(s) found")
+        excl = intent.get("exclude_assets")
+        if isinstance(excl, list) and excl:
+            lines.append("- Exclusions: " + ", ".join([str(x) for x in excl[:12]]))
         lines.append(
             "- Execution: "
             + ("auto-submit allowed" if bool(intent.get("execute_requested", False)) else "stage/plan first")
         )
         return "\n".join(lines)
 
+    def _build_agent_ai_intent_prompt(self, cmd: str, mode: str) -> str:
+        ctx = self.agent_context if isinstance(self.agent_context, dict) else {}
+        payload = {
+            "command": str(cmd or "").strip(),
+            "mode": str(mode or "plan").strip().lower(),
+            "context": {
+                "timeframe": str(ctx.get("timeframe", "4h")),
+                "top_n": int(ctx.get("top_n", 10) or 10),
+                "quote_asset": str(ctx.get("quote_asset", self._effective_crypto_quote("USDT"))),
+                "stop_pct": float(ctx.get("stop_pct", 5.0) or 5.0),
+                "exclude_assets": ctx.get("exclude_assets", []),
+            },
+            "allowed_intents": [
+                "buy",
+                "scan_allocate",
+                "open_view",
+                "scheduler",
+                "status",
+                "set_context",
+                "execute_staged",
+                "unknown",
+            ],
+            "allowed_timeframes": ["1d", "4h", "8h", "12h"],
+            "allowed_quote_assets": ["USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "BNB"],
+        }
+        return (
+            "Interpret the user trading command into strict JSON for the STRATA agent.\n"
+            "Return ONLY one JSON object between the markers below.\n"
+            "Do not include commentary.\n\n"
+            "BEGIN_STRATA_AGENT_INTENT_JSON\n"
+            "{\n"
+            "  \"intent\": \"buy|scan_allocate|open_view|scheduler|status|set_context|execute_staged|unknown\",\n"
+            "  \"asset\": \"BTC\",\n"
+            "  \"symbol\": \"BTCUSDT\",\n"
+            "  \"timeframe\": \"4h\",\n"
+            "  \"top_n\": 10,\n"
+            "  \"quote_asset\": \"USDT\",\n"
+            "  \"stop_pct\": 5.0,\n"
+            "  \"amount_mode\": \"quote_amount|quote_percent\",\n"
+            "  \"amount_value\": 10.0,\n"
+            "  \"auto_size\": true,\n"
+            "  \"execute_requested\": false,\n"
+            "  \"expand_until_found\": false,\n"
+            "  \"scheduler_action\": \"start|stop\",\n"
+            "  \"scheduler_minutes\": 30,\n"
+            "  \"open_view\": \"portfolio\",\n"
+            "  \"context_updates\": {\"exclude_assets\": [\"TRX\"]},\n"
+            "  \"exclude_assets\": [\"TRX\"],\n"
+            "  \"error\": \"\"\n"
+            "}\n"
+            "END_STRATA_AGENT_INTENT_JSON\n\n"
+            "User command + runtime context JSON:\n"
+            + json.dumps(payload, indent=2)
+        )
+
+    def _parse_agent_intent_ai_response(self, text: str) -> Dict[str, Any]:
+        raw = str(text or "")
+        if not raw.strip():
+            return {"intent": "unknown", "error": "Empty AI response."}
+        m = re.search(
+            r"BEGIN_STRATA_AGENT_INTENT_JSON\s*(\{[\s\S]*?\})\s*END_STRATA_AGENT_INTENT_JSON",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        blob = ""
+        if m:
+            blob = m.group(1).strip()
+        else:
+            m2 = re.search(r"(\{[\s\S]*\})", raw)
+            if m2:
+                blob = m2.group(1).strip()
+        if not blob:
+            return {"intent": "unknown", "error": "AI intent JSON not found in response."}
+        try:
+            parsed = json.loads(blob)
+        except Exception as exc:
+            return {"intent": "unknown", "error": f"AI intent JSON parse failed: {type(exc).__name__}"}
+        if not isinstance(parsed, dict):
+            return {"intent": "unknown", "error": "AI intent payload is not an object."}
+        intent = str(parsed.get("intent", "unknown")).strip().lower()
+        allowed = {"buy", "scan_allocate", "open_view", "scheduler", "status", "set_context", "execute_staged", "unknown"}
+        if intent not in allowed:
+            return {"intent": "unknown", "error": f"AI returned unsupported intent: {intent}"}
+        parsed["intent"] = intent
+        return parsed
+
     def _parse_agent_intent(self, cmd: str, mode: str) -> Dict[str, Any]:
         c_raw = str(cmd or "").strip()
         c = c_raw.lower()
-        tf = "4h"
+        tf = str(self.agent_context.get("timeframe", "4h")).strip().lower() or "4h"
         m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
         if m_tf:
             tf = m_tf.group(1)
-        top_n = 10
+        top_n = int(self.agent_context.get("top_n", 10) or 10)
         m_top = re.search(r"top\s+(\d+)", c)
         if m_top:
             try:
                 top_n = max(1, min(100, int(m_top.group(1))))
             except Exception:
                 top_n = 10
-        stop_pct = 5.0
+        stop_pct = float(self.agent_context.get("stop_pct", 5.0) or 5.0)
         if re.search(r"\b(no stop|without stop)\b", c):
             stop_pct = 0.0
         else:
@@ -1878,14 +2034,40 @@ class StrataGuiApp:
                     stop_pct = max(0.0, min(25.0, float(m_stop.group(1))))
                 except Exception:
                     stop_pct = 5.0
-        quote = self._resolve_agent_quote_from_text(c)
+        quote = str(self.agent_context.get("quote_asset", self._resolve_agent_quote_from_text(c))).strip().upper()
+        if re.search(r"\b(usdt|usdc|fdusd|busd|usd|btc|eth|bnb)\b", c):
+            quote = self._resolve_agent_quote_from_text(c)
         exec_words = ("execute", "submit", "place order", "buy now", "transaction", "go live")
         execute_requested = any([w in c for w in exec_words])
         scan_words = ("best buy", "best buys", "look for signals", "search for", "allocate", "invest in")
         expand_words = ("expand search", "until found", "comprehensive")
+        excl = self.agent_context.get("exclude_assets", [])
+        if not isinstance(excl, list):
+            excl = []
+
+        m_every = re.search(r"\brun\s+every\s+(\d+)\s*(m|min|mins|minute|minutes)\b", c)
+        if m_every:
+            mins = max(1, min(240, int(m_every.group(1))))
+            return {"intent": "scheduler", "scheduler_action": "start", "scheduler_minutes": mins}
+        if re.search(r"\b(pause|stop)\b.*\b(scheduler|pipeline|auto)\b", c) or c in {"pause", "stop"}:
+            return {"intent": "scheduler", "scheduler_action": "stop"}
+        if re.search(r"\b(status|show status|agent status)\b", c):
+            return {"intent": "status"}
+
+        m_excl = re.search(r"\bexclude\s+([a-z0-9,\s]+)$", c)
+        if m_excl:
+            raw = m_excl.group(1)
+            tokens = [x.strip().upper() for x in re.split(r"[,\s]+", raw) if x.strip()]
+            tokens = [t for t in tokens if re.fullmatch(r"[A-Z0-9]{2,12}", t)]
+            new_excl = sorted(list(set(excl + tokens)))
+            return {"intent": "set_context", "context_updates": {"exclude_assets": new_excl}}
+        if re.search(r"\b(clear exclusions|reset exclusions)\b", c):
+            return {"intent": "set_context", "context_updates": {"exclude_assets": []}}
 
         if ("open detailed view" in c) or ("open detail view" in c) or ("open portfolio" in c):
             return {"intent": "open_view", "open_view": "portfolio"}
+        if re.search(r"\b(execute|submit)\s+(last\s+)?staged\b", c):
+            return {"intent": "execute_staged"}
 
         if any([w in c for w in scan_words]):
             return {
@@ -1897,6 +2079,7 @@ class StrataGuiApp:
                 "expand_until_found": any([w in c for w in expand_words]),
                 "auto_size": ("allocate" in c) or ("current " + quote.lower() in c) or ("with my current" in c),
                 "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+                "exclude_assets": excl,
             }
 
         if "buy" in c:
@@ -1945,6 +2128,7 @@ class StrataGuiApp:
                 "amount_mode": amount_mode,
                 "amount_value": amount_value,
                 "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+                "exclude_assets": excl,
             }
 
         return {"intent": "unknown"}
@@ -1952,8 +2136,71 @@ class StrataGuiApp:
     def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
         parsed = self._parse_agent_intent(cmd, mode)
         intent = str(parsed.get("intent", "unknown")).strip().lower()
+        ai_used = False
+        ai_fallback_enabled = bool(self.agent_ai_fallback_var.get()) if hasattr(self, "agent_ai_fallback_var") else False
+        if intent == "unknown" and ai_fallback_enabled:
+            dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ai_prompt = self._build_agent_ai_intent_prompt(cmd, mode)
+            ai_res = bridge.run_ai_analysis(
+                dashboard_text=str(cmd or ""),
+                datetime_context=dt,
+                prompt_override=ai_prompt,
+                system_prompt_override=(
+                    "You are a strict command parser for a trading copilot. "
+                    "Output only the requested JSON object between markers."
+                ),
+            )
+            if ai_res.get("ok"):
+                parsed_ai = self._parse_agent_intent_ai_response(ai_res.get("response", ""))
+                if str(parsed_ai.get("intent", "unknown")).strip().lower() != "unknown":
+                    parsed = parsed_ai
+                    intent = str(parsed.get("intent", "unknown")).strip().lower()
+                    ai_used = True
+            else:
+                self._append_task_terminal(f"AI fallback unavailable: {ai_res.get('error', 'unknown')}")
+        if intent == "set_context":
+            upd = parsed.get("context_updates", {})
+            if not isinstance(upd, dict):
+                upd = {}
+            for k, v in upd.items():
+                self.agent_context[k] = v
+            self.state["agent_context"] = self.agent_context
+            save_state(self.state)
+            return {"ok": True, "text": self._build_agent_plan_card({"intent": "context_updated", **self.agent_context})}
+        if intent == "status":
+            excl = self.agent_context.get("exclude_assets", []) or []
+            ex_txt = ", ".join([str(x) for x in excl[:12]]) if excl else "none"
+            sched = "running" if bool(self.pipeline_job) else "stopped"
+            return {
+                "ok": True,
+                "text": (
+                    "Agent Status\n"
+                    f"- Timeframe: {self.agent_context.get('timeframe', '4h')}\n"
+                    f"- Top-N: {self.agent_context.get('top_n', 10)}\n"
+                    f"- Quote: {self.agent_context.get('quote_asset', self._effective_crypto_quote('USDT'))}\n"
+                    f"- Stop %: {self.agent_context.get('stop_pct', 5.0)}\n"
+                    f"- Exclusions: {ex_txt}\n"
+                    f"- Scheduler: {sched} ({self.pipeline_interval_min_var.get().strip() or '30'} min)"
+                ),
+            }
+        if intent == "scheduler":
+            act = str(parsed.get("scheduler_action", "")).strip().lower()
+            mins = parsed.get("scheduler_minutes")
+            if act == "start":
+                return {
+                    "ok": True,
+                    "text": f"Starting Live->AI pipeline scheduler every {int(float(mins or 30))} minutes.",
+                    "scheduler_action": "start",
+                    "scheduler_minutes": int(float(mins or 30)),
+                }
+            return {"ok": True, "text": "Stopping Live->AI pipeline scheduler.", "scheduler_action": "stop"}
+        if intent == "execute_staged":
+            return {"ok": True, "text": "Executing latest staged recommendations.", "execute_last_staged": True}
         if intent == "open_view":
-            return {"ok": True, "text": "Opening Portfolio & Ledger detailed view.", "open_view": parsed.get("open_view", "portfolio")}
+            txt = "Opening Portfolio & Ledger detailed view."
+            if ai_used:
+                txt = "[AI intent parsed]\n" + txt
+            return {"ok": True, "text": txt, "open_view": parsed.get("open_view", "portfolio")}
         if intent == "unknown":
             err = str(parsed.get("error", "")).strip()
             if err:
@@ -1974,9 +2221,21 @@ class StrataGuiApp:
         tf = str(parsed.get("timeframe", "4h")).strip().lower() or "4h"
         quote = str(parsed.get("quote_asset", self._effective_crypto_quote("USDT"))).strip().upper()
         stop_pct = float(parsed.get("stop_pct", 5.0) or 0.0)
+        self.agent_context["timeframe"] = tf
+        self.agent_context["quote_asset"] = quote
+        self.agent_context["stop_pct"] = stop_pct
+        try:
+            self.agent_context["top_n"] = int(parsed.get("top_n", self.agent_context.get("top_n", 10)) or 10)
+        except Exception:
+            self.agent_context["top_n"] = 10
+        if isinstance(parsed.get("exclude_assets"), list):
+            self.agent_context["exclude_assets"] = parsed.get("exclude_assets")
+        self.state["agent_context"] = self.agent_context
+        save_state(self.state)
 
         if intent == "scan_allocate":
             top_n = int(parsed.get("top_n", 10) or 10)
+            exclude_assets = {str(x).strip().upper() for x in (parsed.get("exclude_assets", []) or []) if str(x).strip()}
             tiers = [top_n]
             if bool(parsed.get("expand_until_found", False)):
                 for t in [10, 20, 50, 100]:
@@ -2006,6 +2265,8 @@ class StrataGuiApp:
                         continue
                     asset = str(r.get("Asset", "")).strip().upper()
                     if not asset:
+                        continue
+                    if asset in exclude_assets:
                         continue
                     try:
                         px = float(r.get("Price", 0.0) or 0.0)
@@ -2053,7 +2314,7 @@ class StrataGuiApp:
                 lines.append("Allocation step: will auto-size recommendations from available balances.")
             if auto_exec:
                 lines.append("Execution step: will submit immediately (auto_execute mode).")
-            return {
+            out = {
                 "ok": True,
                 "text": "\n".join(lines),
                 "staged_recs": buys,
@@ -2061,6 +2322,9 @@ class StrataGuiApp:
                 "auto_execute": auto_exec,
                 "refresh_ledger": auto_exec,
             }
+            if ai_used:
+                out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+            return out
 
         if intent == "buy":
             base = str(parsed.get("asset", "")).strip().upper()
@@ -2122,11 +2386,14 @@ class StrataGuiApp:
                 ),
             }
             if mode == "plan" or not execute_requested:
-                return {
+                out = {
                     "ok": True,
                     "text": plan_card + f"\n\nPlanned BUY {symbol}: qty={nq:.8f}, est spend={spend:.4f} {quote}, stop~{sl:.8f}",
                     "staged_recs": [rec],
                 }
+                if ai_used:
+                    out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+                return out
 
             if bool(self.agent_guard_enabled_var.get()):
                 try:
@@ -2195,7 +2462,10 @@ class StrataGuiApp:
                 + f"\n\nExecuted BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}, "
                 + f"est spend={spend:.4f} {quote}. {stop_msg}"
             )
-            return {"ok": True, "text": msg, "refresh_ledger": True}
+            out = {"ok": True, "text": msg, "refresh_ledger": True}
+            if ai_used:
+                out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+            return out
 
         return {"ok": False, "error": "Unhandled agent intent."}
 
@@ -4299,6 +4569,10 @@ class StrataGuiApp:
         self.state["display_currency"] = self.display_currency_var.get().strip() or "USD"
         self.state["primary_quote_asset"] = self._primary_quote_asset()
         self.state["lock_primary_quote"] = self._is_primary_quote_locked()
+        if isinstance(getattr(self, "agent_context", None), dict):
+            self.state["agent_context"] = dict(self.agent_context)
+        if hasattr(self, "agent_ai_fallback_var"):
+            self.state["agent_ai_fallback_enabled"] = bool(self.agent_ai_fallback_var.get())
         if hasattr(self, "agent_guard_enabled_var"):
             self.state["agent_guard_enabled"] = bool(self.agent_guard_enabled_var.get())
         if hasattr(self, "agent_guard_require_stop_var"):

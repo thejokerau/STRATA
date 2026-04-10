@@ -143,7 +143,16 @@ GUI AI configuration:
     - "with my current usdt, look for signals and allocate buy strategy"
     - "do a comprehensive search for top 5 coins ... expand search until found"
     - "open detailed view" (jumps to Portfolio & Ledger tab)
+    - "run every 30 minutes" / "pause scheduler" / "stop scheduler" / "agent status"
+    - "exclude TRX DOGE" / "clear exclusions"
+    - "execute staged"
   - agent now emits a deterministic plan card before staging/execution so parsed intent is transparent.
+  - optional `AI fallback` in Agent Console:
+    - deterministic parser runs first
+    - ambiguous commands are sent to the active AI profile to produce strict structured intent JSON
+    - all resulting actions still pass normal STRATA validation/guardrails before execution
+  - agent context memory persists across runs (timeframe, top-N, quote, stop %, exclusions).
+  - `Execute Last Staged` button in Agent Console accelerates review->size->submit workflow.
 
 Quote lock + local-currency ledger:
 
