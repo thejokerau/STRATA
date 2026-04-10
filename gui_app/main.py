@@ -66,11 +66,11 @@ def parse_country_code(display_or_code: str, manual_code: str = "") -> str:
     return "2"
 
 
-class CTMTGuiApp:
+class StrataGuiApp:
     def __init__(self, root: tk.Tk, repo_root: Path) -> None:
         self.root = root
         self.repo_root = repo_root
-        self.root.title("CTMT GUI (gui-nightly)")
+        self.root.title("STRATA GUI (gui-nightly)")
         self.root.geometry("1400x900")
 
         self.state = load_state()
@@ -600,7 +600,7 @@ class CTMTGuiApp:
             insertbackground="#9CF5C6",
         )
         task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
-        self.task_terminal.insert("1.0", "CTMT Task Terminal\n")
+        self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
         self._refresh_task_tab()
         self._schedule_task_tab_refresh()
 
@@ -2657,7 +2657,7 @@ class CTMTGuiApp:
 def run_gui() -> None:
     root = tk.Tk()
     repo_root = Path(__file__).resolve().parents[1]
-    app = CTMTGuiApp(root, repo_root=repo_root)
+    app = StrataGuiApp(root, repo_root=repo_root)
 
     def _shutdown():
         app._stop_pipeline_scheduler()

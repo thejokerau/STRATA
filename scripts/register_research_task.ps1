@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "CTMT_Nightly_Research",
+    [string]$TaskName = "STRATA_Nightly_Research",
     [string]$Time = "02:00",
     [string]$PythonExe = "python"
 )

@@ -1,4 +1,4 @@
-# CTMT Automation Guide
+# STRATA Automation Guide
 
 ## Goal
 
@@ -54,7 +54,7 @@ python scripts/auto_research_cycle.py
 ## Scheduling (Windows)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_research_task.ps1 -TaskName CTMT_Nightly_Research -Time 02:00 -PythonExe python
+powershell -ExecutionPolicy Bypass -File .\scripts\register_research_task.ps1 -TaskName STRATA_Nightly_Research -Time 02:00 -PythonExe python
 ```
 
 ## Notes

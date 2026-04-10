@@ -1,4 +1,4 @@
-# CTMT Bug Scorecard
+# STRATA Bug Scorecard
 
 Build-by-build bug tracking plus aggregate summary.
 

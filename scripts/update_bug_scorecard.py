@@ -57,7 +57,7 @@ def render_markdown(data: dict) -> str:
     latest_status_counter = Counter(v["status"] for v in issue_latest.values())
 
     lines = []
-    lines.append("# CTMT Bug Scorecard")
+    lines.append("# STRATA Bug Scorecard")
     lines.append("")
     lines.append("Build-by-build bug tracking plus aggregate summary.")
     lines.append("")
@@ -132,4 +132,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

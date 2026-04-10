@@ -46,7 +46,7 @@ if sys.version_info[:2] != (3, 13):
         f"Current runtime is {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}."
     )
 
-print("Crypto & Traditional Risk Dashboard (Nightly Quant)")
+print("STRATA - Crypto & Traditional Risk Dashboard (Nightly Quant)")
 
 DB_PATH = "crypto_data.db"
 COINGECKO_KEY = ""
@@ -282,7 +282,10 @@ def detect_terminal_display_capabilities() -> Tuple[bool, bool]:
     is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
     no_color = os.getenv("NO_COLOR") is not None
     force_color = os.getenv("FORCE_COLOR") is not None
-    disable_emoji = os.getenv("CTMT_DISABLE_EMOJI", "").strip().lower() in {"1", "true", "yes", "y"}
+    disable_emoji = (
+        os.getenv("STRATA_DISABLE_EMOJI", "").strip().lower() in {"1", "true", "yes", "y"}
+        or os.getenv("CTMT_DISABLE_EMOJI", "").strip().lower() in {"1", "true", "yes", "y"}
+    )
 
     emoji_ok = ("utf" in enc) and (not disable_emoji)
 

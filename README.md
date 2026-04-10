@@ -192,7 +192,7 @@ GUI traditional-region UX:
 - Action-label UI fallback:
   - auto-detects terminal support for emoji and ANSI color
   - falls back to plain text labels if unsupported
-  - optional env override: `CTMT_DISABLE_EMOJI=1`
+  - optional env override: `STRATA_DISABLE_EMOJI=1` (legacy `CTMT_DISABLE_EMOJI=1` also supported)
   - optional color controls: `NO_COLOR=1` or `FORCE_COLOR=1`
 - Built-in AI analysis mode:
   - paste full raw dashboard text and generate a Grok-ready analysis prompt
@@ -237,7 +237,7 @@ python scripts/auto_research_cycle.py
 Windows Task Scheduler helper:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_research_task.ps1 -TaskName CTMT_Nightly_Research -Time 02:00 -PythonExe python
+powershell -ExecutionPolicy Bypass -File .\scripts\register_research_task.ps1 -TaskName STRATA_Nightly_Research -Time 02:00 -PythonExe python
 ```
 
 Promotion gates (`scripts/promote_champion.py`) are conservative by default:

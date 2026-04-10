@@ -226,6 +226,11 @@
   - validates limit price against tick/min/max filters
   - validates notional against `MIN_NOTIONAL` / `NOTIONAL` constraints
   - normalizes qty/price to exchange-valid increments before order submission
+- Rebranded user-facing project naming to **STRATA**:
+  - GUI window title and task-terminal header now use STRATA branding
+  - nightly startup banner updated to STRATA
+  - docs and scheduler examples updated to STRATA naming
+  - added `STRATA_DISABLE_EMOJI` env override support (legacy `CTMT_DISABLE_EMOJI` retained)
 - Moved dashboard preset workflow into Live Dashboard tab:
   - save/update from selected panels
   - save/update from all panels
@@ -299,7 +304,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T07:12:40+00:00
+- Last update UTC: 2026-04-10T07:18:14+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T031732Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:

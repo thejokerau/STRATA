@@ -1,2 +1,1 @@
-"""CTMT GUI package."""
-
+"""STRATA GUI package."""
