@@ -1,14 +1,30 @@
 import importlib.util
 import io
 import json
+import hashlib
+import hmac
+import os
 import subprocess
 import sys
 import threading
+import time
+import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import requests
+
+from .binance_store import (
+    default_trade_ledger,
+    load_binance_preferences,
+    load_binance_secrets,
+    load_trade_ledger,
+    save_binance_preferences,
+    save_binance_secrets,
+    save_trade_ledger,
+)
 
 
 class EngineBridge:
@@ -408,6 +424,408 @@ class EngineBridge:
                 "system_prompt": system_prompt,
                 "log": stream.getvalue(),
             }
+
+    def _default_binance_endpoint(self) -> str:
+        return "https://api.binance.com"
+
+    def _resolve_binance_credentials(self, profile: Dict[str, Any], secrets: Dict[str, str]) -> Dict[str, str]:
+        key_env = str(profile.get("api_key_env", "") or "").strip()
+        secret_env = str(profile.get("api_secret_env", "") or "").strip()
+        key_name = str(profile.get("api_key_name", "") or "").strip()
+        secret_name = str(profile.get("api_secret_name", "") or "").strip()
+
+        api_key = ""
+        api_secret = ""
+        key_source = "missing"
+        secret_source = "missing"
+
+        if key_env:
+            env_val = (str(os.getenv(key_env, "")) or "").strip()
+            if env_val:
+                api_key = env_val
+                key_source = f"env:{key_env}"
+        if not api_key and key_name and key_name in secrets:
+            v = str(secrets.get(key_name, "")).strip()
+            if v:
+                api_key = v
+                key_source = f"prefs:{key_name}"
+
+        if secret_env:
+            env_val = (str(os.getenv(secret_env, "")) or "").strip()
+            if env_val:
+                api_secret = env_val
+                secret_source = f"env:{secret_env}"
+        if not api_secret and secret_name and secret_name in secrets:
+            v = str(secrets.get(secret_name, "")).strip()
+            if v:
+                api_secret = v
+                secret_source = f"prefs:{secret_name}"
+
+        return {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "key_source": key_source,
+            "secret_source": secret_source,
+        }
+
+    def _signed_binance_get(self, endpoint: str, path: str, api_key: str, api_secret: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        q = dict(params or {})
+        q["timestamp"] = int(time.time() * 1000)
+        q.setdefault("recvWindow", 5000)
+        query = urllib.parse.urlencode(q, doseq=True)
+        sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+        url = endpoint.rstrip("/") + path + "?" + query + "&signature=" + sig
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if not (200 <= r.status_code < 300):
+                return {"ok": False, "status": r.status_code, "error": (r.text or "")[:1200]}
+            return {"ok": True, "status": r.status_code, "data": r.json()}
+        except Exception as e:
+            return {"ok": False, "status": -1, "error": str(e)}
+
+    def list_binance_profiles(self) -> Dict[str, Any]:
+        with self._lock:
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            active = str(prefs.get("active_profile", "") or "")
+            out: List[Dict[str, Any]] = []
+            if isinstance(profiles, dict):
+                for name, profile in profiles.items():
+                    if not isinstance(name, str) or not isinstance(profile, dict):
+                        continue
+                    endpoint = str(profile.get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint()).strip()
+                    creds = self._resolve_binance_credentials(profile, secrets)
+                    out.append(
+                        {
+                            "name": name,
+                            "endpoint": endpoint,
+                            "api_key_env": str(profile.get("api_key_env", "") or ""),
+                            "api_secret_env": str(profile.get("api_secret_env", "") or ""),
+                            "api_key_set": bool(creds["api_key"]),
+                            "api_secret_set": bool(creds["api_secret"]),
+                            "api_key_source": creds["key_source"],
+                            "api_secret_source": creds["secret_source"],
+                            "active": name == active,
+                        }
+                    )
+            return {"ok": True, "active_profile": active, "profiles": out}
+
+    def upsert_binance_profile(
+        self,
+        name: str,
+        endpoint: str,
+        api_key_env: Optional[str] = None,
+        api_secret_env: Optional[str] = None,
+        activate: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            if not pname:
+                return {"ok": False, "error": "Profile name is required."}
+            ep = str(endpoint).strip() or self._default_binance_endpoint()
+            prefs = load_binance_preferences()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles[pname] = {
+                "endpoint": ep,
+                "api_key_env": str(api_key_env or "BINANCE_API_KEY").strip() or "BINANCE_API_KEY",
+                "api_secret_env": str(api_secret_env or "BINANCE_API_SECRET").strip() or "BINANCE_API_SECRET",
+                "api_key_name": f"{pname}_api_key",
+                "api_secret_name": f"{pname}_api_secret",
+            }
+            prefs["profiles"] = profiles
+            if activate:
+                prefs["active_profile"] = pname
+            save_binance_preferences(prefs)
+            return {"ok": True}
+
+    def set_active_binance_profile(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            prefs = load_binance_preferences()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles:
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prefs["active_profile"] = pname
+            save_binance_preferences(prefs)
+            return {"ok": True}
+
+    def delete_binance_profile(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles:
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles.pop(pname) or {}
+            for k in [str(prof.get("api_key_name", "") or ""), str(prof.get("api_secret_name", "") or "")]:
+                if k and k in secrets:
+                    del secrets[k]
+            if prefs.get("active_profile") == pname:
+                prefs["active_profile"] = next(iter(profiles.keys()), "")
+            prefs["profiles"] = profiles
+            save_binance_preferences(prefs)
+            save_binance_secrets(secrets)
+            return {"ok": True}
+
+    def set_binance_profile_keys(self, name: str, api_key: str, api_secret: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            if not pname:
+                return {"ok": False, "error": "Profile name is required."}
+            key = str(api_key).strip()
+            sec = str(api_secret).strip()
+            if not key or not sec:
+                return {"ok": False, "error": "API key and secret are required."}
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles[pname]
+            key_name = str(prof.get("api_key_name", "") or "").strip() or f"{pname}_api_key"
+            secret_name = str(prof.get("api_secret_name", "") or "").strip() or f"{pname}_api_secret"
+            prof["api_key_name"] = key_name
+            prof["api_secret_name"] = secret_name
+            profiles[pname] = prof
+            prefs["profiles"] = profiles
+            secrets[key_name] = key
+            secrets[secret_name] = sec
+            save_binance_preferences(prefs)
+            save_binance_secrets(secrets)
+            return {"ok": True}
+
+    def remove_binance_profile_keys(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            pname = str(name).strip()
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            prof = profiles[pname]
+            for key_name in [str(prof.get("api_key_name", "") or ""), str(prof.get("api_secret_name", "") or "")]:
+                if key_name and key_name in secrets:
+                    del secrets[key_name]
+            save_binance_secrets(secrets)
+            return {"ok": True}
+
+    def test_binance_profile(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            pname = str(name).strip()
+            if not isinstance(profiles, dict) or pname not in profiles or not isinstance(profiles[pname], dict):
+                return {"ok": False, "error": f"Profile not found: {pname}"}
+            profile = profiles[pname]
+            creds = self._resolve_binance_credentials(profile, secrets)
+            if not creds["api_key"] or not creds["api_secret"]:
+                return {"ok": False, "error": f"Missing API key/secret ({creds['key_source']}, {creds['secret_source']})."}
+            endpoint = str(profile.get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            out = self._signed_binance_get(endpoint, "/api/v3/account", creds["api_key"], creds["api_secret"], params={})
+            if not out.get("ok"):
+                return {"ok": False, "status": out.get("status"), "error": out.get("error", "request failed")}
+            data = out.get("data", {}) if isinstance(out.get("data"), dict) else {}
+            can_trade = bool(data.get("canTrade", False))
+            buyer_comm = data.get("buyerCommission", "")
+            return {
+                "ok": True,
+                "status": out.get("status"),
+                "can_trade": can_trade,
+                "buyer_commission_bps": buyer_comm,
+            }
+
+    def fetch_binance_portfolio(self, profile_name: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            prefs = load_binance_preferences()
+            secrets = load_binance_secrets()
+            profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
+            if not isinstance(profiles, dict) or not profiles:
+                return {"ok": False, "error": "No Binance profiles configured."}
+            active = str(profile_name or prefs.get("active_profile", "") or "").strip()
+            if not active or active not in profiles:
+                active = next(iter(profiles.keys()))
+            profile = profiles.get(active, {})
+            if not isinstance(profile, dict):
+                return {"ok": False, "error": f"Profile not found: {active}"}
+            creds = self._resolve_binance_credentials(profile, secrets)
+            if not creds["api_key"] or not creds["api_secret"]:
+                return {"ok": False, "error": f"Missing API key/secret ({creds['key_source']}, {creds['secret_source']})."}
+            endpoint = str(profile.get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            acct = self._signed_binance_get(endpoint, "/api/v3/account", creds["api_key"], creds["api_secret"], params={})
+            if not acct.get("ok"):
+                return {"ok": False, "status": acct.get("status"), "error": acct.get("error", "account request failed")}
+
+            try:
+                tick = requests.get(endpoint.rstrip("/") + "/api/v3/ticker/price", timeout=20)
+                tick.raise_for_status()
+                prices = tick.json()
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to fetch prices: {e}"}
+
+            price_map: Dict[str, float] = {}
+            if isinstance(prices, list):
+                for item in prices:
+                    if not isinstance(item, dict):
+                        continue
+                    s = str(item.get("symbol", "") or "").strip().upper()
+                    try:
+                        p = float(item.get("price", 0.0) or 0.0)
+                    except Exception:
+                        p = 0.0
+                    if s and p > 0:
+                        price_map[s] = p
+
+            account = acct.get("data", {}) if isinstance(acct.get("data"), dict) else {}
+            raw_bal = account.get("balances", []) if isinstance(account, dict) else []
+            rows: List[Dict[str, Any]] = []
+            total_usd = 0.0
+            stable = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI"}
+            for b in raw_bal:
+                if not isinstance(b, dict):
+                    continue
+                asset = str(b.get("asset", "") or "").strip().upper()
+                try:
+                    free = float(b.get("free", 0.0) or 0.0)
+                    locked = float(b.get("locked", 0.0) or 0.0)
+                except Exception:
+                    continue
+                total = free + locked
+                if total <= 0:
+                    continue
+                usd_val = 0.0
+                if asset in stable:
+                    usd_val = total
+                else:
+                    pair = f"{asset}USDT"
+                    if pair in price_map:
+                        usd_val = total * float(price_map[pair])
+                total_usd += usd_val
+                rows.append(
+                    {
+                        "asset": asset,
+                        "free": round(free, 8),
+                        "locked": round(locked, 8),
+                        "total": round(total, 8),
+                        "est_usd": round(usd_val, 2),
+                    }
+                )
+            rows = sorted(rows, key=lambda r: float(r.get("est_usd", 0.0)), reverse=True)
+            return {
+                "ok": True,
+                "profile": active,
+                "total_est_usd": round(total_usd, 2),
+                "balances": rows,
+            }
+
+    def get_trade_ledger(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"ok": True, "ledger": load_trade_ledger()}
+
+    def record_signal_event(self, event: Dict[str, Any], cooldown_minutes: int = 240, allow_duplicate: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            ledger = load_trade_ledger()
+            if not isinstance(ledger, dict):
+                ledger = default_trade_ledger()
+            entries = ledger.get("entries", [])
+            open_positions = ledger.get("open_positions", {})
+            activity_guard = ledger.get("activity_guard", {})
+            if not isinstance(entries, list):
+                entries = []
+            if not isinstance(open_positions, dict):
+                open_positions = {}
+            if not isinstance(activity_guard, dict):
+                activity_guard = {}
+
+            market = str(event.get("market", "crypto")).strip().lower()
+            timeframe = str(event.get("timeframe", "1d")).strip().lower()
+            asset = str(event.get("asset", "")).strip().upper()
+            action = str(event.get("action", "")).strip().upper()
+            panel = str(event.get("panel", "live")).strip()
+            note = str(event.get("note", "")).strip()
+            score = str(event.get("score", "")).strip()
+            try:
+                price = float(event.get("price", 0.0) or 0.0)
+            except Exception:
+                price = 0.0
+            try:
+                qty = float(event.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+
+            if not asset or action not in ("BUY", "SELL", "HOLD"):
+                return {"ok": False, "error": "Event must include valid asset and action (BUY/SELL/HOLD)."}
+
+            now = pd.Timestamp.utcnow()
+            guard_key = f"{market}|{timeframe}|{asset}|{action}"
+            blocked = False
+            blocked_reason = ""
+            if not allow_duplicate:
+                last = activity_guard.get(guard_key)
+                if isinstance(last, dict):
+                    try:
+                        last_ts = pd.to_datetime(last.get("ts", ""), utc=True)
+                        delta_min = (now - last_ts).total_seconds() / 60.0
+                    except Exception:
+                        delta_min = 10e9
+                    if delta_min < max(1, int(cooldown_minutes)):
+                        blocked = True
+                        blocked_reason = f"Duplicate signal within cooldown ({delta_min:.1f}m < {cooldown_minutes}m)."
+
+            if blocked:
+                return {"ok": False, "blocked": True, "reason": blocked_reason}
+
+            entry_id = len(entries) + 1
+            rec = {
+                "id": entry_id,
+                "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "market": market,
+                "timeframe": timeframe,
+                "panel": panel,
+                "asset": asset,
+                "action": action,
+                "price": price,
+                "qty": qty,
+                "score": score,
+                "note": note,
+            }
+            entries.append(rec)
+            activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
+
+            pos_key = f"{market}|{timeframe}|{asset}"
+            open_pos = open_positions.get(pos_key)
+            if action == "BUY":
+                open_positions[pos_key] = {
+                    "entry_id": entry_id,
+                    "entry_ts": rec["ts"],
+                    "entry_price": price,
+                    "qty": qty,
+                    "asset": asset,
+                    "market": market,
+                    "timeframe": timeframe,
+                    "panel": panel,
+                }
+            elif action == "SELL":
+                if isinstance(open_pos, dict):
+                    rec["closed_entry_id"] = int(open_pos.get("entry_id", 0) or 0)
+                    try:
+                        entry_price = float(open_pos.get("entry_price", 0.0) or 0.0)
+                    except Exception:
+                        entry_price = 0.0
+                    if entry_price > 0 and price > 0:
+                        rec["pnl_pct"] = round(((price - entry_price) / entry_price) * 100.0, 4)
+                    open_positions.pop(pos_key, None)
+
+            ledger["entries"] = entries
+            ledger["open_positions"] = open_positions
+            ledger["activity_guard"] = activity_guard
+            save_trade_ledger(ledger)
+            return {"ok": True, "entry": rec}
 
     def run_standard_research(self) -> Dict[str, Any]:
         cmd = [sys.executable, str(self.scripts_dir / "auto_research_cycle.py")]

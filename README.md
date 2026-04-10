@@ -105,6 +105,21 @@ GUI AI configuration:
   - store/remove API key securely
   - test profile connectivity
 - GUI uses the same user-local secure preference/secret files as CLI mode.
+- AI source options include `live_all_panels` to aggregate the latest GUI live panel outputs (e.g., 4h + 12h) into one analysis input.
+- AI analysis prompt now requests a bottom-section implementation snippet (`Recommended API Snippet`) with duplicate-signal guard, entry/exit branches, and minimal ledger logic.
+
+GUI Portfolio & Ledger:
+
+- New `Portfolio & Ledger` tab:
+  - Binance account portfolio snapshot (balances + estimated USD value)
+  - Signal import from latest live dashboard output
+  - Duplicate-signal activity guard (cooldown-based) to reduce repeated same-signal actions
+  - Manual ledger event entry (`BUY/SELL/HOLD`)
+  - Current open-position tracking + historical ledger view
+- Binance profiles can be managed in GUI Settings (similar to AI profiles):
+  - create/update/set active/delete profile
+  - secure key+secret storage outside repo
+  - profile connectivity test
 
 GUI traditional-region UX:
 
@@ -157,6 +172,7 @@ GUI traditional-region UX:
 - Built-in AI analysis mode:
   - paste full raw dashboard text and generate a Grok-ready analysis prompt
   - optional direct call to active AI provider profile (cloud or local)
+  - prompt now requests a simple short-term vs long-term entry/exit/invalidation guide
   - saves prompt/response artifacts under `experiments/grok/`
 - Multi-provider AI integration:
   - xAI, OpenAI, Anthropic, Ollama, OpenAI-compatible, OpenClaw

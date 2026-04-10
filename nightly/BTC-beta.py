@@ -204,6 +204,26 @@ TASKS — perform ALL of them in order:
    - Position-sizing / risk advice tied to Avg Post-Entry DD% and Risk Cone.
    - Suggested next steps (e.g., watch specific Fib levels, re-run on different timeframe, etc.).
 
+6. Entry/Exit Guide (Simple)
+   - Provide a practical simple guide for both:
+     a) Short-term trade style (swing/tactical)
+     b) Long-term trade style (position/core)
+   - For each style include:
+     - Entry trigger(s)
+     - Exit trigger(s) (profit-taking + risk-off)
+     - Invalidation/stop idea
+     - "Do nothing" condition
+
+7. Recommended API Snippet
+   - At the very end, add a section titled exactly: "Recommended API Snippet"
+   - Provide a concise Python example that maps your recommendations into executable API-style actions.
+   - Include:
+     - A duplicate-signal guard
+     - Position sizing placeholder logic
+     - Entry and exit handling branches
+     - A minimal trade-ledger append step
+   - Keep it practical and easy to adapt.
+
 OUTPUT FORMAT — strictly follow this structure with clean headings and bullet points. Use markdown tables only when helpful. Be concise yet insightful. Always end with:
 
 "Would you like a deeper dive on any specific asset or a side-by-side comparison with the previous dashboard?"

@@ -6,7 +6,9 @@ from datetime import datetime
 from pathlib import Path
 import re
 from tkinter import ttk, messagebox, filedialog
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from .engine_bridge import EngineBridge
 from .state import load_state, save_state
@@ -84,10 +86,15 @@ class CTMTGuiApp:
         self.queue_paused = False
         self.ai_last_source_text = ""
         self.ai_conversation: List[Dict[str, str]] = []
+        self.latest_live_output_text = ""
+        self.latest_live_panel_texts: Dict[str, str] = {}
         self.task_monitor_window: Optional[tk.Toplevel] = None
         self.task_monitor_text: Optional[tk.Text] = None
         self.task_monitor_job: Optional[str] = None
         self.task_tab_job: Optional[str] = None
+        self._ai_profiles_cache: Dict[str, Dict[str, Any]] = {}
+        self._binance_profiles_cache: Dict[str, Dict[str, Any]] = {}
+        self.latest_portfolio_snapshot: Dict[str, Any] = {}
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -111,6 +118,7 @@ class CTMTGuiApp:
         self.live_tab = ttk.Frame(self.nb)
         self.backtest_tab = ttk.Frame(self.nb)
         self.ai_tab = ttk.Frame(self.nb)
+        self.portfolio_tab = ttk.Frame(self.nb)
         self.research_tab = ttk.Frame(self.nb)
         self.task_tab = ttk.Frame(self.nb)
         self.settings_tab = ttk.Frame(self.nb)
@@ -118,6 +126,7 @@ class CTMTGuiApp:
         self.nb.add(self.live_tab, text="Live Dashboard")
         self.nb.add(self.backtest_tab, text="Backtest")
         self.nb.add(self.ai_tab, text="AI Analysis")
+        self.nb.add(self.portfolio_tab, text="Portfolio & Ledger")
         self.nb.add(self.research_tab, text="Auto-Research")
         self.nb.add(self.task_tab, text="Task Monitor")
         self.nb.add(self.settings_tab, text="Settings")
@@ -125,6 +134,7 @@ class CTMTGuiApp:
         self._build_live_tab()
         self._build_backtest_tab()
         self._build_ai_tab()
+        self._build_portfolio_tab()
         self._build_research_tab()
         self._build_task_tab()
         self._build_settings_tab()
@@ -296,7 +306,7 @@ class CTMTGuiApp:
         ttk.Combobox(
             top,
             textvariable=self.ai_source,
-            values=["live", "backtest_latest", "backtest_file", "paste"],
+            values=["live", "live_all_panels", "backtest_latest", "backtest_file", "paste"],
             width=16,
             state="readonly",
         ).pack(side="left", padx=4)
@@ -331,6 +341,67 @@ class CTMTGuiApp:
         ttk.Button(follow_row, text="Send Follow-up", command=self._run_ai_followup).pack(side="left")
         self.ai_output = tk.Text(body, wrap="word")
         self.ai_output.pack(fill="both", expand=True, pady=(8, 0))
+
+    def _build_portfolio_tab(self) -> None:
+        top = ttk.Frame(self.portfolio_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.portfolio_tab, padding=8)
+        body.pack(fill="both", expand=True)
+
+        self.pf_binance_profile_var = tk.StringVar(value="")
+        self.pf_cooldown_min_var = tk.StringVar(value="240")
+        self.pf_track_hold_var = tk.BooleanVar(value=True)
+        self.pf_manual_asset_var = tk.StringVar(value="")
+        self.pf_manual_action_var = tk.StringVar(value="BUY")
+        self.pf_manual_price_var = tk.StringVar(value="")
+        self.pf_manual_qty_var = tk.StringVar(value="")
+        self.pf_manual_tf_var = tk.StringVar(value="1d")
+        self.pf_manual_note_var = tk.StringVar(value="")
+
+        ttk.Label(top, text="Binance Profile").pack(side="left")
+        self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
+        self.pf_binance_profile_combo.pack(side="left", padx=4)
+        ttk.Button(top, text="Refresh Profiles", command=self._refresh_binance_profiles).pack(side="left", padx=(4, 8))
+        ttk.Button(top, text="Refresh Portfolio", command=self._refresh_portfolio).pack(side="left")
+        ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Import Signals from Live", command=self._import_signals_from_live).pack(side="left", padx=8)
+        ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
+
+        manual = ttk.LabelFrame(self.portfolio_tab, text="Manual Ledger Event", padding=8)
+        manual.pack(fill="x", padx=8, pady=(0, 8))
+        self._labeled_entry(manual, "Asset", self.pf_manual_asset_var)
+        self._labeled_combo(manual, "Action", self.pf_manual_action_var, ["BUY", "SELL", "HOLD"], state="readonly")
+        self._labeled_combo(manual, "Timeframe", self.pf_manual_tf_var, ["1d", "4h", "8h", "12h"], state="readonly")
+        self._labeled_entry(manual, "Price", self.pf_manual_price_var)
+        self._labeled_entry(manual, "Qty", self.pf_manual_qty_var)
+        self._labeled_entry(manual, "Note", self.pf_manual_note_var)
+        ttk.Button(manual, text="Add Manual Event", command=self._add_manual_ledger_event).pack(fill="x", pady=(6, 0))
+
+        cols = ttk.Frame(body)
+        cols.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(cols, text="Current Portfolio (Binance)", padding=6)
+        right = ttk.LabelFrame(cols, text="Open Positions (Ledger)", padding=6)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right.pack(side="left", fill="both", expand=True)
+
+        self.pf_portfolio_text = tk.Text(left, wrap="none")
+        self.pf_portfolio_text.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_portfolio_text)
+
+        self.pf_open_positions_text = tk.Text(right, wrap="none")
+        self.pf_open_positions_text.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_open_positions_text)
+
+        bottom = ttk.LabelFrame(body, text="Trade Ledger (History + Activity Guard)", padding=6)
+        bottom.pack(fill="both", expand=True, pady=(8, 0))
+        self.pf_ledger_text = tk.Text(bottom, wrap="none")
+        self.pf_ledger_text.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pf_ledger_text)
+
+        self._refresh_binance_profiles()
+        self._refresh_ledger_view()
 
     def _build_research_tab(self) -> None:
         top = ttk.Frame(self.research_tab, padding=8)
@@ -458,13 +529,47 @@ class CTMTGuiApp:
         ttk.Button(ai_btns, text="Remove Key", command=self._remove_ai_key_from_form).pack(side="left", padx=4)
         ttk.Button(ai_btns, text="Test", command=self._test_ai_profile_from_form).pack(side="left")
 
+        bn_frame = ttk.LabelFrame(frame, text="Binance Profiles", padding=8)
+        bn_frame.pack(fill="x", pady=8)
+        self.bn_profile_var = tk.StringVar(value="")
+        self.bn_endpoint_var = tk.StringVar(value="https://api.binance.com")
+        self.bn_key_env_var = tk.StringVar(value="BINANCE_API_KEY")
+        self.bn_secret_env_var = tk.StringVar(value="BINANCE_API_SECRET")
+        self.bn_key_var = tk.StringVar(value="")
+        self.bn_secret_var = tk.StringVar(value="")
+
+        self.bn_profile_combo = self._labeled_combo(bn_frame, "Profile", self.bn_profile_var, [], state="normal")
+        self._labeled_entry(bn_frame, "Endpoint", self.bn_endpoint_var)
+        self._labeled_entry(bn_frame, "API key env", self.bn_key_env_var)
+        self._labeled_entry(bn_frame, "API secret env", self.bn_secret_env_var)
+        key_row = ttk.Frame(bn_frame)
+        key_row.pack(fill="x", pady=2)
+        ttk.Label(key_row, text="API key", width=16).pack(side="left")
+        ttk.Entry(key_row, textvariable=self.bn_key_var, show="*", width=32).pack(side="left")
+        sec_row = ttk.Frame(bn_frame)
+        sec_row.pack(fill="x", pady=2)
+        ttk.Label(sec_row, text="API secret", width=16).pack(side="left")
+        ttk.Entry(sec_row, textvariable=self.bn_secret_var, show="*", width=32).pack(side="left")
+
+        bn_btns = ttk.Frame(bn_frame)
+        bn_btns.pack(fill="x", pady=4)
+        ttk.Button(bn_btns, text="Refresh", command=self._refresh_binance_profiles_from_settings).pack(side="left")
+        ttk.Button(bn_btns, text="Save Profile", command=self._save_binance_profile_from_form).pack(side="left", padx=4)
+        ttk.Button(bn_btns, text="Set Active", command=self._set_active_binance_profile_from_form).pack(side="left")
+        ttk.Button(bn_btns, text="Delete", command=self._delete_binance_profile_from_form).pack(side="left", padx=4)
+        ttk.Button(bn_btns, text="Set Keys", command=self._set_binance_keys_from_form).pack(side="left")
+        ttk.Button(bn_btns, text="Remove Keys", command=self._remove_binance_keys_from_form).pack(side="left", padx=4)
+        ttk.Button(bn_btns, text="Test", command=self._test_binance_profile_from_form).pack(side="left")
+
         ttk.Button(frame, text="Save Settings", command=self._persist_state).pack(fill="x")
 
         self.settings_output = tk.Text(frame, height=8, wrap="word")
         self.settings_output.pack(fill="both", expand=True, pady=(8, 0))
         self._append_settings("Settings are stored under %USERPROFILE%\\.ctmt\\gui\\gui_state.json")
         self.ai_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_ai_profile_into_form())
+        self.bn_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_binance_profile_into_form())
         self._refresh_ai_profiles()
+        self._refresh_binance_profiles_from_settings()
 
     def _labeled_entry(self, parent, label: str, var: tk.StringVar) -> None:
         row = ttk.Frame(parent)
@@ -918,6 +1023,7 @@ class CTMTGuiApp:
         def worker():
             bridge = self._bridge_for_task()
             chunks = []
+            panel_text_map: Dict[str, str] = {}
             for p in self.live_panels:
                 res = bridge.run_live_panel(asdict(p))
                 log = (res.get("log", "") or "").strip()
@@ -941,10 +1047,12 @@ class CTMTGuiApp:
                     text.append("PORTFOLIO CONTEXT")
                     for n in notes:
                         text.append(f"- {n}")
-                chunks.append("\n".join(text) + "\n")
+                panel_blob = "\n".join(text) + "\n"
+                panel_text_map[p.name] = panel_blob
+                chunks.append(panel_blob)
 
             out = "\n".join(chunks)
-            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id))
+            self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id, panel_text_map))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -992,10 +1100,19 @@ class CTMTGuiApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_live_output(self, text: str, task_name: str = "Live Dashboard", task_id: Optional[int] = None) -> None:
+    def _finish_live_output(
+        self,
+        text: str,
+        task_name: str = "Live Dashboard",
+        task_id: Optional[int] = None,
+        panel_text_map: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.live_output.delete("1.0", tk.END)
         self.live_output.insert("1.0", text)
         self._apply_color_tags(self.live_output)
+        self.latest_live_output_text = text
+        if panel_text_map is not None:
+            self.latest_live_panel_texts = dict(panel_text_map)
         self._append_task_terminal(f"DONE {task_name}")
         self._finish_task(task_id, task_name=task_name)
         self._persist_state()
@@ -1232,6 +1349,20 @@ class CTMTGuiApp:
     def _resolve_ai_source_text(self) -> str:
         source = self.ai_source.get().strip().lower()
         if source == "live":
+            live_text = (self.latest_live_output_text or "").strip()
+            if live_text:
+                return live_text
+            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        if source == "live_all_panels":
+            if self.latest_live_panel_texts:
+                blocks = []
+                for name in sorted(self.latest_live_panel_texts.keys()):
+                    blocks.append(self.latest_live_panel_texts[name])
+                return "\n".join(blocks).strip()
+            live_text = (self.latest_live_output_text or "").strip()
+            if live_text:
+                return live_text
             path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
             return path.read_text(encoding="utf-8") if path.exists() else ""
         if source == "backtest_latest":
@@ -1267,6 +1398,231 @@ class CTMTGuiApp:
         prompt = self._build_ai_prompt(source_text, dt)
         self.ai_output.delete("1.0", tk.END)
         self.ai_output.insert("1.0", "PROMPT PREVIEW\n" + ("=" * 60) + "\n" + prompt)
+
+    def _refresh_binance_profiles(self) -> None:
+        res = self.bridge.list_binance_profiles()
+        if not res.get("ok"):
+            self._append_settings(f"Binance profile refresh failed: {res.get('error', 'unknown')}")
+            return
+        profiles = res.get("profiles", []) or []
+        self._binance_profiles_cache = {p.get("name", ""): p for p in profiles if isinstance(p, dict)}
+        names = list(self._binance_profiles_cache.keys())
+        if hasattr(self, "pf_binance_profile_combo"):
+            self.pf_binance_profile_combo["values"] = names
+        active = str(res.get("active_profile", "") or "")
+        if active and active in self._binance_profiles_cache:
+            self.pf_binance_profile_var.set(active)
+        elif names:
+            self.pf_binance_profile_var.set(names[0])
+        else:
+            self.pf_binance_profile_var.set("")
+        self._append_settings(f"Binance profiles loaded: {len(names)} (active: {self.pf_binance_profile_var.get() or 'none'})")
+
+    def _refresh_portfolio(self) -> None:
+        task_name = "Binance Portfolio Refresh"
+        if self._queue_if_busy(task_name, self._start_refresh_portfolio):
+            return
+        self._start_refresh_portfolio()
+
+    def _start_refresh_portfolio(self) -> None:
+        task_name = "Binance Portfolio Refresh"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START Binance Portfolio Refresh")
+        self.pf_portfolio_text.delete("1.0", tk.END)
+        profile_name = self.pf_binance_profile_var.get().strip() or None
+
+        def worker():
+            bridge = self._bridge_for_task()
+            res = bridge.fetch_binance_portfolio(profile_name=profile_name)
+            self.root.after(0, lambda: self._finish_refresh_portfolio(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_refresh_portfolio(self, res: Dict[str, Any], task_id: Optional[int]) -> None:
+        if not res.get("ok"):
+            self.pf_portfolio_text.insert("1.0", f"ERROR: {res.get('error', 'unknown')}\n")
+            self._append_task_terminal(f"DONE Binance Portfolio Refresh (error: {res.get('error', 'unknown')})")
+            self._finish_task(task_id, task_name="Binance Portfolio Refresh")
+            return
+        self.latest_portfolio_snapshot = res
+        profile = str(res.get("profile", "") or "")
+        total = float(res.get("total_est_usd", 0.0) or 0.0)
+        rows = res.get("balances", []) or []
+        lines = [
+            f"Profile: {profile}",
+            f"Estimated Total (USD): ${total:,.2f}",
+            "",
+        ]
+        if rows:
+            lines.append(pd.DataFrame(rows).to_string(index=False))
+        else:
+            lines.append("No non-zero balances returned.")
+        self.pf_portfolio_text.insert("1.0", "\n".join(lines))
+        self._apply_color_tags(self.pf_portfolio_text)
+        self._append_task_terminal("DONE Binance Portfolio Refresh")
+        self._finish_task(task_id, task_name="Binance Portfolio Refresh")
+
+    def _extract_signals_from_live_text(self, text: str) -> List[Dict[str, str]]:
+        signals: List[Dict[str, str]] = []
+        if not text.strip():
+            return signals
+        current_panel = "live"
+        current_market = "crypto"
+        current_tf = "1d"
+        header_re = re.compile(r"^===\s*(.+?)\s*\((Crypto|Traditional)\s+([^)]+)\)\s*===", re.IGNORECASE)
+        row_re = re.compile(r"^\s*\d+\s+([A-Z0-9\-\.\^]+)\s+(?:🟢|🟠|🔴|\?\?)?\s*(BUY|HOLD|SELL)\b", re.IGNORECASE)
+        for raw in text.splitlines():
+            line = raw.strip()
+            h = header_re.match(line)
+            if h:
+                current_panel = h.group(1).strip()
+                current_market = h.group(2).strip().lower()
+                current_tf = h.group(3).strip().lower()
+                continue
+            m = row_re.match(raw)
+            if m:
+                asset = m.group(1).strip().upper()
+                action = m.group(2).strip().upper()
+                signals.append(
+                    {
+                        "panel": current_panel,
+                        "market": current_market,
+                        "timeframe": current_tf,
+                        "asset": asset,
+                        "action": action,
+                    }
+                )
+        return signals
+
+    def _import_signals_from_live(self) -> None:
+        text = (self.latest_live_output_text or "").strip()
+        if not text:
+            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            if path.exists():
+                text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            messagebox.showinfo("Import Signals", "No live dashboard output is available yet.")
+            return
+        signals = self._extract_signals_from_live_text(text)
+        if not signals:
+            messagebox.showinfo("Import Signals", "No BUY/HOLD/SELL signal rows were found.")
+            return
+        track_hold = bool(self.pf_track_hold_var.get())
+        try:
+            cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
+        except Exception:
+            cooldown = 240
+        accepted = 0
+        blocked = 0
+        skipped = 0
+        for s in signals:
+            action = str(s.get("action", "")).upper()
+            if (not track_hold) and action == "HOLD":
+                skipped += 1
+                continue
+            out = self.bridge.record_signal_event(
+                {
+                    "market": s.get("market", "crypto"),
+                    "timeframe": s.get("timeframe", "1d"),
+                    "panel": s.get("panel", "live"),
+                    "asset": s.get("asset", ""),
+                    "action": action,
+                    "note": "Imported from latest live dashboard",
+                },
+                cooldown_minutes=cooldown,
+                allow_duplicate=False,
+            )
+            if out.get("ok"):
+                accepted += 1
+            elif out.get("blocked"):
+                blocked += 1
+        self._refresh_ledger_view()
+        self._append_task_terminal(
+            f"Imported signals -> accepted={accepted}, blocked={blocked}, skipped={skipped}, cooldown={cooldown}m"
+        )
+        messagebox.showinfo(
+            "Signal Import Complete",
+            f"Accepted: {accepted}\nBlocked (duplicate-guard): {blocked}\nSkipped: {skipped}",
+        )
+
+    def _add_manual_ledger_event(self) -> None:
+        asset = self.pf_manual_asset_var.get().strip().upper()
+        action = self.pf_manual_action_var.get().strip().upper()
+        tf = self.pf_manual_tf_var.get().strip().lower() or "1d"
+        note = self.pf_manual_note_var.get().strip()
+        try:
+            price = float((self.pf_manual_price_var.get() or "0").strip())
+        except Exception:
+            price = 0.0
+        try:
+            qty = float((self.pf_manual_qty_var.get() or "0").strip())
+        except Exception:
+            qty = 0.0
+        try:
+            cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
+        except Exception:
+            cooldown = 240
+        if not asset:
+            messagebox.showinfo("Manual Event", "Asset is required.")
+            return
+        out = self.bridge.record_signal_event(
+            {
+                "market": "crypto",
+                "timeframe": tf,
+                "panel": "manual",
+                "asset": asset,
+                "action": action,
+                "price": price,
+                "qty": qty,
+                "note": note,
+            },
+            cooldown_minutes=cooldown,
+            allow_duplicate=False,
+        )
+        if out.get("ok"):
+            self._append_task_terminal(f"Manual ledger event added: {action} {asset} ({tf})")
+            self.pf_manual_note_var.set("")
+            self._refresh_ledger_view()
+            return
+        if out.get("blocked"):
+            messagebox.showinfo("Manual Event Blocked", str(out.get("reason", "Duplicate signal blocked.")))
+            return
+        messagebox.showerror("Manual Event Failed", str(out.get("error", "Unknown error")))
+
+    def _refresh_ledger_view(self) -> None:
+        out = self.bridge.get_trade_ledger()
+        if not out.get("ok"):
+            if hasattr(self, "pf_ledger_text"):
+                self.pf_ledger_text.delete("1.0", tk.END)
+                self.pf_ledger_text.insert("1.0", f"ERROR: {out.get('error', 'unknown')}")
+            return
+        ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
+        entries = ledger.get("entries", []) if isinstance(ledger, dict) else []
+        open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
+        guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
+
+        if hasattr(self, "pf_open_positions_text"):
+            self.pf_open_positions_text.delete("1.0", tk.END)
+            if isinstance(open_positions, dict) and open_positions:
+                op_df = pd.DataFrame(list(open_positions.values()))
+                self.pf_open_positions_text.insert("1.0", op_df.to_string(index=False))
+            else:
+                self.pf_open_positions_text.insert("1.0", "No open positions tracked.")
+            self._apply_color_tags(self.pf_open_positions_text)
+
+        if hasattr(self, "pf_ledger_text"):
+            self.pf_ledger_text.delete("1.0", tk.END)
+            lines = []
+            lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
+            lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
+            lines.append("")
+            if isinstance(entries, list) and entries:
+                df = pd.DataFrame(entries[-200:])
+                lines.append(df.to_string(index=False))
+            else:
+                lines.append("No ledger entries yet.")
+            self.pf_ledger_text.insert("1.0", "\n".join(lines))
+            self._apply_color_tags(self.pf_ledger_text)
 
     def _run_standard_research(self) -> None:
         self._run_research_job(standard=True)
@@ -1519,6 +1875,122 @@ class CTMTGuiApp:
             status = res.get("status", "")
             self._append_settings(f"AI test failed ({name}) status={status}: {err}")
 
+    def _refresh_binance_profiles_from_settings(self) -> None:
+        self._refresh_binance_profiles()
+        names = list(self._binance_profiles_cache.keys())
+        self.bn_profile_combo["values"] = names
+        active = self.pf_binance_profile_var.get().strip()
+        if active and active in self._binance_profiles_cache:
+            self.bn_profile_var.set(active)
+        elif names:
+            self.bn_profile_var.set(names[0])
+        else:
+            self.bn_profile_var.set("")
+        self._load_binance_profile_into_form()
+
+    def _load_binance_profile_into_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        prof = self._binance_profiles_cache.get(name, {})
+        if not prof:
+            return
+        self.bn_endpoint_var.set(str(prof.get("endpoint", "https://api.binance.com") or "https://api.binance.com"))
+        self.bn_key_env_var.set(str(prof.get("api_key_env", "BINANCE_API_KEY") or "BINANCE_API_KEY"))
+        self.bn_secret_env_var.set(str(prof.get("api_secret_env", "BINANCE_API_SECRET") or "BINANCE_API_SECRET"))
+        key_state = "set" if bool(prof.get("api_key_set", False)) else "missing"
+        sec_state = "set" if bool(prof.get("api_secret_set", False)) else "missing"
+        self._append_settings(
+            f"Binance profile `{name}` loaded. key={key_state} ({prof.get('api_key_source','')}) secret={sec_state} ({prof.get('api_secret_source','')})"
+        )
+
+    def _save_binance_profile_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        if not name:
+            messagebox.showinfo("Binance Profiles", "Enter/select a profile name first.")
+            return
+        res = self.bridge.upsert_binance_profile(
+            name=name,
+            endpoint=self.bn_endpoint_var.get().strip(),
+            api_key_env=self.bn_key_env_var.get().strip(),
+            api_secret_env=self.bn_secret_env_var.get().strip(),
+            activate=False,
+        )
+        if not res.get("ok"):
+            self._append_settings(f"Save Binance profile failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Saved Binance profile: {name}")
+        self._refresh_binance_profiles_from_settings()
+        self.bn_profile_var.set(name)
+        self.pf_binance_profile_var.set(name)
+        self._load_binance_profile_into_form()
+
+    def _set_active_binance_profile_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        if not name:
+            return
+        res = self.bridge.set_active_binance_profile(name)
+        if not res.get("ok"):
+            self._append_settings(f"Set active Binance profile failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Active Binance profile set: {name}")
+        self._refresh_binance_profiles_from_settings()
+        self.pf_binance_profile_var.set(name)
+
+    def _delete_binance_profile_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        if not name:
+            return
+        ok = messagebox.askyesno("Delete Binance Profile", f"Delete Binance profile '{name}'?")
+        if not ok:
+            return
+        res = self.bridge.delete_binance_profile(name)
+        if not res.get("ok"):
+            self._append_settings(f"Delete Binance profile failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Deleted Binance profile: {name}")
+        self._refresh_binance_profiles_from_settings()
+
+    def _set_binance_keys_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        api_key = self.bn_key_var.get().strip()
+        api_secret = self.bn_secret_var.get().strip()
+        if not name or not api_key or not api_secret:
+            messagebox.showinfo("Binance Keys", "Select a profile and provide both API key and API secret.")
+            return
+        res = self.bridge.set_binance_profile_keys(name, api_key, api_secret)
+        if not res.get("ok"):
+            self._append_settings(f"Set Binance keys failed: {res.get('error', 'unknown')}")
+            return
+        self.bn_key_var.set("")
+        self.bn_secret_var.set("")
+        self._append_settings(f"Stored Binance keys for profile: {name}")
+        self._refresh_binance_profiles_from_settings()
+
+    def _remove_binance_keys_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        if not name:
+            return
+        res = self.bridge.remove_binance_profile_keys(name)
+        if not res.get("ok"):
+            self._append_settings(f"Remove Binance keys failed: {res.get('error', 'unknown')}")
+            return
+        self._append_settings(f"Removed stored Binance keys for profile: {name}")
+        self._refresh_binance_profiles_from_settings()
+
+    def _test_binance_profile_from_form(self) -> None:
+        name = self.bn_profile_var.get().strip()
+        if not name:
+            return
+        self._append_settings(f"Testing Binance profile: {name} ...")
+        res = self.bridge.test_binance_profile(name)
+        if res.get("ok"):
+            self._append_settings(
+                f"Binance test OK ({name}) canTrade={res.get('can_trade')} buyerCommission={res.get('buyer_commission_bps')}"
+            )
+            return
+        self._append_settings(
+            f"Binance test failed ({name}) status={res.get('status','')}: {res.get('error','unknown')}"
+        )
+
     def _show_ai_settings_hint(self) -> None:
         messagebox.showinfo(
             "AI Provider Settings",
@@ -1528,6 +2000,8 @@ class CTMTGuiApp:
         )
 
     def _append_settings(self, text: str) -> None:
+        if not hasattr(self, "settings_output") or self.settings_output is None:
+            return
         self.settings_output.insert("end", text + "\n")
         self.settings_output.see("end")
 
