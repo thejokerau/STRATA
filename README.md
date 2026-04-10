@@ -138,6 +138,12 @@ GUI AI configuration:
   - supports intents such as:
     - "find best buys top 10 crypto on 4h"
     - "buy btc 10% capital stop loss 5%"
+    - "buy 10 usdt of btc with stop loss 5%"
+    - "buy btc with 30% of my usdt"
+    - "with my current usdt, look for signals and allocate buy strategy"
+    - "do a comprehensive search for top 5 coins ... expand search until found"
+    - "open detailed view" (jumps to Portfolio & Ledger tab)
+  - agent now emits a deterministic plan card before staging/execution so parsed intent is transparent.
 
 Quote lock + local-currency ledger:
 

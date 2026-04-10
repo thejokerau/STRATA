@@ -1809,11 +1809,58 @@ class StrataGuiApp:
                 self._submit_selected_pending_orders()
         if out.get("refresh_ledger", False):
             self._refresh_ledger_view()
+        view = str(out.get("open_view", "") or "").strip().lower()
+        if view in ("portfolio", "ledger", "detailed"):
+            try:
+                self.nb.select(self.portfolio_tab)
+            except Exception:
+                pass
         self._append_task_terminal("DONE Agent Command")
         self._finish_task(task_id, task_name="Agent Command")
 
-    def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
-        c = str(cmd or "").strip().lower()
+    def _resolve_agent_quote_from_text(self, cmd_lower: str) -> str:
+        m = re.search(r"\b(usdt|usdc|fdusd|busd|usd|btc|eth|bnb)\b", cmd_lower)
+        if m:
+            q = m.group(1).upper()
+            if q == "USD" and self._is_primary_quote_locked():
+                return self._primary_quote_asset()
+            return q
+        return self._effective_crypto_quote("USDT")
+
+    def _build_agent_plan_card(self, intent: Dict[str, Any]) -> str:
+        lines = ["Agent Plan"]
+        lines.append(f"- Intent: {intent.get('intent', 'unknown')}")
+        tf = str(intent.get("timeframe", "") or "").strip()
+        if tf:
+            lines.append(f"- Timeframe: {tf}")
+        q = str(intent.get("quote_asset", "") or "").strip()
+        if q:
+            lines.append(f"- Quote Asset: {q}")
+        top_n = intent.get("top_n")
+        if isinstance(top_n, int) and top_n > 0:
+            lines.append(f"- Universe Size: top {top_n}")
+        stop_pct = intent.get("stop_pct")
+        if isinstance(stop_pct, (int, float)) and stop_pct > 0:
+            lines.append(f"- Stop Loss: {float(stop_pct):.2f}%")
+        if intent.get("amount_mode") == "quote_amount":
+            lines.append(f"- Spend: {float(intent.get('amount_value', 0.0) or 0.0):.4f} {q or 'QUOTE'}")
+        if intent.get("amount_mode") == "quote_percent":
+            lines.append(f"- Spend: {float(intent.get('amount_value', 0.0) or 0.0):.2f}% of free {q or 'QUOTE'}")
+        if bool(intent.get("expand_until_found", False)):
+            lines.append("- Search Strategy: expand top-N tiers until BUY signal(s) found")
+        lines.append(
+            "- Execution: "
+            + ("auto-submit allowed" if bool(intent.get("execute_requested", False)) else "stage/plan first")
+        )
+        return "\n".join(lines)
+
+    def _parse_agent_intent(self, cmd: str, mode: str) -> Dict[str, Any]:
+        c_raw = str(cmd or "").strip()
+        c = c_raw.lower()
+        tf = "4h"
+        m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
+        if m_tf:
+            tf = m_tf.group(1)
         top_n = 10
         m_top = re.search(r"top\s+(\d+)", c)
         if m_top:
@@ -1821,102 +1868,209 @@ class StrataGuiApp:
                 top_n = max(1, min(100, int(m_top.group(1))))
             except Exception:
                 top_n = 10
-        tf = "4h"
-        m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
-        if m_tf:
-            tf = m_tf.group(1)
         stop_pct = 5.0
-        m_stop = re.search(r"stop(?:\s*loss)?[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)\s*%?", c)
-        if m_stop:
-            try:
-                stop_pct = max(0.1, min(25.0, float(m_stop.group(1))))
-            except Exception:
-                stop_pct = 5.0
-
-        if ("best buy" in c) or ("best buys" in c):
-            quote = self._effective_crypto_quote("USDT")
-            live_cfg = {
-                "name": "Agent Scan",
-                "market": "crypto",
-                "timeframe": tf,
-                "quote_currency": quote,
-                "top_n": top_n,
-                "display_currency": self.display_currency_var.get().strip() or "USD",
-            }
-            live = bridge.run_live_panel(live_cfg)
-            if not live.get("ok"):
-                return {"ok": False, "error": live.get("error", "Live scan failed")}
-            rows = live.get("table_rows", []) if isinstance(live.get("table_rows"), list) else []
-            buys: List[Dict[str, Any]] = []
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                act = str(r.get("Action", "")).upper()
-                if "BUY" not in act:
-                    continue
-                asset = str(r.get("Asset", "")).strip().upper()
-                if not asset:
-                    continue
+        if re.search(r"\b(no stop|without stop)\b", c):
+            stop_pct = 0.0
+        else:
+            m_stop = re.search(r"stop(?:\s*loss)?[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)\s*%?", c)
+            if m_stop:
                 try:
-                    px = float(r.get("Price", 0.0) or 0.0)
+                    stop_pct = max(0.0, min(25.0, float(m_stop.group(1))))
                 except Exception:
-                    px = 0.0
-                sl = px * (1.0 - (stop_pct / 100.0)) if px > 0 else 0.0
-                self._pending_rec_seq += 1
-                buys.append(
-                    {
-                        "id": self._pending_rec_seq,
-                        "symbol": f"{asset}{quote}",
-                        "asset": asset,
-                        "side": "BUY",
-                        "order_type": "MARKET",
-                        "quantity": 0.0,
-                        "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
-                        "timeframe": tf,
-                        "confidence": "",
-                        "status": "PENDING",
-                        "reason": f"Agent best-buy scan ({tf}, top {top_n})",
-                    }
-                )
-            if not buys:
-                return {"ok": True, "text": f"No BUY signals found for top {top_n} on {tf}.", "staged_recs": []}
-            lines = [f"Agent scan found {len(buys)} BUY candidate(s) on {tf} (top {top_n}, quote {quote})."]
-            for b in buys[:10]:
-                lines.append(f"- {b['symbol']} stop~{b.get('stop_loss_price', 0)}")
-            exec_words = ("execute", "submit", "place order", "buy now", "transaction")
-            do_execute = any([w in c for w in exec_words]) and mode in ("semi_auto", "auto_execute")
-            if do_execute:
-                if mode == "auto_execute":
-                    lines.append("Will auto-size and auto-execute staged recommendations.")
-                else:
-                    lines.append("Will auto-size staged recommendations (semi_auto).")
-                return {
-                    "ok": True,
-                    "text": "\n".join(lines),
-                    "staged_recs": buys,
-                    "auto_size": True,
-                    "auto_execute": (mode == "auto_execute"),
-                    "refresh_ledger": True,
-                }
-            return {"ok": True, "text": "\n".join(lines), "staged_recs": buys}
+                    stop_pct = 5.0
+        quote = self._resolve_agent_quote_from_text(c)
+        exec_words = ("execute", "submit", "place order", "buy now", "transaction", "go live")
+        execute_requested = any([w in c for w in exec_words])
+        scan_words = ("best buy", "best buys", "look for signals", "search for", "allocate", "invest in")
+        expand_words = ("expand search", "until found", "comprehensive")
+
+        if ("open detailed view" in c) or ("open detail view" in c) or ("open portfolio" in c):
+            return {"intent": "open_view", "open_view": "portfolio"}
+
+        if any([w in c for w in scan_words]):
+            return {
+                "intent": "scan_allocate",
+                "timeframe": tf,
+                "top_n": top_n,
+                "quote_asset": quote,
+                "stop_pct": stop_pct,
+                "expand_until_found": any([w in c for w in expand_words]),
+                "auto_size": ("allocate" in c) or ("current " + quote.lower() in c) or ("with my current" in c),
+                "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+            }
 
         if "buy" in c:
+            m_amt = re.search(
+                r"\bbuy\s+([0-9]+(?:\.[0-9]+)?)\s*(usd|usdt|usdc|fdusd|busd)?\s*(?:of\s+)?([a-z0-9]{2,12})\b",
+                c,
+            )
             m_sym = re.search(r"\bbuy\s+([a-z0-9]{2,12})\b", c)
-            if not m_sym:
-                return {"ok": False, "error": "Could not parse buy symbol. Try: buy btc with 5% stop loss"}
-            base = m_sym.group(1).upper()
-            quote = self._effective_crypto_quote("USDT")
-            symbol = f"{base}{quote}"
+            base = ""
+            amount_mode = "quote_percent"
+            amount_value = 10.0
+            if m_amt:
+                base = str(m_amt.group(3) or "").upper()
+                amount_mode = "quote_amount"
+                try:
+                    amount_value = max(0.01, float(m_amt.group(1)))
+                except Exception:
+                    amount_value = 10.0
+                if m_amt.group(2):
+                    qtxt = str(m_amt.group(2)).upper()
+                    if qtxt == "USD" and self._is_primary_quote_locked():
+                        qtxt = self._primary_quote_asset()
+                    quote = qtxt
+            elif m_sym:
+                base = str(m_sym.group(1) or "").upper()
+            banned = {"SIGNAL", "SIGNALS", "STRATEGY", "ORDER", "ORDERS", "VIEW", "DETAIL", "DETAILED"}
+            if (not base) or (base in banned):
+                return {"intent": "unknown", "error": "Could not parse buy symbol."}
+            m_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:of\s+my\s+)?(usdt|usd|usdc|fdusd|busd|balance|capital)?", c)
+            if amount_mode != "quote_amount" and m_pct:
+                amount_mode = "quote_percent"
+                try:
+                    amount_value = max(0.1, min(100.0, float(m_pct.group(1))))
+                except Exception:
+                    amount_value = 10.0
+                pool = str(m_pct.group(2) or "").strip().upper()
+                if pool in {"USDT", "USD", "USDC", "FDUSD", "BUSD"}:
+                    quote = self._primary_quote_asset() if (pool == "USD" and self._is_primary_quote_locked()) else pool
+            return {
+                "intent": "buy",
+                "asset": base,
+                "symbol": f"{base}{quote}",
+                "timeframe": tf,
+                "quote_asset": quote,
+                "stop_pct": stop_pct,
+                "amount_mode": amount_mode,
+                "amount_value": amount_value,
+                "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+            }
+
+        return {"intent": "unknown"}
+
+    def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
+        parsed = self._parse_agent_intent(cmd, mode)
+        intent = str(parsed.get("intent", "unknown")).strip().lower()
+        if intent == "open_view":
+            return {"ok": True, "text": "Opening Portfolio & Ledger detailed view.", "open_view": parsed.get("open_view", "portfolio")}
+        if intent == "unknown":
+            err = str(parsed.get("error", "")).strip()
+            if err:
+                return {"ok": False, "error": err + " Try: 'buy 10 usdt of btc with stop loss 5%'."}
+            return {
+                "ok": True,
+                "text": (
+                    "Command understood, but no executable intent matched yet.\n"
+                    "Try:\n"
+                    "- find best buys top 10 crypto 4h and allocate\n"
+                    "- buy 10 usdt of btc with stop loss 5%\n"
+                    "- buy btc with 30% of my usdt\n"
+                    "- open detailed view"
+                ),
+            }
+
+        plan_card = self._build_agent_plan_card(parsed)
+        tf = str(parsed.get("timeframe", "4h")).strip().lower() or "4h"
+        quote = str(parsed.get("quote_asset", self._effective_crypto_quote("USDT"))).strip().upper()
+        stop_pct = float(parsed.get("stop_pct", 5.0) or 0.0)
+
+        if intent == "scan_allocate":
+            top_n = int(parsed.get("top_n", 10) or 10)
+            tiers = [top_n]
+            if bool(parsed.get("expand_until_found", False)):
+                for t in [10, 20, 50, 100]:
+                    if t not in tiers:
+                        tiers.append(t)
+            buys: List[Dict[str, Any]] = []
+            matched_top = top_n
+            for n in tiers:
+                live_cfg = {
+                    "name": "Agent Scan",
+                    "market": "crypto",
+                    "timeframe": tf,
+                    "quote_currency": quote,
+                    "top_n": n,
+                    "display_currency": self.display_currency_var.get().strip() or "USD",
+                }
+                live = bridge.run_live_panel(live_cfg)
+                if not live.get("ok"):
+                    continue
+                rows = live.get("table_rows", []) if isinstance(live.get("table_rows"), list) else []
+                staged: List[Dict[str, Any]] = []
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    act = str(r.get("Action", "")).upper()
+                    if "BUY" not in act:
+                        continue
+                    asset = str(r.get("Asset", "")).strip().upper()
+                    if not asset:
+                        continue
+                    try:
+                        px = float(r.get("Price", 0.0) or 0.0)
+                    except Exception:
+                        px = 0.0
+                    sl = px * (1.0 - (stop_pct / 100.0)) if (px > 0 and stop_pct > 0) else 0.0
+                    score_raw = str(r.get("Raw Score", "") or r.get("Score", "")).strip()
+                    conf = ""
+                    m_sc = re.search(r"(-?\d+)\s*/\s*5", score_raw)
+                    if m_sc:
+                        try:
+                            sc = int(m_sc.group(1))
+                            conf = str(max(1.0, min(99.0, 50.0 + (sc * 10.0))))
+                        except Exception:
+                            conf = ""
+                    self._pending_rec_seq += 1
+                    staged.append(
+                        {
+                            "id": self._pending_rec_seq,
+                            "symbol": f"{asset}{quote}",
+                            "asset": asset,
+                            "side": "BUY",
+                            "order_type": "MARKET",
+                            "quantity": 0.0,
+                            "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
+                            "timeframe": tf,
+                            "confidence": conf,
+                            "status": "PENDING",
+                            "reason": f"Agent scan allocation ({tf}, top {n})",
+                        }
+                    )
+                if staged:
+                    buys = staged
+                    matched_top = n
+                    break
+            if not buys:
+                tiers_txt = ", ".join([str(t) for t in tiers])
+                return {"ok": True, "text": plan_card + f"\n\nNo BUY signals found (searched top tiers: {tiers_txt}) on {tf}.", "staged_recs": []}
+            lines = [plan_card, "", f"Signal scan found {len(buys)} BUY candidate(s) on {tf} (top {matched_top}, quote {quote})."]
+            for b in buys[:10]:
+                lines.append(f"- {b['symbol']} stop~{b.get('stop_loss_price', 0)}")
+            auto_size = bool(parsed.get("auto_size", False))
+            auto_exec = bool(parsed.get("execute_requested", False)) and mode == "auto_execute"
+            if auto_size:
+                lines.append("Allocation step: will auto-size recommendations from available balances.")
+            if auto_exec:
+                lines.append("Execution step: will submit immediately (auto_execute mode).")
+            return {
+                "ok": True,
+                "text": "\n".join(lines),
+                "staged_recs": buys,
+                "auto_size": auto_size,
+                "auto_execute": auto_exec,
+                "refresh_ledger": auto_exec,
+            }
+
+        if intent == "buy":
+            base = str(parsed.get("asset", "")).strip().upper()
+            symbol = str(parsed.get("symbol", f"{base}{quote}")).strip().upper()
+            amount_mode = str(parsed.get("amount_mode", "quote_percent")).strip().lower()
+            amount_value = float(parsed.get("amount_value", 0.0) or 0.0)
+            execute_requested = bool(parsed.get("execute_requested", False))
             profile = self.pf_binance_profile_var.get().strip() or None
             if not profile:
                 return {"ok": False, "error": "Select a Binance profile first."}
-            pct = 10.0
-            m_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:capital|balance|allocation|size)?", c)
-            if m_pct:
-                try:
-                    pct = max(0.1, min(100.0, float(m_pct.group(1))))
-                except Exception:
-                    pct = 10.0
             fres = bridge.fetch_binance_portfolio(profile_name=profile)
             if not fres.get("ok"):
                 return {"ok": False, "error": str(fres.get("error", "Failed to fetch portfolio."))}
@@ -1936,29 +2090,43 @@ class StrataGuiApp:
             px = float(p.get("price", 0.0) or 0.0)
             if px <= 0:
                 return {"ok": False, "error": "Invalid market price."}
-            spend = free_quote * (pct / 100.0)
+            if amount_mode == "quote_amount":
+                spend = max(0.01, amount_value)
+            else:
+                pct = max(0.1, min(100.0, amount_value if amount_value > 0 else 10.0))
+                spend = free_quote * (pct / 100.0)
+            if spend > free_quote:
+                return {"ok": False, "error": f"Requested spend {spend:.4f} {quote} exceeds free balance {free_quote:.4f} {quote}."}
             qty = spend / px
             v = bridge.validate_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=qty, profile_name=profile)
             if not v.get("ok"):
                 return {"ok": False, "error": str(v.get("error", "Order validation failed."))}
             nq = float(v.get("normalized_quantity", 0.0) or 0.0)
-            sl = px * (1.0 - (stop_pct / 100.0))
-            if mode == "plan":
-                self._pending_rec_seq += 1
-                rec = {
-                    "id": self._pending_rec_seq,
-                    "symbol": symbol,
-                    "asset": base,
-                    "side": "BUY",
-                    "order_type": "MARKET",
-                    "quantity": nq,
-                    "stop_loss_price": round(sl, 8),
-                    "timeframe": tf,
-                    "confidence": "",
-                    "status": "PENDING",
-                    "reason": f"Agent planned BUY using {pct:.1f}% {quote} balance; stop {stop_pct:.2f}%",
+            sl = px * (1.0 - (stop_pct / 100.0)) if stop_pct > 0 else 0.0
+            self._pending_rec_seq += 1
+            rec = {
+                "id": self._pending_rec_seq,
+                "symbol": symbol,
+                "asset": base,
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": nq,
+                "stop_loss_price": round(sl, 8) if sl > 0 else 0.0,
+                "timeframe": tf,
+                "confidence": "",
+                "status": "PENDING",
+                "reason": (
+                    f"Agent BUY plan using {spend:.4f} {quote}"
+                    + (f" ({amount_value:.2f}% balance)" if amount_mode == "quote_percent" else "")
+                    + (f"; stop {stop_pct:.2f}%" if stop_pct > 0 else "; no stop")
+                ),
+            }
+            if mode == "plan" or not execute_requested:
+                return {
+                    "ok": True,
+                    "text": plan_card + f"\n\nPlanned BUY {symbol}: qty={nq:.8f}, est spend={spend:.4f} {quote}, stop~{sl:.8f}",
+                    "staged_recs": [rec],
                 }
-                return {"ok": True, "text": f"Planned BUY {symbol}: qty={nq:.8f}, stop~{sl:.8f}", "staged_recs": [rec]}
 
             if bool(self.agent_guard_enabled_var.get()):
                 try:
@@ -1990,16 +2158,22 @@ class StrataGuiApp:
             out = bridge.submit_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=nq, profile_name=profile)
             if not out.get("ok"):
                 return {"ok": False, "error": str(out.get("error", "Submit failed."))}
-            stop_limit = sl * 0.995
-            stop_out = bridge.submit_binance_order(
-                symbol=symbol,
-                side="SELL",
-                order_type="STOP_LOSS_LIMIT",
-                quantity=float(out.get("normalized_quantity", nq) or nq),
-                profile_name=profile,
-                price=stop_limit,
-                stop_price=sl,
-            )
+            stop_msg = "No protective stop requested."
+            if sl > 0:
+                stop_limit = sl * 0.995
+                stop_out = bridge.submit_binance_order(
+                    symbol=symbol,
+                    side="SELL",
+                    order_type="STOP_LOSS_LIMIT",
+                    quantity=float(out.get("normalized_quantity", nq) or nq),
+                    profile_name=profile,
+                    price=stop_limit,
+                    stop_price=sl,
+                )
+                if stop_out.get("ok"):
+                    stop_msg = f"Protective stop set at {sl:.8f}."
+                else:
+                    stop_msg = f"Stop placement failed: {stop_out.get('error', 'unknown')}."
             bridge.record_signal_event(
                 {
                     "market": "crypto",
@@ -2016,14 +2190,14 @@ class StrataGuiApp:
                 },
                 allow_duplicate=True,
             )
-            msg = f"Executed BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}. "
-            if stop_out.get("ok"):
-                msg += f"Protective stop set at {sl:.8f}."
-            else:
-                msg += f"Stop placement failed: {stop_out.get('error', 'unknown')}."
+            msg = (
+                plan_card
+                + f"\n\nExecuted BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}, "
+                + f"est spend={spend:.4f} {quote}. {stop_msg}"
+            )
             return {"ok": True, "text": msg, "refresh_ledger": True}
 
-        return {"ok": True, "text": "Command understood, but no executable intent matched yet. Try: 'find best buys top 10 crypto 4h' or 'buy btc 10% capital stop loss 5%'."}
+        return {"ok": False, "error": "Unhandled agent intent."}
 
     def _start_run_ai_analysis(self) -> None:
         self._start_run_ai_analysis_internal(source_override=None, force_no_confirm=False)
