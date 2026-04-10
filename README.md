@@ -106,6 +106,11 @@ GUI dashboard readability:
 
 - Live/Backtest text outputs now apply color highlighting for key sections and action states (`BUY/HOLD/SELL`) to improve scanability.
 - Major GUI tabs now support both vertical and horizontal scrolling at tab level, improving access to full config/action areas on smaller screens.
+- Console usability/debugging:
+  - right-click context menu on text consoles (`Copy`, `Select All`, `Clear`)
+  - `Ctrl+A` / `Ctrl+C` support in text areas, and copy-selected-row support in tables
+  - dedicated copy buttons for Live/Backtest/AI/Task/Settings consoles
+  - optional `Verbose terminal logging (debug mode)` in Settings for deeper task/runtime traces
 
 GUI AI configuration:
 

@@ -253,6 +253,10 @@ class StrataGuiApp:
         live_frame, self.live_output = self._create_scrolled_text(right, wrap="none")
         live_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.live_output)
+        live_copy_row = ttk.Frame(right)
+        live_copy_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(live_copy_row, text="Copy Output", command=lambda: self._copy_text_widget(self.live_output, "Live output")).pack(side="left")
+        ttk.Button(live_copy_row, text="Clear Output", command=lambda: self.live_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_backtest_tab(self) -> None:
         top = ttk.Frame(self.backtest_tab, padding=8)
@@ -330,9 +334,13 @@ class StrataGuiApp:
         bt_summary_frame, self.bt_summary = self._create_scrolled_text(out, height=10, wrap="none")
         bt_summary_frame.pack(fill="x")
         self._configure_dashboard_tags(self.bt_summary)
+        bt_btns = ttk.Frame(out)
+        bt_btns.pack(fill="x", pady=(4, 4))
+        ttk.Button(bt_btns, text="Copy Summary", command=lambda: self._copy_text_widget(self.bt_summary, "Backtest summary")).pack(side="left")
         bt_trades_frame, self.bt_trades = self._create_scrolled_text(out, wrap="none")
         bt_trades_frame.pack(fill="both", expand=True, pady=(8, 0))
         self._configure_dashboard_tags(self.bt_trades)
+        ttk.Button(bt_btns, text="Copy Trades", command=lambda: self._copy_text_widget(self.bt_trades, "Backtest trades")).pack(side="left", padx=6)
 
     def _build_ai_tab(self) -> None:
         top = ttk.Frame(self.ai_tab, padding=8)
@@ -400,6 +408,10 @@ class StrataGuiApp:
         ttk.Button(follow_row, text="Send Follow-up", command=self._run_ai_followup).pack(side="left")
         ai_output_frame, self.ai_output = self._create_scrolled_text(body, wrap="none")
         ai_output_frame.pack(fill="both", expand=True, pady=(8, 0))
+        ai_btns = ttk.Frame(body)
+        ai_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(ai_btns, text="Copy AI Output", command=lambda: self._copy_text_widget(self.ai_output, "AI output")).pack(side="left")
+        ttk.Button(ai_btns, text="Clear AI Output", command=lambda: self.ai_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
         top = ttk.Frame(self.portfolio_tab, padding=8)
@@ -631,6 +643,10 @@ class StrataGuiApp:
         )
         task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
+        term_btns = ttk.Frame(body)
+        term_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(term_btns, text="Copy Terminal", command=lambda: self._copy_text_widget(self.task_terminal, "Task terminal")).pack(side="left")
+        ttk.Button(term_btns, text="Clear Terminal", command=lambda: self.task_terminal.delete("1.0", tk.END)).pack(side="left", padx=6)
         self._refresh_task_tab()
         self._schedule_task_tab_refresh()
 
@@ -646,12 +662,18 @@ class StrataGuiApp:
         ttk.Checkbutton(frame, text="Lock primary quote across crypto dashboards/trades", variable=self.quote_lock_var).pack(anchor="w", pady=(2, 6))
         self.parallel_mode_var = tk.BooleanVar(value=bool(self.state.get("parallel_mode_enabled", False)))
         self.parallel_jobs_var = tk.StringVar(value=str(self.state.get("parallel_max_jobs", 2)))
+        self.verbose_logging_var = tk.BooleanVar(value=bool(self.state.get("verbose_terminal_logging", True)))
         ttk.Checkbutton(
             frame,
             text="Advanced Mode: Parallel jobs (experimental)",
             variable=self.parallel_mode_var,
             command=lambda: self._update_run_controls_and_status(),
         ).pack(anchor="w", pady=(8, 2))
+        ttk.Checkbutton(
+            frame,
+            text="Verbose terminal logging (debug mode)",
+            variable=self.verbose_logging_var,
+        ).pack(anchor="w", pady=(2, 2))
         self._labeled_entry(frame, "Max parallel jobs", self.parallel_jobs_var)
 
         ai_frame = ttk.LabelFrame(frame, text="AI Profiles", padding=8)
@@ -721,6 +743,9 @@ class StrataGuiApp:
 
         settings_frame, self.settings_output = self._create_scrolled_text(frame, height=8, wrap="none")
         settings_frame.pack(fill="both", expand=True, pady=(8, 0))
+        settings_btns = ttk.Frame(frame)
+        settings_btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(settings_btns, text="Copy Settings Log", command=lambda: self._copy_text_widget(self.settings_output, "Settings log")).pack(side="left")
         self._append_settings("Settings are stored under %USERPROFILE%\\.ctmt\\gui\\gui_state.json")
         self.ai_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_ai_profile_into_form())
         self.bn_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_binance_profile_into_form())
@@ -744,6 +769,7 @@ class StrataGuiApp:
         text.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
+        self._install_text_console_bindings(text)
         return frame, text
 
     def _create_scrolled_tree(self, parent, **tree_kwargs):
@@ -757,7 +783,66 @@ class StrataGuiApp:
         tree.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
+        self._install_tree_bindings(tree)
         return frame, tree
+
+    def _install_text_console_bindings(self, text: tk.Text) -> None:
+        menu = tk.Menu(text, tearoff=0)
+        menu.add_command(label="Copy", command=lambda: text.event_generate("<<Copy>>"))
+        menu.add_command(label="Select All", command=lambda: text.tag_add("sel", "1.0", tk.END))
+        menu.add_separator()
+        menu.add_command(label="Clear", command=lambda: text.delete("1.0", tk.END))
+
+        def _popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        text.bind("<Button-3>", _popup)
+        text.bind("<Control-a>", lambda e: (text.tag_add("sel", "1.0", tk.END), "break"))
+        text.bind("<Control-A>", lambda e: (text.tag_add("sel", "1.0", tk.END), "break"))
+
+    def _install_tree_bindings(self, tree: ttk.Treeview) -> None:
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Copy Selected Rows", command=lambda: self._copy_tree_selection(tree, "Tree rows"))
+
+        def _popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        tree.bind("<Button-3>", _popup)
+        tree.bind("<Control-c>", lambda e: (self._copy_tree_selection(tree, "Tree rows"), "break"))
+        tree.bind("<Control-C>", lambda e: (self._copy_tree_selection(tree, "Tree rows"), "break"))
+
+    def _copy_text_widget(self, widget: tk.Text, label: str = "Text") -> None:
+        try:
+            txt = widget.get("1.0", tk.END).strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            self._append_task_terminal(f"{label}: nothing to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(txt)} chars).")
+
+    def _copy_tree_selection(self, tree: ttk.Treeview, label: str = "Rows") -> None:
+        rows = []
+        cols = list(tree["columns"]) if "columns" in tree.keys() else []
+        for iid in tree.selection():
+            vals = tree.item(iid, "values")
+            rows.append("\t".join([str(v) for v in vals]))
+        if not rows:
+            self._append_task_terminal(f"{label}: no selected rows to copy.")
+            return
+        head = "\t".join([str(c) for c in cols]) if cols else ""
+        payload = (head + "\n" if head else "") + "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(payload)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
 
     def _configure_dashboard_tags(self, widget: tk.Text) -> None:
         # Section/header emphasis
@@ -1237,6 +1322,19 @@ class StrataGuiApp:
             drop = current_lines - max_lines
             self.task_terminal.delete("1.0", f"{drop}.0")
 
+    def _is_verbose_logging(self) -> bool:
+        v = getattr(self, "verbose_logging_var", None)
+        if v is not None:
+            try:
+                return bool(v.get())
+            except Exception:
+                pass
+        return bool(self.state.get("verbose_terminal_logging", True))
+
+    def _vlog(self, line: str) -> None:
+        if self._is_verbose_logging():
+            self._append_task_terminal(f"VERBOSE {line}")
+
     def _append_task_terminal_from_worker(self, line: str) -> None:
         self.root.after(0, lambda: self._append_task_terminal(line))
 
@@ -1354,12 +1452,16 @@ class StrataGuiApp:
                 cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
                 if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
                     cfg["quote_currency"] = self._primary_quote_asset()
+                self._append_task_terminal_from_worker(
+                    f"VERBOSE Live panel start: name={cfg.get('name')} market={cfg.get('market')} tf={cfg.get('timeframe')} quote={cfg.get('quote_currency')} top_n={cfg.get('top_n')}"
+                )
                 res = bridge.run_live_panel(cfg)
                 log = (res.get("log", "") or "").strip()
                 if log:
                     self._append_task_terminal_from_worker(f"LOG [{p.name}] {log[:4000]}")
                 if not res.get("ok"):
                     chunks.append(f"=== {p.name} ===\nERROR: {res.get('error', 'unknown')}\n")
+                    self._append_task_terminal_from_worker(f"VERBOSE Live panel failed: {p.name} -> {res.get('error', 'unknown')}")
                     continue
                 text = [
                     f"=== {p.name} ({res['market']} {res['timeframe']}) ===",
@@ -1379,6 +1481,9 @@ class StrataGuiApp:
                 panel_blob = "\n".join(text) + "\n"
                 panel_text_map[p.name] = panel_blob
                 chunks.append(panel_blob)
+                self._append_task_terminal_from_worker(
+                    f"VERBOSE Live panel done: {p.name} loaded={res.get('loaded_assets')}/{res.get('requested_assets')}"
+                )
 
             out = "\n".join(chunks)
             self.root.after(0, lambda: self._finish_live_output(out, task_name, task_id, panel_text_map))
@@ -1405,6 +1510,9 @@ class StrataGuiApp:
             cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
             if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
                 cfg["quote_currency"] = self._primary_quote_asset()
+            self._append_task_terminal_from_worker(
+                f"VERBOSE Live single start: name={cfg.get('name')} market={cfg.get('market')} tf={cfg.get('timeframe')} quote={cfg.get('quote_currency')} top_n={cfg.get('top_n')}"
+            )
             res = bridge.run_live_panel(cfg)
             log = (res.get("log", "") or "").strip()
             if log:
@@ -1527,6 +1635,10 @@ class StrataGuiApp:
             "sell_threshold": _to_int(self.bt_sell_threshold.get(), -2),
             "display_currency": self.display_currency_var.get() or "USD",
         }
+        try:
+            self._vlog("Backtest config: " + json.dumps(cfg, indent=2))
+        except Exception:
+            self._vlog(f"Backtest config built (market={cfg.get('market')} tf={cfg.get('timeframe')}).")
 
         def worker():
             bridge = self._bridge_for_task()
@@ -1591,6 +1703,10 @@ class StrataGuiApp:
             messagebox.showerror("AI Prompt Error", f"{type(exc).__name__}: {exc}")
             self._finish_task(task_id, task_name=task_name)
             return
+        self._vlog(
+            f"AI request prepared: source={source_override or self.ai_source.get().strip()} "
+            f"prompt_mode={self.ai_prompt_mode.get().strip()} chars_source={len(text)} chars_prompt={len(prompt)}"
+        )
         if self.ai_require_confirm.get() and (not force_no_confirm):
             preview = prompt[:2000]
             ok = messagebox.askyesno("Confirm AI Request", f"Send this prompt?\n\n{preview}")
@@ -1658,6 +1774,7 @@ class StrataGuiApp:
             self._append_task_terminal("DONE AI Analysis (failed/empty)")
             if err:
                 messagebox.showerror("AI Analysis Failed", err)
+            self._vlog(f"AI failed: {err or 'empty response'}")
         else:
             response = res.get("response", "")
             self.ai_output.insert("1.0", response)
@@ -1668,6 +1785,7 @@ class StrataGuiApp:
             if bool(self.ai_auto_stage_var.get()):
                 staged = self._stage_ai_recommendations(silent=True)
                 self._append_task_terminal(f"Auto-stage after AI run: {staged} recommendation(s).")
+            self._vlog(f"AI success: response_chars={len(response)}")
             self._append_task_terminal("DONE AI Analysis")
         self._finish_task(task_id, task_name="AI Analysis")
 
@@ -2153,6 +2271,86 @@ class StrataGuiApp:
             return s
         return f"{base}{self._primary_quote_asset()}"
 
+    def _parse_min_notional_from_error(self, err_text: str) -> Optional[float]:
+        txt = str(err_text or "")
+        m = re.search(r"minNotional\s+([0-9]+(?:\.[0-9]+)?)", txt, flags=re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def _balances_free_map(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        snap = self.latest_portfolio_snapshot if isinstance(self.latest_portfolio_snapshot, dict) else {}
+        rows = snap.get("balances", []) if isinstance(snap, dict) else []
+        if not isinstance(rows, list):
+            return out
+        for b in rows:
+            if not isinstance(b, dict):
+                continue
+            a = str(b.get("asset", "")).strip().upper()
+            if not a:
+                continue
+            try:
+                out[a] = float(b.get("free", 0.0) or 0.0)
+            except Exception:
+                out[a] = 0.0
+        return out
+
+    def _attempt_min_notional_qty_adjustment(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        min_notional: float,
+        profile: Optional[str],
+        free_by_asset: Dict[str, float],
+    ) -> Tuple[Optional[float], str]:
+        if min_notional <= 0:
+            return None, "Invalid minNotional."
+        p = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+        if not p.get("ok"):
+            return None, str(p.get("error", "Failed to fetch market price for minNotional adjustment."))
+        try:
+            px = float(p.get("price", 0.0) or 0.0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            return None, "Invalid market price for minNotional adjustment."
+        # Small buffer above minNotional to avoid rounding underflow.
+        target_notional = float(min_notional) * 1.02
+        qty_guess = target_notional / px
+        v = self.bridge.validate_binance_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=qty_guess,
+            profile_name=profile,
+        )
+        if not v.get("ok"):
+            return None, str(v.get("error", "Adjusted quantity still fails validation."))
+        try:
+            nq = float(v.get("normalized_quantity", 0.0) or 0.0)
+        except Exception:
+            nq = 0.0
+        if nq <= 0:
+            return None, "Adjusted quantity normalized to zero."
+
+        quote = self._quote_asset_from_symbol(symbol)
+        base = self._base_asset_from_symbol(symbol)
+        if side == "BUY":
+            need_quote = nq * px
+            free_q = float(free_by_asset.get(quote, 0.0) or 0.0)
+            if free_q > 0 and need_quote > free_q:
+                return None, f"Need ~{need_quote:.6f} {quote} for minNotional-adjusted BUY, available {free_q:.6f}."
+        if side == "SELL":
+            free_b = float(free_by_asset.get(base, 0.0) or 0.0)
+            if free_b > 0 and nq > free_b:
+                return None, f"Need ~{nq:.8f} {base} for minNotional-adjusted SELL, available {free_b:.8f}."
+        return nq, f"Auto-adjusted qty to satisfy minNotional ({min_notional}) at px {px:.6f}."
+
     def _confidence_multiplier(self, raw: Any) -> float:
         if not bool(self.pf_auto_confidence_var.get()):
             return 1.0
@@ -2266,6 +2464,22 @@ class StrataGuiApp:
                 profile_name=profile,
             )
             if not v.get("ok"):
+                min_n = self._parse_min_notional_from_error(str(v.get("error", "")))
+                if min_n is not None:
+                    adj_qty, adj_note = self._attempt_min_notional_qty_adjustment(
+                        symbol=symbol,
+                        side=side,
+                        order_type=otype,
+                        min_notional=min_n,
+                        profile=profile,
+                        free_by_asset=free_by_asset,
+                    )
+                    if adj_qty is not None and adj_qty > 0:
+                        rec["quantity"] = adj_qty
+                        rec["status"] = "PENDING"
+                        rec["reason"] = adj_note
+                        updated += 1
+                        continue
                 blocked += 1
                 rec["status"] = "BLOCKED"
                 rec["reason"] = str(v.get("error", "Auto-size failed validation."))
@@ -2317,6 +2531,13 @@ class StrataGuiApp:
         submitted = 0
         blocked = 0
         failed = 0
+        free_by_asset = self._balances_free_map()
+        if not free_by_asset:
+            # Best effort refresh for balance-aware retry logic.
+            fres = self.bridge.fetch_binance_portfolio(profile_name=profile)
+            if fres.get("ok"):
+                self.latest_portfolio_snapshot = fres
+                free_by_asset = self._balances_free_map()
         for rid in ids:
             rec = next((r for r in self.pending_recommendations if int(r.get("id", -1)) == int(rid)), None)
             if not rec:
@@ -2333,8 +2554,10 @@ class StrataGuiApp:
             if qty <= 0:
                 rec["status"] = "BLOCKED"
                 rec["reason"] = "Quantity is 0. Edit quantity before submit."
+                self._vlog(f"Submit blocked: {symbol} {side} qty={qty}")
                 blocked += 1
                 continue
+            self._vlog(f"Submitting order: symbol={symbol} side={side} type={order_type} qty={qty}")
             out = self.bridge.submit_binance_order(
                 symbol=symbol,
                 side=side,
@@ -2343,10 +2566,38 @@ class StrataGuiApp:
                 profile_name=profile,
             )
             if not out.get("ok"):
-                rec["status"] = "FAILED"
-                rec["reason"] = str(out.get("error", "submit failed"))
-                failed += 1
-                continue
+                err_text = str(out.get("error", "submit failed"))
+                min_n = self._parse_min_notional_from_error(err_text)
+                if min_n is not None:
+                    adj_qty, adj_note = self._attempt_min_notional_qty_adjustment(
+                        symbol=symbol,
+                        side=side,
+                        order_type=order_type,
+                        min_notional=min_n,
+                        profile=profile,
+                        free_by_asset=free_by_asset,
+                    )
+                    if adj_qty is not None and adj_qty > 0:
+                        self._vlog(f"Retry submit with minNotional-adjusted qty: {adj_qty} ({symbol})")
+                        out2 = self.bridge.submit_binance_order(
+                            symbol=symbol,
+                            side=side,
+                            order_type=order_type,
+                            quantity=adj_qty,
+                            profile_name=profile,
+                        )
+                        if out2.get("ok"):
+                            out = out2
+                            qty = adj_qty
+                            rec["reason"] = f"{rec.get('reason','')} | {adj_note}".strip(" |")
+                        else:
+                            err_text = f"{err_text} | retry failed: {out2.get('error', 'submit failed')}"
+                if not out.get("ok"):
+                    rec["status"] = "FAILED"
+                    rec["reason"] = err_text
+                    self._vlog(f"Submit failed: symbol={symbol} error={rec['reason']}")
+                    failed += 1
+                    continue
             rec["status"] = "SUBMITTED"
             nq = out.get("normalized_quantity", None)
             npv = out.get("normalized_price", None)
@@ -2355,6 +2606,9 @@ class StrataGuiApp:
             if npv is not None:
                 rec["reason"] = f"{rec.get('reason','')} | normalized px={npv}"
             submitted += 1
+            self._vlog(
+                f"Submit ok: symbol={symbol} side={side} normalized_qty={out.get('normalized_quantity')} normalized_px={out.get('normalized_price')}"
+            )
             self.bridge.record_signal_event(
                 {
                     "market": "crypto",
@@ -3127,6 +3381,7 @@ class StrataGuiApp:
         mode_var = getattr(self, "parallel_mode_var", None)
         jobs_var = getattr(self, "parallel_jobs_var", None)
         self.state["parallel_mode_enabled"] = bool(mode_var.get()) if mode_var is not None else False
+        self.state["verbose_terminal_logging"] = bool(self.verbose_logging_var.get()) if hasattr(self, "verbose_logging_var") else True
         try:
             raw_jobs = str(jobs_var.get()).strip() if jobs_var is not None else "2"
             self.state["parallel_max_jobs"] = max(1, int(raw_jobs or "2"))
