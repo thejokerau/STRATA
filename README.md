@@ -54,6 +54,12 @@ Nightly channel (`nightly` branch target):
 python nightly/BTC-beta.py
 ```
 
+GUI (gui-nightly branch):
+
+```bash
+python scripts/run_gui.py
+```
+
 ## Nightly Highlights (`nightly/BTC-beta.py`)
 
 - User-selectable analysis interval: `1d`, `4h`, `8h`, `12h`

@@ -140,6 +140,18 @@
 - Fixed cache date parsing compatibility bug:
   - `get_cached()` now parses mixed legacy date formats (`YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS`)
   - prevents crash when old cache rows use date-only strings
+- Started GUI implementation (Tkinter MVP) with modular bridge architecture:
+  - added `gui_app/engine_bridge.py` to invoke nightly engine features for live/backtest/AI/research
+  - added `gui_app/main.py` multi-tab desktop app:
+    - Live Dashboard tab: multi-panel configs, run selected/all, auto-refresh
+    - Backtest tab: parameterized run + summary/trades output
+    - AI Analysis tab: source selection (live/backtest/paste) + provider-backed response
+    - Auto-Research tab: standard + comprehensive run controls and log output
+    - Settings tab: display currency and user-defined dashboard profile save/load/delete
+  - added `gui_app/state.py` for secure user-local GUI state persistence under `%USERPROFILE%\\.ctmt\\gui\\`
+  - added launcher `scripts/run_gui.py`
+  - updated `README.md` with GUI launch command
+  - validated syntax compile for new GUI files and existing nightly/scripts modules
 
 ## Current Files of Interest
 - `nightly/BTC-beta.py`
@@ -151,6 +163,10 @@
 - `scripts/auto_research_cycle.py`
 - `experiments/scenarios.json`
 - `experiments/registry/champions.json`
+- `gui_app/main.py`
+- `gui_app/engine_bridge.py`
+- `gui_app/state.py`
+- `scripts/run_gui.py`
 
 ## Known Issues / Risks
 - Some CoinGecko symbols still may not be usable across all data providers; filtering now favors Binance tradability for crypto.
@@ -170,6 +186,8 @@
 - Backtest snapshot artifacts are generated outputs and are now git-ignored.
 - User-local AI preference/secrets files are outside repo by design; backup/rotation policy is user-managed.
 - Legacy cache rows with malformed/unparseable dates are now dropped at read time; affected rows may need cache refresh if large.
+- GUI runtime behavior has not yet been fully integration-tested in this environment due desktop/display constraints.
+- GUI currently uses text-first output panes; richer native tables/charts and embedded chart views are pending.
 
 ## Run / Validate
 - Syntax check:
@@ -178,12 +196,9 @@
   - `python .\\nightly\\BTC-beta.py`
 
 ## Recommended Next Tasks
-1. Add deterministic benchmark mode (fixed ticker set + timeframe + seed-like controls) to compare optimization changes across commits.
-2. Extend automation outputs with per-scenario CSV exports (trades/equity/metrics) for offline analysis.
-3. Add champion confidence scoring and tie-break transparency in runtime prompt (why this champion was chosen).
-   - assets requested/loaded/dropped + reasons
-   - trades count by exit type
-   - average hold days and bars
+1. Run end-to-end manual GUI acceptance tests on target desktop (live/backtest/AI/research tabs).
+2. Upgrade GUI tables/charts from text panes to richer native widgets and chart embeds.
+3. Add full parity coverage for every advanced CLI setting in GUI forms (with validation/presets).
 
 ## Process Rule (Required)
 - For every future code change in this project, update this file in the same change set:
@@ -193,7 +208,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T01:23:43+00:00
+- Last update UTC: 2026-04-10T01:30:04+00:00
 - Latest experiment artifact: `experiments/runs/run_20260409T224249Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:
