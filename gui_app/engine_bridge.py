@@ -100,6 +100,7 @@ class EngineBridge:
             "ok": True,
             "table_text": table_print.to_string(),
             "risk_text": risk.to_string(),
+            "table_rows": table_print.reset_index().to_dict(orient="records"),
             "notes": notes,
             "loaded_assets": len(raw_data),
             "requested_assets": len(tickers),
@@ -1220,6 +1221,130 @@ class EngineBridge:
 
             rows = sorted(rows, key=lambda r: int(r.get("sell_votes", 0)), reverse=True)
             return {"ok": True, "rows": rows}
+
+    def evaluate_agent_policy(
+        self,
+        profile_name: Optional[str],
+        display_currency: str,
+        max_daily_loss_pct: float,
+        max_trades_per_day: int,
+        max_exposure_pct: float,
+        pending_buy_count: int = 0,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            dcur = str(display_currency or "USD").strip().upper() or "USD"
+            daily_loss_limit = max(0.0, float(max_daily_loss_pct))
+            trades_limit = max(1, int(max_trades_per_day))
+            exposure_limit = max(0.0, min(100.0, float(max_exposure_pct)))
+            usd_like = {"USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI"}
+
+            port = self.fetch_binance_portfolio(profile_name=profile_name)
+            if not port.get("ok"):
+                return {"ok": False, "error": str(port.get("error", "Failed to fetch portfolio for policy checks."))}
+            total_usd = float(port.get("total_est_usd", 0.0) or 0.0)
+            try:
+                fx = float(self.mod.get_usd_to_currency_rate(dcur))
+            except Exception:
+                fx = 1.0
+            total_display = total_usd * fx if dcur != "USD" else total_usd
+            if total_display <= 0:
+                return {"ok": False, "error": "Portfolio value is zero; cannot evaluate policy limits."}
+
+            ledger = load_trade_ledger()
+            if not isinstance(ledger, dict):
+                ledger = default_trade_ledger()
+            entries = ledger.get("entries", [])
+            if not isinstance(entries, list):
+                entries = []
+            open_positions = ledger.get("open_positions", {})
+            if not isinstance(open_positions, dict):
+                open_positions = {}
+
+            today = pd.Timestamp.utcnow().date()
+            trades_today = 0
+            realized_today = 0.0
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if not bool(e.get("is_execution", False)):
+                    continue
+                ts = str(e.get("ts", "") or "").strip()
+                try:
+                    d = pd.to_datetime(ts, utc=True).date()
+                except Exception:
+                    continue
+                if d != today:
+                    continue
+                trades_today += 1
+                if str(e.get("action", "")).strip().upper() == "SELL":
+                    try:
+                        pdv = float(e.get("pnl_display", 0.0) or 0.0)
+                    except Exception:
+                        pdv = 0.0
+                    if pdv == 0.0:
+                        try:
+                            pq = float(e.get("pnl_quote", 0.0) or 0.0)
+                        except Exception:
+                            pq = 0.0
+                        qc = str(e.get("quote_currency", "USD") or "USD").strip().upper()
+                        if qc == dcur:
+                            pdv = pq
+                        elif qc in usd_like:
+                            pdv = pq * fx
+                    realized_today += pdv
+
+            day_loss_pct = 0.0
+            if realized_today < 0:
+                day_loss_pct = abs(realized_today) / total_display * 100.0
+
+            active, profile, _, err = self._resolve_active_binance_profile(profile_name)
+            if err:
+                return {"ok": False, "error": err}
+            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            open_exposure_display = 0.0
+            for _, pos in open_positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                asset = str(pos.get("asset", "")).strip().upper()
+                quote = str(pos.get("quote_currency", "USDT")).strip().upper() or "USDT"
+                try:
+                    qty = float(pos.get("qty", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                if not asset or qty <= 0:
+                    continue
+                sym = f"{asset}{quote}"
+                px = self._get_last_price(endpoint, sym)
+                if px is None or px <= Decimal("0"):
+                    continue
+                val_quote = qty * float(px)
+                if quote == dcur:
+                    open_exposure_display += val_quote
+                elif quote in usd_like:
+                    open_exposure_display += val_quote * fx
+
+            exposure_pct = (open_exposure_display / total_display * 100.0) if total_display > 0 else 0.0
+
+            reasons: List[str] = []
+            if trades_today >= trades_limit:
+                reasons.append(f"Trades today {trades_today} reached limit {trades_limit}.")
+            if day_loss_pct >= daily_loss_limit > 0:
+                reasons.append(f"Daily realized loss {day_loss_pct:.2f}% reached limit {daily_loss_limit:.2f}%.")
+            if pending_buy_count > 0 and exposure_pct >= exposure_limit > 0:
+                reasons.append(f"Current exposure {exposure_pct:.2f}% reached limit {exposure_limit:.2f}%; blocking new BUYs.")
+
+            return {
+                "ok": len(reasons) == 0,
+                "profile": active,
+                "display_currency": dcur,
+                "total_value_display": total_display,
+                "trades_today": trades_today,
+                "realized_today_display": realized_today,
+                "day_loss_pct": day_loss_pct,
+                "open_exposure_display": open_exposure_display,
+                "exposure_pct": exposure_pct,
+                "reasons": reasons,
+            }
 
     def reconcile_binance_fills(
         self,

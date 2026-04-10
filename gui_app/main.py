@@ -125,6 +125,7 @@ class StrataGuiApp:
         self.live_tab = self._create_scrollable_tab("Live Dashboard", "live")
         self.backtest_tab = self._create_scrollable_tab("Backtest", "backtest")
         self.ai_tab = self._create_scrollable_tab("AI Analysis", "ai")
+        self.agent_tab = self._create_scrollable_tab("Agent Console", "agent")
         self.portfolio_tab = self._create_scrollable_tab("Portfolio & Ledger", "portfolio")
         self.research_tab = self._create_scrollable_tab("Auto-Research", "research")
         self.task_tab = self._create_scrollable_tab("Task Monitor", "task")
@@ -133,6 +134,7 @@ class StrataGuiApp:
         self._build_live_tab()
         self._build_backtest_tab()
         self._build_ai_tab()
+        self._build_agent_tab()
         self._build_portfolio_tab()
         self._build_research_tab()
         self._build_task_tab()
@@ -413,6 +415,43 @@ class StrataGuiApp:
         ai_btns.pack(fill="x", pady=(6, 0))
         ttk.Button(ai_btns, text="Copy AI Output", command=lambda: self._copy_text_widget(self.ai_output, "AI output")).pack(side="left")
         ttk.Button(ai_btns, text="Clear AI Output", command=lambda: self.ai_output.delete("1.0", tk.END)).pack(side="left", padx=6)
+
+    def _build_agent_tab(self) -> None:
+        top = ttk.Frame(self.agent_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.agent_tab, padding=8)
+        body.pack(fill="both", expand=True)
+
+        self.agent_mode_var = tk.StringVar(value="plan")
+        self.agent_cmd_var = tk.StringVar(value="find me the best buys across the top 10 crypto coins on 4h and keep risk tight")
+        self.agent_guard_enabled_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_enabled", True)))
+        self.agent_guard_require_stop_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_require_stop", True)))
+        self.agent_guard_max_daily_loss_var = tk.StringVar(value=str(self.state.get("agent_guard_max_daily_loss_pct", 5.0)))
+        self.agent_guard_max_trades_var = tk.StringVar(value=str(self.state.get("agent_guard_max_trades_per_day", 8)))
+        self.agent_guard_max_exposure_var = tk.StringVar(value=str(self.state.get("agent_guard_max_exposure_pct", 40.0)))
+        ttk.Label(top, text="Mode").pack(side="left")
+        ttk.Combobox(top, textvariable=self.agent_mode_var, values=["plan", "semi_auto", "auto_execute"], width=12, state="readonly").pack(side="left", padx=4)
+        ttk.Label(top, text="Command").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.agent_cmd_var, width=120).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(top, text="Run Command", command=self._run_agent_command).pack(side="left", padx=6)
+
+        guard = ttk.LabelFrame(self.agent_tab, text="Agent Guardrails", padding=8)
+        guard.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Checkbutton(guard, text="Enable guardrails", variable=self.agent_guard_enabled_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(guard, text="Require stop for BUY execution", variable=self.agent_guard_require_stop_var).pack(side="left", padx=(0, 10))
+        ttk.Label(guard, text="Max daily loss %").pack(side="left")
+        ttk.Entry(guard, textvariable=self.agent_guard_max_daily_loss_var, width=6).pack(side="left", padx=4)
+        ttk.Label(guard, text="Max trades/day").pack(side="left")
+        ttk.Entry(guard, textvariable=self.agent_guard_max_trades_var, width=6).pack(side="left", padx=4)
+        ttk.Label(guard, text="Max exposure %").pack(side="left")
+        ttk.Entry(guard, textvariable=self.agent_guard_max_exposure_var, width=6).pack(side="left", padx=4)
+
+        agent_frame, self.agent_output = self._create_scrolled_text(body, wrap="none")
+        agent_frame.pack(fill="both", expand=True)
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Copy Output", command=lambda: self._copy_text_widget(self.agent_output, "Agent output")).pack(side="left")
+        ttk.Button(btns, text="Clear Output", command=lambda: self.agent_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
         top = ttk.Frame(self.portfolio_tab, padding=8)
@@ -1670,6 +1709,321 @@ class StrataGuiApp:
         if self._queue_if_busy("AI Analysis", self._start_run_ai_analysis):
             return
         self._start_run_ai_analysis()
+
+    def _run_agent_command(self) -> None:
+        if self._queue_if_busy("Agent Command", self._start_run_agent_command):
+            return
+        self._start_run_agent_command()
+
+    def _start_run_agent_command(self) -> None:
+        task_name = "Agent Command"
+        task_id = self._set_busy(True, task_name)
+        cmd = str(self.agent_cmd_var.get() or "").strip()
+        mode = str(self.agent_mode_var.get() or "plan").strip().lower()
+        if not cmd:
+            self.agent_output.delete("1.0", tk.END)
+            self.agent_output.insert("1.0", "No command provided.")
+            self._finish_task(task_id, task_name=task_name)
+            return
+        self.agent_output.delete("1.0", tk.END)
+        self.agent_output.insert("1.0", f"Running command in {mode} mode...\n")
+        self._append_task_terminal(f"START Agent Command ({mode})")
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                out = self._execute_agent_command(bridge, cmd, mode)
+            except Exception as exc:
+                out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.root.after(0, lambda: self._finish_agent_command(out, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_agent_command(self, out: Dict[str, Any], task_id: Optional[int]) -> None:
+        if not out.get("ok"):
+            self.agent_output.delete("1.0", tk.END)
+            self.agent_output.insert("1.0", f"Agent command failed: {out.get('error', 'unknown')}")
+            self._append_task_terminal(f"DONE Agent Command (error: {out.get('error', 'unknown')})")
+            self._finish_task(task_id, task_name="Agent Command")
+            return
+        text = str(out.get("text", "") or "").strip() or "Done."
+        self.agent_output.delete("1.0", tk.END)
+        self.agent_output.insert("1.0", text)
+        staged = out.get("staged_recs", []) or []
+        if staged:
+            self.pending_recommendations.extend(staged)
+            self._refresh_pending_recommendations_view()
+            self._append_task_terminal(f"Agent staged {len(staged)} recommendation(s).")
+        if out.get("auto_size", False) and staged:
+            ids = [int(r.get("id", 0) or 0) for r in staged]
+            try:
+                self.pending_tree.selection_set(*[str(i) for i in ids if i > 0])
+            except Exception:
+                pass
+            self._auto_size_selected_pending_orders()
+            if out.get("auto_execute", False):
+                if bool(self.agent_guard_enabled_var.get()):
+                    buy_count = sum([1 for r in staged if str(r.get("side", "")).upper() == "BUY"])
+                    try:
+                        max_loss = float((self.agent_guard_max_daily_loss_var.get() or "5").strip())
+                    except Exception:
+                        max_loss = 5.0
+                    try:
+                        max_trades = int((self.agent_guard_max_trades_var.get() or "8").strip())
+                    except Exception:
+                        max_trades = 8
+                    try:
+                        max_exposure = float((self.agent_guard_max_exposure_var.get() or "40").strip())
+                    except Exception:
+                        max_exposure = 40.0
+                    pol = self.bridge.evaluate_agent_policy(
+                        profile_name=self.pf_binance_profile_var.get().strip() or None,
+                        display_currency=self.display_currency_var.get().strip() or "USD",
+                        max_daily_loss_pct=max_loss,
+                        max_trades_per_day=max_trades,
+                        max_exposure_pct=max_exposure,
+                        pending_buy_count=buy_count,
+                    )
+                    if not pol.get("ok"):
+                        reasons = pol.get("reasons", []) or [pol.get("error", "Policy check failed.")]
+                        self._append_task_terminal("Agent execution blocked by policy: " + " | ".join([str(x) for x in reasons]))
+                        messagebox.showwarning("Agent Guardrails", "Execution blocked:\n- " + "\n- ".join([str(x) for x in reasons]))
+                        self._finish_task(task_id, task_name="Agent Command")
+                        return
+                if bool(self.agent_guard_require_stop_var.get()):
+                    missing = []
+                    for r in staged:
+                        if str(r.get("side", "")).upper() != "BUY":
+                            continue
+                        try:
+                            sl = float(r.get("stop_loss_price", 0.0) or 0.0)
+                        except Exception:
+                            sl = 0.0
+                        if sl <= 0:
+                            missing.append(str(r.get("symbol", "")))
+                    if missing:
+                        self._append_task_terminal("Agent execution blocked: missing stop on BUY -> " + ", ".join(missing))
+                        messagebox.showwarning("Agent Guardrails", "Execution blocked. Missing stop for BUY symbols:\n" + "\n".join(missing))
+                        self._finish_task(task_id, task_name="Agent Command")
+                        return
+                self._submit_selected_pending_orders()
+        if out.get("refresh_ledger", False):
+            self._refresh_ledger_view()
+        self._append_task_terminal("DONE Agent Command")
+        self._finish_task(task_id, task_name="Agent Command")
+
+    def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
+        c = str(cmd or "").strip().lower()
+        top_n = 10
+        m_top = re.search(r"top\s+(\d+)", c)
+        if m_top:
+            try:
+                top_n = max(1, min(100, int(m_top.group(1))))
+            except Exception:
+                top_n = 10
+        tf = "4h"
+        m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
+        if m_tf:
+            tf = m_tf.group(1)
+        stop_pct = 5.0
+        m_stop = re.search(r"stop(?:\s*loss)?[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)\s*%?", c)
+        if m_stop:
+            try:
+                stop_pct = max(0.1, min(25.0, float(m_stop.group(1))))
+            except Exception:
+                stop_pct = 5.0
+
+        if ("best buy" in c) or ("best buys" in c):
+            quote = self._effective_crypto_quote("USDT")
+            live_cfg = {
+                "name": "Agent Scan",
+                "market": "crypto",
+                "timeframe": tf,
+                "quote_currency": quote,
+                "top_n": top_n,
+                "display_currency": self.display_currency_var.get().strip() or "USD",
+            }
+            live = bridge.run_live_panel(live_cfg)
+            if not live.get("ok"):
+                return {"ok": False, "error": live.get("error", "Live scan failed")}
+            rows = live.get("table_rows", []) if isinstance(live.get("table_rows"), list) else []
+            buys: List[Dict[str, Any]] = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                act = str(r.get("Action", "")).upper()
+                if "BUY" not in act:
+                    continue
+                asset = str(r.get("Asset", "")).strip().upper()
+                if not asset:
+                    continue
+                try:
+                    px = float(r.get("Price", 0.0) or 0.0)
+                except Exception:
+                    px = 0.0
+                sl = px * (1.0 - (stop_pct / 100.0)) if px > 0 else 0.0
+                self._pending_rec_seq += 1
+                buys.append(
+                    {
+                        "id": self._pending_rec_seq,
+                        "symbol": f"{asset}{quote}",
+                        "asset": asset,
+                        "side": "BUY",
+                        "order_type": "MARKET",
+                        "quantity": 0.0,
+                        "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
+                        "timeframe": tf,
+                        "confidence": "",
+                        "status": "PENDING",
+                        "reason": f"Agent best-buy scan ({tf}, top {top_n})",
+                    }
+                )
+            if not buys:
+                return {"ok": True, "text": f"No BUY signals found for top {top_n} on {tf}.", "staged_recs": []}
+            lines = [f"Agent scan found {len(buys)} BUY candidate(s) on {tf} (top {top_n}, quote {quote})."]
+            for b in buys[:10]:
+                lines.append(f"- {b['symbol']} stop~{b.get('stop_loss_price', 0)}")
+            exec_words = ("execute", "submit", "place order", "buy now", "transaction")
+            do_execute = any([w in c for w in exec_words]) and mode in ("semi_auto", "auto_execute")
+            if do_execute:
+                if mode == "auto_execute":
+                    lines.append("Will auto-size and auto-execute staged recommendations.")
+                else:
+                    lines.append("Will auto-size staged recommendations (semi_auto).")
+                return {
+                    "ok": True,
+                    "text": "\n".join(lines),
+                    "staged_recs": buys,
+                    "auto_size": True,
+                    "auto_execute": (mode == "auto_execute"),
+                    "refresh_ledger": True,
+                }
+            return {"ok": True, "text": "\n".join(lines), "staged_recs": buys}
+
+        if "buy" in c:
+            m_sym = re.search(r"\bbuy\s+([a-z0-9]{2,12})\b", c)
+            if not m_sym:
+                return {"ok": False, "error": "Could not parse buy symbol. Try: buy btc with 5% stop loss"}
+            base = m_sym.group(1).upper()
+            quote = self._effective_crypto_quote("USDT")
+            symbol = f"{base}{quote}"
+            profile = self.pf_binance_profile_var.get().strip() or None
+            if not profile:
+                return {"ok": False, "error": "Select a Binance profile first."}
+            pct = 10.0
+            m_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:capital|balance|allocation|size)?", c)
+            if m_pct:
+                try:
+                    pct = max(0.1, min(100.0, float(m_pct.group(1))))
+                except Exception:
+                    pct = 10.0
+            fres = bridge.fetch_binance_portfolio(profile_name=profile)
+            if not fres.get("ok"):
+                return {"ok": False, "error": str(fres.get("error", "Failed to fetch portfolio."))}
+            free_quote = 0.0
+            for b in fres.get("balances", []) or []:
+                if isinstance(b, dict) and str(b.get("asset", "")).upper() == quote:
+                    try:
+                        free_quote = float(b.get("free", 0.0) or 0.0)
+                    except Exception:
+                        free_quote = 0.0
+                    break
+            if free_quote <= 0:
+                return {"ok": False, "error": f"No free {quote} balance available."}
+            p = bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+            if not p.get("ok"):
+                return {"ok": False, "error": str(p.get("error", "Failed to fetch symbol price."))}
+            px = float(p.get("price", 0.0) or 0.0)
+            if px <= 0:
+                return {"ok": False, "error": "Invalid market price."}
+            spend = free_quote * (pct / 100.0)
+            qty = spend / px
+            v = bridge.validate_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=qty, profile_name=profile)
+            if not v.get("ok"):
+                return {"ok": False, "error": str(v.get("error", "Order validation failed."))}
+            nq = float(v.get("normalized_quantity", 0.0) or 0.0)
+            sl = px * (1.0 - (stop_pct / 100.0))
+            if mode == "plan":
+                self._pending_rec_seq += 1
+                rec = {
+                    "id": self._pending_rec_seq,
+                    "symbol": symbol,
+                    "asset": base,
+                    "side": "BUY",
+                    "order_type": "MARKET",
+                    "quantity": nq,
+                    "stop_loss_price": round(sl, 8),
+                    "timeframe": tf,
+                    "confidence": "",
+                    "status": "PENDING",
+                    "reason": f"Agent planned BUY using {pct:.1f}% {quote} balance; stop {stop_pct:.2f}%",
+                }
+                return {"ok": True, "text": f"Planned BUY {symbol}: qty={nq:.8f}, stop~{sl:.8f}", "staged_recs": [rec]}
+
+            if bool(self.agent_guard_enabled_var.get()):
+                try:
+                    max_loss = float((self.agent_guard_max_daily_loss_var.get() or "5").strip())
+                except Exception:
+                    max_loss = 5.0
+                try:
+                    max_trades = int((self.agent_guard_max_trades_var.get() or "8").strip())
+                except Exception:
+                    max_trades = 8
+                try:
+                    max_exposure = float((self.agent_guard_max_exposure_var.get() or "40").strip())
+                except Exception:
+                    max_exposure = 40.0
+                pol = bridge.evaluate_agent_policy(
+                    profile_name=profile,
+                    display_currency=self.display_currency_var.get().strip() or "USD",
+                    max_daily_loss_pct=max_loss,
+                    max_trades_per_day=max_trades,
+                    max_exposure_pct=max_exposure,
+                    pending_buy_count=1,
+                )
+                if not pol.get("ok"):
+                    reasons = pol.get("reasons", []) or [pol.get("error", "Policy check failed.")]
+                    return {"ok": False, "error": "Agent policy blocked execution: " + " | ".join([str(x) for x in reasons])}
+            if bool(self.agent_guard_require_stop_var.get()) and stop_pct <= 0:
+                return {"ok": False, "error": "Agent policy requires a stop loss for BUY execution."}
+
+            out = bridge.submit_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=nq, profile_name=profile)
+            if not out.get("ok"):
+                return {"ok": False, "error": str(out.get("error", "Submit failed."))}
+            stop_limit = sl * 0.995
+            stop_out = bridge.submit_binance_order(
+                symbol=symbol,
+                side="SELL",
+                order_type="STOP_LOSS_LIMIT",
+                quantity=float(out.get("normalized_quantity", nq) or nq),
+                profile_name=profile,
+                price=stop_limit,
+                stop_price=sl,
+            )
+            bridge.record_signal_event(
+                {
+                    "market": "crypto",
+                    "timeframe": tf,
+                    "panel": "agent_console",
+                    "asset": base,
+                    "action": "BUY",
+                    "price": float(out.get("normalized_price", 0.0) or 0.0),
+                    "qty": float(out.get("normalized_quantity", nq) or nq),
+                    "quote_currency": quote,
+                    "display_currency": self.display_currency_var.get().strip() or "USD",
+                    "note": f"Agent BUY ({symbol})",
+                    "is_execution": True,
+                },
+                allow_duplicate=True,
+            )
+            msg = f"Executed BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}. "
+            if stop_out.get("ok"):
+                msg += f"Protective stop set at {sl:.8f}."
+            else:
+                msg += f"Stop placement failed: {stop_out.get('error', 'unknown')}."
+            return {"ok": True, "text": msg, "refresh_ledger": True}
+
+        return {"ok": True, "text": "Command understood, but no executable intent matched yet. Try: 'find best buys top 10 crypto 4h' or 'buy btc 10% capital stop loss 5%'."}
 
     def _start_run_ai_analysis(self) -> None:
         self._start_run_ai_analysis_internal(source_override=None, force_no_confirm=False)
@@ -3771,6 +4125,31 @@ class StrataGuiApp:
         self.state["display_currency"] = self.display_currency_var.get().strip() or "USD"
         self.state["primary_quote_asset"] = self._primary_quote_asset()
         self.state["lock_primary_quote"] = self._is_primary_quote_locked()
+        if hasattr(self, "agent_guard_enabled_var"):
+            self.state["agent_guard_enabled"] = bool(self.agent_guard_enabled_var.get())
+        if hasattr(self, "agent_guard_require_stop_var"):
+            self.state["agent_guard_require_stop"] = bool(self.agent_guard_require_stop_var.get())
+        if hasattr(self, "agent_guard_max_daily_loss_var"):
+            try:
+                self.state["agent_guard_max_daily_loss_pct"] = float(
+                    (self.agent_guard_max_daily_loss_var.get() or "5").strip()
+                )
+            except Exception:
+                self.state["agent_guard_max_daily_loss_pct"] = 5.0
+        if hasattr(self, "agent_guard_max_trades_var"):
+            try:
+                self.state["agent_guard_max_trades_per_day"] = max(
+                    1, int((self.agent_guard_max_trades_var.get() or "8").strip())
+                )
+            except Exception:
+                self.state["agent_guard_max_trades_per_day"] = 8
+        if hasattr(self, "agent_guard_max_exposure_var"):
+            try:
+                self.state["agent_guard_max_exposure_pct"] = max(
+                    0.0, min(100.0, float((self.agent_guard_max_exposure_var.get() or "40").strip()))
+                )
+            except Exception:
+                self.state["agent_guard_max_exposure_pct"] = 40.0
         self.state["auto_refresh_seconds"] = int(self.refresh_secs_var.get().strip() or "120")
         mode_var = getattr(self, "parallel_mode_var", None)
         jobs_var = getattr(self, "parallel_jobs_var", None)

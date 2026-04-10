@@ -126,6 +126,18 @@ GUI AI configuration:
   - captures current live dashboard snapshot
   - runs targeted backtests on assets currently signaled in live output (grouped by market/timeframe)
   - sends combined live + targeted-backtest context to AI for recommendation generation
+- New `Agent Console` tab (natural-language command center):
+  - `plan` mode: analysis + staged recommendations only
+  - `semi_auto` mode: stage + auto-size
+  - `auto_execute` mode: stage + auto-size + submit
+  - optional execution guardrails:
+    - max daily realized loss threshold
+    - max trades per day
+    - max open exposure threshold
+    - optional requirement that BUY actions include a protective stop
+  - supports intents such as:
+    - "find best buys top 10 crypto on 4h"
+    - "buy btc 10% capital stop loss 5%"
 
 Quote lock + local-currency ledger:
 
