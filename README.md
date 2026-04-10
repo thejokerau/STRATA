@@ -139,6 +139,11 @@ GUI Portfolio & Ledger:
   - Manual ledger event entry (`BUY/SELL/HOLD`)
   - Current open-position tracking + historical ledger view
   - AI recommendation staging queue with selective approval/submit flow
+  - auto-sizing for selected pending trades:
+    - BUY uses configurable `%` of available quote balance (for example USDT)
+    - SELL uses configurable `%` of available base-asset balance
+    - optional confidence weighting from AI recommendation confidence
+    - final quantity is validated/normalized against Binance symbol filters before submit
   - direct import of AI-interpreted signals into pending queue (with optional ledger logging)
   - open Binance order list + cancel selected orders from GUI
   - execution modes: `manual`, `semi_auto`, `full_auto` (mode-controlled behavior)
@@ -151,6 +156,10 @@ GUI Portfolio & Ledger:
     - only execution-grade events (`is_execution=true` with non-zero qty) create/close open positions
     - signal-only entries (e.g., AI interpretation/imported signals) are kept in history but do not pollute open positions
     - invalid legacy zero-qty open positions are auto-cleaned on ledger read
+  - ledger views now split into:
+    - `Overall`
+    - `Signal Journal`
+    - `Execution Ledger`
 - Binance profiles can be managed in GUI Settings (similar to AI profiles):
   - create/update/set active/delete profile
   - secure key+secret storage outside repo

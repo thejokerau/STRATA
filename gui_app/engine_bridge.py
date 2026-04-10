@@ -697,6 +697,20 @@ class EngineBridge:
             "note": "Validated against Binance symbol filters.",
         }
 
+    def get_binance_last_price(self, symbol: str, profile_name: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            sym = str(symbol).strip().upper()
+            if not sym:
+                return {"ok": False, "error": "Symbol is required."}
+            _, profile, _, err = self._resolve_active_binance_profile(profile_name)
+            if err:
+                return {"ok": False, "error": err}
+            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            px = self._get_last_price(endpoint, sym)
+            if px is None or px <= Decimal("0"):
+                return {"ok": False, "error": f"Unable to fetch last price for {sym}."}
+            return {"ok": True, "symbol": sym, "price": float(px)}
+
     def list_binance_profiles(self) -> Dict[str, Any]:
         with self._lock:
             prefs = load_binance_preferences()

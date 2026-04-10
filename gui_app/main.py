@@ -421,6 +421,9 @@ class StrataGuiApp:
         self.pf_manual_note_var = tk.StringVar(value="")
         self.pf_pending_qty_var = tk.StringVar(value="0")
         self.pf_pending_type_var = tk.StringVar(value="MARKET")
+        self.pf_auto_buy_pct_var = tk.StringVar(value="10")
+        self.pf_auto_sell_pct_var = tk.StringVar(value="100")
+        self.pf_auto_confidence_var = tk.BooleanVar(value=True)
 
         ttk.Label(top, text="Binance Profile").pack(side="left")
         self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
@@ -469,6 +472,12 @@ class StrataGuiApp:
         ttk.Label(pending_btns_row1, text="type").pack(side="left")
         ttk.Combobox(pending_btns_row1, textvariable=self.pf_pending_type_var, values=["MARKET", "LIMIT"], width=8, state="readonly").pack(side="left", padx=4)
         ttk.Button(pending_btns_row1, text="Apply to Selected", command=self._apply_pending_edit_to_selected).pack(side="left", padx=6)
+        ttk.Label(pending_btns_row1, text="Auto BUY %").pack(side="left", padx=(10, 0))
+        ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_buy_pct_var, width=6).pack(side="left", padx=4)
+        ttk.Label(pending_btns_row1, text="Auto SELL %").pack(side="left")
+        ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_sell_pct_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(pending_btns_row1, text="Weight by confidence", variable=self.pf_auto_confidence_var).pack(side="left", padx=(6, 0))
+        ttk.Button(pending_btns_row1, text="Auto-size Selected", command=self._auto_size_selected_pending_orders).pack(side="left", padx=6)
         pending_btns_row2 = ttk.Frame(pending_frame)
         pending_btns_row2.pack(fill="x")
         ttk.Button(pending_btns_row2, text="Submit Selected", command=self._submit_selected_pending_orders).pack(side="left")
@@ -2094,6 +2103,154 @@ class StrataGuiApp:
             if s.endswith(q) and len(s) > len(q):
                 return s[: -len(q)]
         return s
+
+    def _quote_asset_from_symbol(self, symbol: str) -> str:
+        s = str(symbol).strip().upper()
+        for q in ["USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB"]:
+            if s.endswith(q) and len(s) > len(q):
+                return q
+        return str(self.pf_quote_var.get() or "USDT").strip().upper()
+
+    def _confidence_multiplier(self, raw: Any) -> float:
+        if not bool(self.pf_auto_confidence_var.get()):
+            return 1.0
+        try:
+            s = str(raw or "").strip().replace("%", "")
+            if not s:
+                return 1.0
+            v = float(s)
+            if v > 1.0:
+                v = v / 100.0
+            v = max(0.0, min(1.0, v))
+            # Keep sizing bounded but responsive.
+            return max(0.5, min(1.25, 0.5 + (v * 0.75)))
+        except Exception:
+            return 1.0
+
+    def _auto_size_selected_pending_orders(self) -> None:
+        ids = self._selected_pending_ids()
+        if not ids:
+            messagebox.showinfo("Auto-size", "Select one or more pending rows first.")
+            return
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Auto-size", "Select a Binance profile first.")
+            return
+        try:
+            buy_pct = max(0.0, min(100.0, float((self.pf_auto_buy_pct_var.get() or "10").strip())))
+        except Exception:
+            buy_pct = 10.0
+        try:
+            sell_pct = max(0.0, min(100.0, float((self.pf_auto_sell_pct_var.get() or "100").strip())))
+        except Exception:
+            sell_pct = 100.0
+
+        if not self.latest_portfolio_snapshot or not bool(self.latest_portfolio_snapshot.get("ok")):
+            res = self.bridge.fetch_binance_portfolio(profile_name=profile)
+            if not res.get("ok"):
+                messagebox.showerror("Auto-size", str(res.get("error", "Failed to fetch Binance portfolio.")))
+                return
+            self.latest_portfolio_snapshot = res
+            self._finish_refresh_portfolio(res, task_id=None)
+
+        balances = self.latest_portfolio_snapshot.get("balances", []) or []
+        free_by_asset: Dict[str, float] = {}
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            a = str(b.get("asset", "")).strip().upper()
+            if not a:
+                continue
+            try:
+                free_by_asset[a] = float(b.get("free", 0.0) or 0.0)
+            except Exception:
+                free_by_asset[a] = 0.0
+
+        updated = 0
+        blocked = 0
+        for rid in ids:
+            rec = next((r for r in self.pending_recommendations if int(r.get("id", -1)) == int(rid)), None)
+            if not rec:
+                continue
+            symbol = str(rec.get("symbol", "")).strip().upper()
+            side = str(rec.get("side", "")).strip().upper()
+            otype = str(rec.get("order_type", "MARKET")).strip().upper()
+            if not symbol or side not in ("BUY", "SELL"):
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = "Missing symbol/side for auto-size."
+                continue
+
+            base = self._base_asset_from_symbol(symbol)
+            quote = self._quote_asset_from_symbol(symbol)
+            mult = self._confidence_multiplier(rec.get("confidence", ""))
+
+            qty_guess = 0.0
+            if side == "BUY":
+                free_quote = float(free_by_asset.get(quote, 0.0) or 0.0)
+                spend = free_quote * (buy_pct / 100.0) * mult
+                if spend <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = f"No available {quote} balance to auto-size BUY."
+                    continue
+                p = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+                if not p.get("ok"):
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = str(p.get("error", "Failed to fetch last price."))
+                    continue
+                px = float(p.get("price", 0.0) or 0.0)
+                if px <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = "Invalid market price for auto-size."
+                    continue
+                qty_guess = spend / px
+            else:
+                free_base = float(free_by_asset.get(base, 0.0) or 0.0)
+                qty_guess = free_base * (sell_pct / 100.0) * mult
+                if qty_guess <= 0:
+                    blocked += 1
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = f"No available {base} balance to auto-size SELL."
+                    continue
+
+            v = self.bridge.validate_binance_order(
+                symbol=symbol,
+                side=side,
+                order_type=otype,
+                quantity=qty_guess,
+                profile_name=profile,
+            )
+            if not v.get("ok"):
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = str(v.get("error", "Auto-size failed validation."))
+                continue
+
+            nqty = float(v.get("normalized_quantity", 0.0) or 0.0)
+            if nqty <= 0:
+                blocked += 1
+                rec["status"] = "BLOCKED"
+                rec["reason"] = "Auto-size normalized qty is zero."
+                continue
+            rec["quantity"] = nqty
+            rec["status"] = "PENDING"
+            rec["reason"] = f"Auto-sized ({side}) using available balance and Binance filters."
+            updated += 1
+
+        self._refresh_pending_recommendations_view()
+        self._append_task_terminal(
+            f"Auto-size completed -> updated={updated}, blocked={blocked}, "
+            f"buy_pct={buy_pct:.1f}%, sell_pct={sell_pct:.1f}%, confidence_weight={bool(self.pf_auto_confidence_var.get())}"
+        )
+        messagebox.showinfo(
+            "Auto-size complete",
+            f"Updated: {updated}\nBlocked: {blocked}\n\n"
+            f"BUY sizing: {buy_pct:.1f}% of available quote balance\n"
+            f"SELL sizing: {sell_pct:.1f}% of available base balance",
+        )
 
     def _submit_selected_pending_orders(self) -> None:
         ids = self._selected_pending_ids()
