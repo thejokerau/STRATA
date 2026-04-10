@@ -218,6 +218,8 @@
   - optional auto-stage of AI recommendations after each AI run
   - optional AI-signal logging to ledger during staging
   - one-click Live->AI pipeline run and interval scheduler for continuous operation
+  - parser now supports strict machine-readable trade-plan footer (`BEGIN_STRATA_TRADE_PLAN_JSON` ... `END_STRATA_TRADE_PLAN_JSON`)
+  - structured trade rows are mapped directly into pending recommendations while keeping human-readable AI narrative at top
 - Added open-order trade controls in GUI:
   - fetch Binance open orders
   - cancel selected open orders directly from GUI
@@ -311,7 +313,7 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-10T07:37:40+00:00
+- Last update UTC: 2026-04-10T07:53:28+00:00
 - Latest experiment artifact: `experiments/runs/run_20260410T031732Z.json`
 - Champion scenarios tracked: 4
 - Latest run summary:

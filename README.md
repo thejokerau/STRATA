@@ -123,6 +123,12 @@ GUI AI configuration:
   - optional `Log AI signals to ledger`
   - `Run Live->AI Pipeline` (run dashboards, then AI on combined panel outputs)
   - pipeline scheduler (interval in minutes) for continuous operation during runtime
+  - AI output contract now supports dual format:
+    - human-readable interpretation at top
+    - machine-readable footer between:
+      - `BEGIN_STRATA_TRADE_PLAN_JSON`
+      - `END_STRATA_TRADE_PLAN_JSON`
+    - structured trades from this footer are parsed directly into pending recommendations for Portfolio/Ledger workflow
 
 GUI Portfolio & Ledger:
 

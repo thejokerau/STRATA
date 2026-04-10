@@ -3,6 +3,7 @@ import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from tkinter import ttk, messagebox, filedialog
@@ -1726,6 +1727,10 @@ class StrataGuiApp:
         recs: List[Dict[str, Any]] = []
         if not text.strip():
             return recs
+        # Preferred path: structured JSON payload at bottom of AI response.
+        structured = self._extract_structured_trade_plan_from_ai_text(text)
+        if structured:
+            return structured
         quote_default = "USDT"
         try:
             quote_default = (self.quote_var.get().strip().upper() or "USDT")
@@ -1780,6 +1785,117 @@ class StrataGuiApp:
                     "confidence": conf,
                     "status": "PENDING",
                     "reason": ln.strip()[:220],
+                }
+            )
+        return recs
+
+    def _extract_structured_trade_plan_from_ai_text(self, text: str) -> List[Dict[str, Any]]:
+        payload: Optional[Dict[str, Any]] = None
+
+        # First preference: explicit STRATA markers.
+        marker_re = re.compile(
+            r"BEGIN_STRATA_TRADE_PLAN_JSON\s*(\{[\s\S]*?\})\s*END_STRATA_TRADE_PLAN_JSON",
+            re.IGNORECASE,
+        )
+        mm = marker_re.search(text)
+        if mm:
+            try:
+                obj = json.loads(mm.group(1))
+                if isinstance(obj, dict):
+                    payload = obj
+            except Exception:
+                payload = None
+
+        # Fallback: last json fenced block containing trades list.
+        if payload is None:
+            code_blocks = re.findall(r"```json\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+            for block in reversed(code_blocks):
+                try:
+                    obj = json.loads(block)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("trades", None), list):
+                    payload = obj
+                    break
+
+        if payload is None:
+            return []
+
+        trades = payload.get("trades", [])
+        if not isinstance(trades, list):
+            return []
+
+        quote_default = "USDT"
+        try:
+            quote_default = (self.quote_var.get().strip().upper() or "USDT")
+        except Exception:
+            pass
+        allowed_assets: set[str] = set()
+        for s in self._extract_signals_from_live_text((self.latest_live_output_text or "").strip()):
+            a = str(s.get("asset", "")).strip().upper()
+            if a:
+                allowed_assets.add(a)
+
+        recs: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str]] = set()
+        for tr in trades:
+            if not isinstance(tr, dict):
+                continue
+            symbol = str(tr.get("symbol", "") or "").strip().upper()
+            asset = str(tr.get("asset", "") or "").strip().upper()
+            side = str(tr.get("side", "") or "").strip().upper()
+            if side not in ("BUY", "SELL"):
+                continue
+
+            if not symbol and asset:
+                symbol = f"{asset}{quote_default}"
+            if not asset and symbol:
+                asset = self._base_asset_from_symbol(symbol)
+            if not symbol or not asset:
+                continue
+            if not re.fullmatch(r"[A-Z0-9]{2,12}", asset):
+                continue
+            if allowed_assets:
+                if asset not in allowed_assets:
+                    continue
+            else:
+                if asset not in COMMON_CRYPTO_BASES:
+                    continue
+
+            key = (symbol, side)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            order_type = str(tr.get("order_type", "MARKET") or "MARKET").strip().upper()
+            if order_type not in ("MARKET", "LIMIT"):
+                order_type = "MARKET"
+            timeframe = str(tr.get("timeframe", "") or "").strip().lower() or (self.timeframe_var.get().strip() or "1d")
+            confidence = str(tr.get("confidence", "") or "").strip()
+            reason = str(tr.get("reason", "") or "").strip()
+            qty = 0.0
+            for qk in ("quantity", "qty", "size_qty"):
+                try:
+                    qv = float(tr.get(qk, 0.0) or 0.0)
+                except Exception:
+                    qv = 0.0
+                if qv > 0:
+                    qty = qv
+                    break
+
+            self._pending_rec_seq += 1
+            recs.append(
+                {
+                    "id": self._pending_rec_seq,
+                    "symbol": symbol,
+                    "asset": asset,
+                    "side": side,
+                    "order_type": order_type,
+                    "quantity": qty,
+                    "timeframe": timeframe,
+                    "confidence": confidence,
+                    "status": "PENDING",
+                    "reason": (reason or "Structured trade-plan recommendation")[:300],
                 }
             )
         return recs
