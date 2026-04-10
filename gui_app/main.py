@@ -4241,7 +4241,13 @@ class StrataGuiApp:
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
         profile_name = self.pf_binance_profile_var.get().strip() or None
-        display_ccy = (self.display_currency_var.get().strip() or "USD").upper()
+        if hasattr(self, "display_currency_var"):
+            try:
+                display_ccy = (self.display_currency_var.get().strip() or "USD").upper()
+            except Exception:
+                display_ccy = str(self.state.get("display_currency", "USD") or "USD").strip().upper()
+        else:
+            display_ccy = str(self.state.get("display_currency", "USD") or "USD").strip().upper()
         usd_like = {"USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI"}
         try:
             fx_usd_to_disp = float(self.bridge.mod.get_usd_to_currency_rate(display_ccy))
@@ -4345,7 +4351,7 @@ class StrataGuiApp:
                 except Exception:
                     pdv = 0.0
                 if abs(pdv) > 0:
-                    dc = str(e.get("display_currency", self.display_currency_var.get() or "USD") or "USD").strip().upper()
+                    dc = str(e.get("display_currency", display_ccy) or display_ccy).strip().upper()
                     realized_display[dc] = realized_display.get(dc, 0.0) + pdv
             if realized_quote:
                 qtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_quote.items())])
