@@ -124,7 +124,10 @@ class EngineBridge:
         display_currency = str(cfg.get("display_currency", "USD")).upper()
         country = str(cfg.get("country", "2"))
 
-        if is_crypto:
+        explicit = cfg.get("tickers", None)
+        if isinstance(explicit, list) and explicit:
+            tickers = [str(x).strip() for x in explicit if str(x).strip()]
+        elif is_crypto:
             tickers = self.mod.filter_crypto_tickers_by_binance(self.mod.fetch_top_coins(top_n, quote_currency=quote))
         else:
             tickers = list(self.mod.TRADITIONAL_TOP.get(country, self.mod.TRADITIONAL_TOP["2"]))[:max(1, top_n)]

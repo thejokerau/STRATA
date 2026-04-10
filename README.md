@@ -122,6 +122,10 @@ GUI AI configuration:
   - test profile connectivity
 - GUI uses the same user-local secure preference/secret files as CLI mode.
 - AI source options include `live_all_panels` to aggregate the latest GUI live panel outputs (e.g., 4h + 12h) into one analysis input.
+- New AI pipeline option: `Run Live->Backtest->AI`
+  - captures current live dashboard snapshot
+  - runs targeted backtests on assets currently signaled in live output (grouped by market/timeframe)
+  - sends combined live + targeted-backtest context to AI for recommendation generation
 
 Quote lock + local-currency ledger:
 

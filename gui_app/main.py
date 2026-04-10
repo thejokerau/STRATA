@@ -387,6 +387,7 @@ class StrataGuiApp:
         ttk.Label(top, text="Pipeline min").pack(side="left", padx=(10, 0))
         ttk.Entry(top, textvariable=self.pipeline_interval_min_var, width=6).pack(side="left", padx=4)
         ttk.Button(top, text="Run Live->AI Pipeline", command=self._run_live_ai_pipeline_now).pack(side="left", padx=4)
+        ttk.Button(top, text="Run Live->Backtest->AI", command=self._run_live_backtest_ai_pipeline).pack(side="left", padx=4)
         ttk.Button(top, text="Start Pipeline Scheduler", command=self._start_pipeline_scheduler).pack(side="left", padx=4)
         ttk.Button(top, text="Stop Scheduler", command=self._stop_pipeline_scheduler).pack(side="left", padx=4)
 
@@ -1738,6 +1739,172 @@ class StrataGuiApp:
             "AI Analysis (Pipeline)",
             lambda: self._start_run_ai_analysis_internal(source_override="live_all_panels", force_no_confirm=True),
         )
+
+    def _run_live_backtest_ai_pipeline(self) -> None:
+        if self._queue_if_busy("Live->Backtest->AI Pipeline", self._start_live_backtest_ai_pipeline):
+            return
+        self._start_live_backtest_ai_pipeline()
+
+    def _start_live_backtest_ai_pipeline(self) -> None:
+        task_name = "Live->Backtest->AI Pipeline"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal("START Live->Backtest->AI Pipeline")
+        self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", "Running live/backtest/AI pipeline...\n")
+
+        def worker():
+            bridge = self._bridge_for_task()
+            live_chunks: List[str] = []
+            signal_map: Dict[Tuple[str, str], set] = {}
+            for p in self.live_panels:
+                cfg = asdict(p)
+                cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+                if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
+                    cfg["quote_currency"] = self._primary_quote_asset()
+                res = bridge.run_live_panel(cfg)
+                if not res.get("ok"):
+                    self._append_task_terminal_from_worker(f"LOG [Pipeline Live] {p.name} failed: {res.get('error', 'unknown')}")
+                    continue
+                blob = "\n".join(
+                    [
+                        f"=== {p.name} ({res['market']} {res['timeframe']}) ===",
+                        f"Assets loaded: {res['loaded_assets']}/{res['requested_assets']}",
+                        "",
+                        res["table_text"],
+                        "",
+                        "RISK SCORE BREAKDOWN",
+                        res["risk_text"],
+                    ]
+                )
+                live_chunks.append(blob)
+                for s in self._extract_signals_from_live_text(blob):
+                    mkt = str(s.get("market", "crypto")).strip().lower()
+                    tf = str(s.get("timeframe", "1d")).strip().lower()
+                    asset = str(s.get("asset", "")).strip().upper()
+                    if not asset:
+                        continue
+                    signal_map.setdefault((mkt, tf), set()).add(asset)
+
+            live_text = "\n\n".join(live_chunks).strip()
+            if not live_text:
+                self.root.after(
+                    0,
+                    lambda: self._finish_live_backtest_ai_pipeline(
+                        {"ok": False, "error": "No live panel output available for pipeline."},
+                        task_id,
+                        task_name,
+                    ),
+                )
+                return
+
+            def _to_int(v: str, default: int) -> int:
+                try:
+                    return int(str(v).strip())
+                except Exception:
+                    return default
+
+            def _to_float(v: str, default: float) -> float:
+                try:
+                    return float(str(v).strip())
+                except Exception:
+                    return default
+
+            months = _to_int(self.bt_months.get(), 12)
+            quote = self._effective_crypto_quote("USDT")
+            targeted_parts: List[str] = []
+            for (mkt, tf), assets in sorted(signal_map.items()):
+                aset = sorted(list(assets))
+                if not aset:
+                    continue
+                if mkt == "crypto":
+                    tks = [f"{a}-{quote}" for a in aset]
+                else:
+                    tks = aset
+                bt_cfg = {
+                    "market": mkt,
+                    "timeframe": tf,
+                    "months": months,
+                    "top_n": max(1, len(tks)),
+                    "tickers": tks,
+                    "quote_currency": quote,
+                    "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()),
+                    "initial_capital": _to_float(self.bt_initial.get(), 10000.0),
+                    "stop_loss_pct": _to_float(self.bt_stop_loss.get(), 8.0),
+                    "take_profit_pct": _to_float(self.bt_take_profit.get(), 20.0),
+                    "max_hold_days": _to_int(self.bt_max_hold_days.get(), 45),
+                    "min_hold_bars": _to_int(self.bt_min_hold_bars.get(), 2),
+                    "cooldown_bars": _to_int(self.bt_cooldown_bars.get(), 1),
+                    "same_asset_cooldown_bars": _to_int(self.bt_same_asset_cooldown.get(), 3),
+                    "max_consecutive_same_asset_entries": _to_int(self.bt_max_same_asset_entries.get(), 3),
+                    "fee_pct": _to_float(self.bt_fee_pct.get(), 0.10),
+                    "slippage_pct": _to_float(self.bt_slippage_pct.get(), 0.05),
+                    "position_size": max(0.01, min(1.0, _to_float(self.bt_position_size_pct.get(), 30.0) / 100.0)),
+                    "atr_multiplier": _to_float(self.bt_atr_mult.get(), 2.2),
+                    "adx_threshold": _to_float(self.bt_adx_threshold.get(), 25.0),
+                    "cmf_threshold": _to_float(self.bt_cmf_threshold.get(), 0.02),
+                    "obv_slope_threshold": _to_float(self.bt_obv_threshold.get(), 0.0),
+                    "max_drawdown_limit_pct": _to_float(self.bt_max_dd_target_pct.get(), 35.0),
+                    "max_exposure_pct": max(0.01, min(1.0, _to_float(self.bt_max_exposure_pct.get(), 40.0) / 100.0)),
+                    "cache_workers": _to_int(self.bt_cache_workers.get(), 8),
+                    "buy_threshold": _to_int(self.bt_buy_threshold.get(), 2),
+                    "sell_threshold": _to_int(self.bt_sell_threshold.get(), -2),
+                    "display_currency": self.display_currency_var.get() or "USD",
+                }
+                bt_res = bridge.run_backtest(bt_cfg)
+                if not bt_res.get("ok"):
+                    targeted_parts.append(f"## {mkt.upper()} {tf} (assets={len(tks)})\nBACKTEST ERROR: {bt_res.get('error', 'unknown')}\n")
+                else:
+                    targeted_parts.append(
+                        "\n".join(
+                            [
+                                f"## {mkt.upper()} {tf} (assets={len(tks)})",
+                                bt_res.get("summary_text", ""),
+                                "",
+                                "TRADE SAMPLE",
+                                bt_res.get("trades_text", ""),
+                            ]
+                        )
+                    )
+
+            combined_source = (
+                "LIVE DASHBOARD SNAPSHOT\n"
+                + ("=" * 80)
+                + "\n"
+                + live_text
+                + "\n\nTARGETED BACKTEST REVIEW\n"
+                + ("=" * 80)
+                + "\n"
+                + ("\n\n".join(targeted_parts) if targeted_parts else "No targeted backtest output.")
+            )
+            dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            prompt = self._build_ai_prompt(combined_source, dt)
+            ai_res = bridge.run_ai_analysis(combined_source, dt, prompt_override=prompt)
+            ai_res["combined_source"] = combined_source
+            self.root.after(0, lambda: self._finish_live_backtest_ai_pipeline(ai_res, task_id, task_name))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_live_backtest_ai_pipeline(self, res: Dict[str, Any], task_id: Optional[int], task_name: str) -> None:
+        if not res.get("ok"):
+            self.ai_output.delete("1.0", tk.END)
+            self.ai_output.insert("1.0", f"Pipeline failed: {res.get('error', 'unknown')}")
+            self._append_task_terminal(f"DONE {task_name} (error)")
+            self._finish_task(task_id, task_name=task_name)
+            return
+        response = str(res.get("response", "") or "").strip()
+        self.ai_last_source_text = str(res.get("combined_source", "") or "")
+        self.ai_output.delete("1.0", tk.END)
+        self.ai_output.insert("1.0", response or "AI returned empty response.")
+        used_prompt = str(res.get("prompt", "") or "")
+        if used_prompt:
+            self.ai_conversation.append({"role": "user", "content": used_prompt})
+        if response:
+            self.ai_conversation.append({"role": "assistant", "content": response})
+        if bool(self.ai_auto_stage_var.get()) and response:
+            staged = self._stage_ai_recommendations(silent=True)
+            self._append_task_terminal(f"Auto-stage after pipeline: {staged} recommendation(s).")
+        self._append_task_terminal(f"DONE {task_name}")
+        self._finish_task(task_id, task_name=task_name)
 
     def _pipeline_tick(self) -> None:
         self._run_live_ai_pipeline_now()
