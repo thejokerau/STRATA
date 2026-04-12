@@ -107,6 +107,8 @@ class StrataGuiApp:
         self._pending_rec_seq = 0
         self.pipeline_job: Optional[str] = None
         self.protection_monitor_job: Optional[str] = None
+        self.portfolio_auto_refresh_job: Optional[str] = None
+        self.portfolio_auto_refresh_running = False
         self.agent_last_staged_ids: List[int] = []
         self.agent_context: Dict[str, Any] = dict(self.state.get("agent_context", {})) if isinstance(self.state.get("agent_context", {}), dict) else {}
         self.agent_context.setdefault("timeframe", "4h")
@@ -148,6 +150,7 @@ class StrataGuiApp:
         self._build_task_tab()
         self._build_settings_tab()
         self._build_status_bar()
+        self.nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _create_scrollable_tab(self, title: str, key: str) -> ttk.Frame:
         container = ttk.Frame(self.nb)
@@ -194,10 +197,11 @@ class StrataGuiApp:
         self.status_progress.pack(side="right")
 
     def _build_live_tab(self) -> None:
-        left = ttk.Frame(self.live_tab, padding=8)
-        right = ttk.Frame(self.live_tab, padding=8)
-        left.pack(side="left", fill="y")
-        right.pack(side="left", fill="both", expand=True)
+        split = self._create_paned(self.live_tab, orient="horizontal")
+        left = ttk.Frame(split, padding=8)
+        right = ttk.Frame(split, padding=8)
+        split.add(left, weight=1)
+        split.add(right, weight=3)
 
         ttk.Label(left, text="Panels").pack(anchor="w")
         self.panel_list = tk.Listbox(left, width=40, height=18, selectmode="extended")
@@ -269,10 +273,11 @@ class StrataGuiApp:
         ttk.Button(live_copy_row, text="Clear Output", command=lambda: self.live_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_backtest_tab(self) -> None:
-        top = ttk.Frame(self.backtest_tab, padding=8)
-        top.pack(fill="x")
-        out = ttk.Frame(self.backtest_tab, padding=8)
-        out.pack(fill="both", expand=True)
+        split = self._create_paned(self.backtest_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        out = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(out, weight=3)
 
         self.bt_market = tk.StringVar(value="crypto")
         self.bt_tf = tk.StringVar(value="1d")
@@ -353,10 +358,11 @@ class StrataGuiApp:
         ttk.Button(bt_btns, text="Copy Trades", command=lambda: self._copy_text_widget(self.bt_trades, "Backtest trades")).pack(side="left", padx=6)
 
     def _build_ai_tab(self) -> None:
-        top = ttk.Frame(self.ai_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.ai_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.ai_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=3)
 
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -425,10 +431,11 @@ class StrataGuiApp:
         ttk.Button(ai_btns, text="Clear AI Output", command=lambda: self.ai_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_agent_tab(self) -> None:
-        top = ttk.Frame(self.agent_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.agent_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.agent_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=3)
 
         self.agent_mode_var = tk.StringVar(value="plan")
         self.agent_cmd_var = tk.StringVar(value="find me the best buys across the top 10 crypto coins on 4h and keep risk tight")
@@ -490,6 +497,8 @@ class StrataGuiApp:
         self.pf_auto_confidence_var = tk.BooleanVar(value=True)
         self.pf_protect_interval_min_var = tk.StringVar(value="30")
         self.pf_protect_auto_send_var = tk.BooleanVar(value=False)
+        self.pf_auto_refresh_var = tk.BooleanVar(value=bool(self.state.get("portfolio_auto_refresh_enabled", True)))
+        self.pf_auto_refresh_secs_var = tk.StringVar(value=str(self.state.get("portfolio_auto_refresh_seconds", 45)))
 
         ttk.Label(top, text="Binance Profile").pack(side="left")
         self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
@@ -515,9 +524,13 @@ class StrataGuiApp:
         ttk.Button(top, text="Import Signals from Live", command=self._import_signals_from_live).pack(side="left", padx=8)
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
         ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
+        ttk.Label(top, text="Auto refresh (s)").pack(side="left", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.pf_auto_refresh_secs_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="While on this tab", variable=self.pf_auto_refresh_var).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="Refresh All Now", command=self._refresh_portfolio_suite).pack(side="left", padx=(6, 0))
 
-        pending_frame = ttk.LabelFrame(self.portfolio_tab, text="Pending Recommendations (Review & Approve)", padding=8)
-        pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        pending_frame = ttk.LabelFrame(body, text="Pending Recommendations (Review & Approve)", padding=8)
+        pending_frame.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
             columns=("id", "symbol", "side", "type", "qty", "stop", "tf", "conf", "status", "reason"),
@@ -559,7 +572,7 @@ class StrataGuiApp:
         ttk.Button(pending_btns_row2, text="Remove Selected", command=self._remove_selected_pending_orders).pack(side="left", padx=6)
         ttk.Button(pending_btns_row2, text="Clear All", command=self._clear_pending_recommendations).pack(side="left")
 
-        manual = ttk.LabelFrame(self.portfolio_tab, text="Manual Ledger Event", padding=8)
+        manual = ttk.LabelFrame(body, text="Manual Ledger Event", padding=8)
         manual.pack(fill="x", padx=8, pady=(0, 8))
         self._labeled_entry(manual, "Asset", self.pf_manual_asset_var)
         self._labeled_combo(manual, "Action", self.pf_manual_action_var, ["BUY", "SELL", "HOLD"], state="readonly")
@@ -569,8 +582,8 @@ class StrataGuiApp:
         self._labeled_entry(manual, "Note", self.pf_manual_note_var)
         ttk.Button(manual, text="Add Manual Event", command=self._add_manual_ledger_event).pack(fill="x", pady=(6, 0))
 
-        orders = ttk.LabelFrame(self.portfolio_tab, text="Open Binance Orders (Cancel via GUI)", padding=8)
-        orders.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        orders = ttk.LabelFrame(body, text="Open Binance Orders (Cancel via GUI)", padding=8)
+        orders.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         order_top = ttk.Frame(orders)
         order_top.pack(fill="x")
         self.pf_open_symbol_filter_var = tk.StringVar(value="")
@@ -600,17 +613,19 @@ class StrataGuiApp:
         open_orders_frame.pack(fill="x", expand=False, pady=(6, 0))
 
         cols = ttk.Frame(body)
-        cols.pack(fill="both", expand=True)
+        cols.pack(fill="both", expand=False, pady=(0, 8))
+        cols.configure(height=220)
+        cols.pack_propagate(False)
         left = ttk.LabelFrame(cols, text="Current Portfolio (Binance)", padding=6)
         right = ttk.LabelFrame(cols, text="Open Positions (Ledger)", padding=6)
         left.pack(side="left", fill="both", expand=True, padx=(0, 6))
         right.pack(side="left", fill="both", expand=True)
 
-        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none")
+        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none", height=8)
         pf_portfolio_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_portfolio_text)
 
-        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none")
+        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none", height=8)
         pf_open_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_open_positions_text)
 
@@ -637,10 +652,12 @@ class StrataGuiApp:
         self._refresh_binance_profiles()
         self._refresh_ledger_view()
         self._refresh_pending_recommendations_view()
+        self.root.after(300, self._refresh_portfolio_suite)
 
     def _build_research_tab(self) -> None:
-        top = ttk.Frame(self.research_tab, padding=8)
-        top.pack(fill="x")
+        split = self._create_paned(self.research_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
         self.rs_market_scope = tk.StringVar(value="both")
         self.rs_quote = tk.StringVar(value="USD")
         self.rs_country = tk.StringVar(value=country_code_to_display("2"))
@@ -666,14 +683,17 @@ class StrataGuiApp:
         self.btn_run_research_comp = ttk.Button(top, text="Run Comprehensive", command=self._run_comprehensive_research)
         self.btn_run_research_comp.pack(side="left")
 
-        rs_frame, self.rs_output = self._create_scrolled_text(self.research_tab, wrap="none")
+        rs_host = ttk.Frame(split, padding=8)
+        split.add(rs_host, weight=3)
+        rs_frame, self.rs_output = self._create_scrolled_text(rs_host, wrap="none")
         rs_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_task_tab(self) -> None:
-        top = ttk.Frame(self.task_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.task_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.task_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=4)
 
         ttk.Button(top, text="Refresh", command=self._refresh_task_tab).pack(side="left")
         self.btn_pause_queue = ttk.Button(top, text="Pause Queue", command=self._toggle_queue_pause)
@@ -686,25 +706,29 @@ class StrataGuiApp:
         cols.pack(fill="both", expand=True)
         left = ttk.LabelFrame(cols, text="Running", padding=6)
         right = ttk.LabelFrame(cols, text="Queued", padding=6)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        right.pack(side="left", fill="both", expand=True)
+        cols_split = self._create_paned(cols, orient="horizontal")
+        cols_split.pack(fill="both", expand=True)
+        cols_split.add(left, weight=1)
+        cols_split.add(right, weight=1)
 
         self.running_list = tk.Listbox(left, height=12)
         self.running_list.pack(fill="both", expand=True)
         self.queued_list = tk.Listbox(right, height=12)
         self.queued_list.pack(fill="both", expand=True)
 
-        task_out_frame, self.task_tab_output = self._create_scrolled_text(body, height=4, wrap="none")
-        task_out_frame.pack(fill="x", pady=(8, 0))
+        logs_split = self._create_paned(body, orient="vertical")
+        logs_split.pack(fill="both", expand=True, pady=(8, 0))
+        task_out_frame, self.task_tab_output = self._create_scrolled_text(logs_split, height=4, wrap="none")
+        logs_split.add(task_out_frame, weight=1)
         task_term_frame, self.task_terminal = self._create_scrolled_text(
-            body,
+            logs_split,
             height=12,
             wrap="none",
             bg="#101315",
             fg="#9CF5C6",
             insertbackground="#9CF5C6",
         )
-        task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
+        logs_split.add(task_term_frame, weight=3)
         self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
         term_btns = ttk.Frame(body)
         term_btns.pack(fill="x", pady=(6, 0))
@@ -714,8 +738,9 @@ class StrataGuiApp:
         self._schedule_task_tab_refresh()
 
     def _build_settings_tab(self) -> None:
-        frame = ttk.Frame(self.settings_tab, padding=8)
-        frame.pack(fill="both", expand=True)
+        split = self._create_paned(self.settings_tab, orient="vertical")
+        frame = ttk.Frame(split, padding=8)
+        split.add(frame, weight=3)
 
         self.display_currency_var = tk.StringVar(value=self.state.get("display_currency", "USD"))
         self._labeled_combo(frame, "Display Currency", self.display_currency_var, ["USD", "AUD", "EUR", "GBP", "CAD", "JPY", "NZD", "SGD", "HKD", "CHF"])
@@ -804,8 +829,8 @@ class StrataGuiApp:
 
         ttk.Button(frame, text="Save Settings", command=self._persist_state).pack(fill="x")
 
-        settings_frame, self.settings_output = self._create_scrolled_text(frame, height=8, wrap="none")
-        settings_frame.pack(fill="both", expand=True, pady=(8, 0))
+        settings_frame, self.settings_output = self._create_scrolled_text(split, height=8, wrap="none")
+        split.add(settings_frame, weight=1)
         settings_btns = ttk.Frame(frame)
         settings_btns.pack(fill="x", pady=(6, 0))
         ttk.Button(settings_btns, text="Copy Settings Log", command=lambda: self._copy_text_widget(self.settings_output, "Settings log")).pack(side="left")
@@ -820,6 +845,12 @@ class StrataGuiApp:
         row.pack(fill="x", pady=2)
         ttk.Label(row, text=label, width=16).pack(side="left")
         ttk.Entry(row, textvariable=var, width=18).pack(side="left")
+
+    def _create_paned(self, parent, orient: str = "horizontal") -> ttk.Panedwindow:
+        o = tk.HORIZONTAL if str(orient).lower().startswith("h") else tk.VERTICAL
+        pane = ttk.Panedwindow(parent, orient=o)
+        pane.pack(fill="both", expand=True)
+        return pane
 
     def _create_scrolled_text(self, parent, **text_kwargs):
         frame = ttk.Frame(parent)
@@ -907,6 +938,27 @@ class StrataGuiApp:
         self.root.clipboard_append(payload)
         self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
 
+    def _human_readable_ts(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return raw
+        try:
+            ts = pd.to_datetime(raw, utc=True, errors="raise")
+        except Exception:
+            return raw
+        try:
+            local_ts = ts.tz_convert(datetime.now().astimezone().tzinfo)
+            return local_ts.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        except Exception:
+            return str(ts)
+
+    def _humanize_df_timestamps(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        out = df.copy()
+        for c in cols:
+            if c in out.columns:
+                out[c] = out[c].apply(self._human_readable_ts)
+        return out
+
     def _configure_dashboard_tags(self, widget: tk.Text) -> None:
         # Section/header emphasis
         widget.tag_configure("hdr", foreground="#7FDBFF")
@@ -915,6 +967,10 @@ class StrataGuiApp:
         widget.tag_configure("buy", foreground="#2ECC71")
         widget.tag_configure("hold", foreground="#F39C12")
         widget.tag_configure("sell", foreground="#E74C3C")
+        # Open position protection emphasis
+        widget.tag_configure("protected", foreground="#2ECC71")
+        widget.tag_configure("stale_protected", foreground="#F39C12")
+        widget.tag_configure("unprotected", foreground="#E74C3C")
         # Result emphasis
         widget.tag_configure("okline", foreground="#2ECC71")
         widget.tag_configure("errline", foreground="#FF6B6B")
@@ -923,7 +979,18 @@ class StrataGuiApp:
         if widget is None:
             return
         # Clear prior highlights
-        for tag in ("hdr", "subhdr", "buy", "hold", "sell", "okline", "errline"):
+        for tag in (
+            "hdr",
+            "subhdr",
+            "buy",
+            "hold",
+            "sell",
+            "protected",
+            "stale_protected",
+            "unprotected",
+            "okline",
+            "errline",
+        ):
             widget.tag_remove(tag, "1.0", tk.END)
 
         def _tag_all(needle: str, tag: str, nocase: bool = True) -> None:
@@ -949,6 +1016,14 @@ class StrataGuiApp:
             _tag_all(k, "hold")
         for k in ("🔴 SELL", " SELL "):
             _tag_all(k, "sell")
+
+        # Open-position protection markers
+        for k in ("PROTECTED",):
+            _tag_all(k, "protected", nocase=False)
+        for k in ("STALE_PROTECTED",):
+            _tag_all(k, "stale_protected", nocase=False)
+        for k in ("UNPROTECTED",):
+            _tag_all(k, "unprotected", nocase=False)
 
         # Outcome markers
         for k in ("DONE", "SUCCESS", "OK"):
@@ -3806,19 +3881,64 @@ class StrataGuiApp:
                 if not price_arg or price_arg <= 0:
                     price_arg = float(stop_arg) * 0.995
 
-                if bool(rec.get("replace_existing_stop", False)):
+                if side == "SELL":
+                    # Tighten-only guard: never move a protective stop backwards for long positions.
+                    # If an existing protective stop is higher, block this update.
                     oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
-                    if oo.get("ok"):
-                        for od in oo.get("orders", []) or []:
-                            if not isinstance(od, dict):
+                    if not oo.get("ok"):
+                        rec["status"] = "BLOCKED"
+                        rec["reason"] = (
+                            f"Could not verify existing protective stops ({oo.get('error', 'unknown')}). "
+                            "Tighten-only guard blocked update."
+                        )
+                        blocked += 1
+                        continue
+
+                    protective_orders: List[Dict[str, Any]] = []
+                    best_existing_stop = 0.0
+                    for od in oo.get("orders", []) or []:
+                        if not isinstance(od, dict):
+                            continue
+                        o_side = str(od.get("side", "")).upper()
+                        o_type = str(od.get("type", "")).upper()
+                        o_status = str(od.get("status", "")).upper()
+                        if o_side != "SELL" or o_status not in ("NEW", "PARTIALLY_FILLED"):
+                            continue
+                        if o_type not in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"):
+                            continue
+                        protective_orders.append(od)
+                        try:
+                            o_stop = float(od.get("stopPrice", 0.0) or 0.0)
+                        except Exception:
+                            o_stop = 0.0
+                        if o_stop <= 0:
+                            try:
+                                o_stop = float(od.get("price", 0.0) or 0.0)
+                            except Exception:
+                                o_stop = 0.0
+                        if o_stop > best_existing_stop:
+                            best_existing_stop = o_stop
+
+                    if best_existing_stop > 0 and float(stop_arg) + 1e-12 < float(best_existing_stop):
+                        rec["status"] = "BLOCKED"
+                        rec["reason"] = (
+                            f"Tighten-only guard: new stop {float(stop_arg):.8f} is below "
+                            f"existing protective stop {float(best_existing_stop):.8f}."
+                        )
+                        self._vlog(f"Submit blocked tighten-only: {symbol} new_stop={stop_arg} existing_stop={best_existing_stop}")
+                        blocked += 1
+                        continue
+
+                    if bool(rec.get("replace_existing_stop", False)):
+                        for od in protective_orders:
+                            try:
+                                oid = int(od.get("orderId", 0) or 0)
+                            except Exception:
+                                oid = 0
+                            if oid <= 0:
                                 continue
-                            o_side = str(od.get("side", "")).upper()
-                            o_type = str(od.get("type", "")).upper()
-                            o_status = str(od.get("status", "")).upper()
-                            oid = int(od.get("orderId", 0) or 0)
-                            if o_side == "SELL" and o_type in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT") and o_status in ("NEW", "PARTIALLY_FILLED") and oid > 0:
-                                self.bridge.cancel_binance_order(symbol=symbol, order_id=oid, profile_name=profile)
-                                self._vlog(f"Canceled existing protective order before replace: {symbol} oid={oid}")
+                            self.bridge.cancel_binance_order(symbol=symbol, order_id=oid, profile_name=profile)
+                            self._vlog(f"Canceled existing protective order before replace: {symbol} oid={oid}")
 
             out = self.bridge.submit_binance_order(
                 symbol=symbol,
@@ -3879,6 +3999,41 @@ class StrataGuiApp:
                 except Exception:
                     sl = 0.0
                 if sl > 0:
+                    # Tighten-only guard for auto protective placement after BUY:
+                    # if a stronger (higher) protective stop already exists, keep it.
+                    try:
+                        oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
+                    except Exception:
+                        oo = {"ok": False}
+                    if oo.get("ok"):
+                        best_existing_stop = 0.0
+                        for od in oo.get("orders", []) or []:
+                            if not isinstance(od, dict):
+                                continue
+                            o_side = str(od.get("side", "")).upper()
+                            o_type = str(od.get("type", "")).upper()
+                            o_status = str(od.get("status", "")).upper()
+                            if o_side != "SELL" or o_status not in ("NEW", "PARTIALLY_FILLED"):
+                                continue
+                            if o_type not in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"):
+                                continue
+                            try:
+                                o_stop = float(od.get("stopPrice", 0.0) or 0.0)
+                            except Exception:
+                                o_stop = 0.0
+                            if o_stop <= 0:
+                                try:
+                                    o_stop = float(od.get("price", 0.0) or 0.0)
+                                except Exception:
+                                    o_stop = 0.0
+                            if o_stop > best_existing_stop:
+                                best_existing_stop = o_stop
+                        if best_existing_stop > 0 and sl < best_existing_stop:
+                            self._vlog(
+                                f"Tighten-only guard adjusted BUY protective stop for {symbol}: "
+                                f"{sl:.8f} -> {best_existing_stop:.8f}"
+                            )
+                            sl = float(best_existing_stop)
                     stop_limit = sl * 0.995
                     stop_out = self.bridge.submit_binance_order(
                         symbol=symbol,
@@ -3898,7 +4053,7 @@ class StrataGuiApp:
             lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
-                    "timeframe": str(rec.get("timeframe", "1d")),
+                    "timeframe": "spot",
                     "panel": "ai_trade_queue",
                     "asset": self._base_asset_from_symbol(symbol),
                     "action": side,
@@ -3908,6 +4063,9 @@ class StrataGuiApp:
                     "display_currency": self.display_currency_var.get().strip() or "USD",
                     "note": f"Submitted to Binance ({symbol})",
                     "is_execution": True,
+                    "is_placeholder": True,
+                    "exchange_symbol": symbol,
+                    "exchange_order_id": int((out.get("data", {}) or {}).get("orderId", 0) or 0),
                 },
                 cooldown_minutes=cooldown,
                 # Execution events must be recorded even if a recent signal exists.
@@ -4355,26 +4513,112 @@ class StrataGuiApp:
             self.protection_monitor_job = None
             self._append_task_terminal("Stopped protection monitor.")
 
+    def _is_portfolio_tab_selected(self) -> bool:
+        try:
+            cur = self.nb.select()
+            return bool(cur) and (self.nb.tab(cur, "text") == "Portfolio & Ledger")
+        except Exception:
+            return False
+
+    def _refresh_portfolio_suite(self) -> None:
+        # Keep local views fresh instantly.
+        self._refresh_ledger_view()
+        # Network-backed views.
+        self._refresh_portfolio()
+        try:
+            self.root.after(120, self._refresh_open_orders)
+        except Exception:
+            pass
+
+    def _start_portfolio_auto_refresh(self) -> None:
+        self._stop_portfolio_auto_refresh()
+        if not hasattr(self, "pf_auto_refresh_var") or not bool(self.pf_auto_refresh_var.get()):
+            return
+        self.portfolio_auto_refresh_running = True
+        self._schedule_portfolio_auto_refresh_tick(initial=True)
+
+    def _stop_portfolio_auto_refresh(self) -> None:
+        self.portfolio_auto_refresh_running = False
+        if self.portfolio_auto_refresh_job:
+            try:
+                self.root.after_cancel(self.portfolio_auto_refresh_job)
+            except Exception:
+                pass
+            self.portfolio_auto_refresh_job = None
+
+    def _schedule_portfolio_auto_refresh_tick(self, initial: bool = False) -> None:
+        if not self.portfolio_auto_refresh_running:
+            return
+        if not self._is_portfolio_tab_selected():
+            self._stop_portfolio_auto_refresh()
+            return
+        try:
+            secs = max(10, int((self.pf_auto_refresh_secs_var.get() or "45").strip()))
+        except Exception:
+            secs = 45
+        if initial:
+            self._append_task_terminal(f"Portfolio auto-refresh started ({secs}s).")
+        self._refresh_portfolio_suite()
+        self.portfolio_auto_refresh_job = self.root.after(
+            secs * 1000,
+            lambda: self._schedule_portfolio_auto_refresh_tick(initial=False),
+        )
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        if self._is_portfolio_tab_selected():
+            self._refresh_portfolio_suite()
+            if hasattr(self, "pf_auto_refresh_var") and bool(self.pf_auto_refresh_var.get()):
+                self._start_portfolio_auto_refresh()
+        else:
+            self._stop_portfolio_auto_refresh()
+
     def _review_open_positions_mtf(self) -> None:
         profile = self.pf_binance_profile_var.get().strip() or None
         if not profile:
             messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
             return
+        task_name = "Open Position Review (MTF)"
+        if self._queue_if_busy(task_name, self._start_review_open_positions_mtf):
+            return
+        self._start_review_open_positions_mtf()
+
+    def _start_review_open_positions_mtf(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
+            return
+        task_name = "Open Position Review (MTF)"
+        task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START Open Position Review (4h/8h/12h/1d)")
-        out = self.bridge.analyze_open_positions_multi_tf(
-            profile_name=profile,
-            timeframes=["4h", "8h", "12h", "1d"],
-            display_currency=self.display_currency_var.get().strip() or "USD",
-        )
+        display_ccy = self.display_currency_var.get().strip() or "USD"
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                res = bridge.analyze_open_positions_multi_tf(
+                    profile_name=profile,
+                    timeframes=["4h", "8h", "12h", "1d"],
+                    display_currency=display_ccy,
+                )
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            self.root.after(0, lambda: self._finish_review_open_positions_mtf(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_review_open_positions_mtf(self, out: Dict[str, Any], task_id: Optional[int]) -> None:
+        task_name = "Open Position Review (MTF)"
         if not out.get("ok"):
             self._append_task_terminal(f"DONE Open Position Review (error: {out.get('error', 'unknown')})")
             messagebox.showerror("Open Position Review", str(out.get("error", "Failed to analyze open positions.")))
+            self._finish_task(task_id, task_name=task_name)
             return
         rows = out.get("rows", []) or []
         if not rows:
             note = str(out.get("note", "") or "No open positions to analyze.")
             self._append_task_terminal(f"DONE Open Position Review ({note})")
             messagebox.showinfo("Open Position Review", note)
+            self._finish_task(task_id, task_name=task_name)
             return
         lines = []
         lines.append("OPEN POSITION MTF REVIEW")
@@ -4392,6 +4636,7 @@ class StrataGuiApp:
         self._append_task_terminal(blob)
         self._append_task_terminal(f"DONE Open Position Review ({len(rows)} positions)")
         messagebox.showinfo("Open Position Review", f"Reviewed {len(rows)} open position(s).\nSee Task Terminal for detailed breakdown.")
+        self._finish_task(task_id, task_name=task_name)
 
     def _cancel_selected_open_orders(self) -> None:
         if not hasattr(self, "open_orders_tree"):
@@ -4617,6 +4862,8 @@ class StrataGuiApp:
             signal_entries = []
         if not isinstance(execution_entries, list):
             execution_entries = []
+        visible_execution_entries = [e for e in execution_entries if not bool((e or {}).get("is_placeholder", False))]
+        hidden_placeholders = max(0, len(execution_entries) - len(visible_execution_entries))
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
         profile_name = self.pf_binance_profile_var.get().strip() or None
@@ -4638,6 +4885,29 @@ class StrataGuiApp:
         unrealized_quote: Dict[str, float] = {}
         unrealized_display: Dict[str, float] = {}
         op_rows: List[Dict[str, Any]] = []
+        protective_orders_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        if profile_name:
+            try:
+                oout = self.bridge.list_open_binance_orders(profile_name=profile_name, symbol="")
+                if oout.get("ok"):
+                    for o in (oout.get("orders", []) or []):
+                        if not isinstance(o, dict):
+                            continue
+                        sym = str(o.get("symbol", "") or "").strip().upper()
+                        side = str(o.get("side", "") or "").strip().upper()
+                        otype = str(o.get("type", "") or "").strip().upper()
+                        # Treat sell-side stop / trailing / take-profit orders as protective overlays.
+                        is_protective = side == "SELL" and (
+                            ("STOP" in otype)
+                            or ("TAKE_PROFIT" in otype)
+                            or ("TRAILING" in otype)
+                        )
+                        if not sym or not is_protective:
+                            continue
+                        protective_orders_by_symbol.setdefault(sym, []).append(o)
+            except Exception:
+                protective_orders_by_symbol = {}
+
         if isinstance(open_positions, dict):
             for _, pos in open_positions.items():
                 if not isinstance(pos, dict):
@@ -4681,22 +4951,56 @@ class StrataGuiApp:
                     unrealized_quote[quote_ccy] = unrealized_quote.get(quote_ccy, 0.0) + upnl_q
                 if abs(upnl_d) > 0:
                     unrealized_display[display_ccy] = unrealized_display.get(display_ccy, 0.0) + upnl_d
+
+                # Protection status:
+                # - PROTECTED: has at least one protective open order
+                # - STALE_PROTECTED: protective order exists but latest update/time > 24h old
+                # - UNPROTECTED: no protective open order detected
+                prot_state = "UNPROTECTED"
+                prot_detail = ""
+                now_utc = pd.Timestamp.now(tz="UTC")
+                prot_orders = protective_orders_by_symbol.get(symbol, [])
+                if prot_orders:
+                    newest_ts = None
+                    otypes: List[str] = []
+                    for po in prot_orders:
+                        otypes.append(str(po.get("type", "") or "").strip().upper())
+                        try:
+                            t_ms = int(po.get("updateTime", 0) or po.get("time", 0) or 0)
+                        except Exception:
+                            t_ms = 0
+                        if t_ms > 0:
+                            ts = pd.to_datetime(t_ms, unit="ms", utc=True, errors="coerce")
+                            if pd.notna(ts):
+                                if newest_ts is None or ts > newest_ts:
+                                    newest_ts = ts
+                    if newest_ts is not None:
+                        age_h = (now_utc - newest_ts).total_seconds() / 3600.0
+                        prot_state = "STALE_PROTECTED" if age_h > 24.0 else "PROTECTED"
+                        prot_detail = f"{','.join(sorted(set(otypes)))} @ {newest_ts.strftime('%Y-%m-%d %H:%MZ')}"
+                    else:
+                        prot_state = "PROTECTED"
+                        prot_detail = ",".join(sorted(set(otypes)))
+
                 row["symbol"] = symbol
                 row["quote_currency"] = quote_ccy
                 row["last_price"] = round(last_px, 8) if last_px > 0 else ""
                 row["unreal_pnl_quote"] = round(upnl_q, 8)
                 row["unreal_pnl_pct"] = round(upnl_pct, 4)
                 row["unreal_pnl_display"] = round(upnl_d, 8)
+                row["protection_status"] = prot_state
+                row["protection_detail"] = prot_detail
                 op_rows.append(row)
 
         if hasattr(self, "pf_open_positions_text"):
             self.pf_open_positions_text.delete("1.0", tk.END)
             if op_rows:
                 op_df = pd.DataFrame(op_rows)
+                op_df = self._humanize_df_timestamps(op_df, ["entry_ts"])
                 preferred = [
                     "entry_id", "entry_ts", "symbol", "asset", "timeframe", "qty", "entry_price",
                     "last_price", "unreal_pnl_pct", "unreal_pnl_quote", "unreal_pnl_display",
-                    "quote_currency", "display_currency", "panel",
+                    "quote_currency", "display_currency", "protection_status", "protection_detail", "panel",
                 ]
                 cols = [c for c in preferred if c in op_df.columns] + [c for c in op_df.columns if c not in preferred]
                 op_df = op_df[cols]
@@ -4710,12 +5014,14 @@ class StrataGuiApp:
             lines = []
             lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
             lines.append(f"Signal Journal: {len(signal_entries)}")
-            lines.append(f"Execution Ledger: {len(execution_entries)}")
+            lines.append(f"Execution Ledger: {len(visible_execution_entries)}")
+            if hidden_placeholders > 0:
+                lines.append(f"Execution placeholders hidden: {hidden_placeholders}")
             lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
             # Realized PnL summary in quote/display currencies (execution rows only).
             realized_quote: Dict[str, float] = {}
             realized_display: Dict[str, float] = {}
-            for e in execution_entries:
+            for e in visible_execution_entries:
                 if not isinstance(e, dict):
                     continue
                 try:
@@ -4746,8 +5052,19 @@ class StrataGuiApp:
                 lines.append(f"Unrealized PnL (Display): {udtxt}")
             lines.append("")
             if isinstance(entries, list) and entries:
-                df = pd.DataFrame(entries[-200:])
-                lines.append(df.to_string(index=False))
+                display_entries = []
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    if bool(e.get("is_execution", False)) and bool(e.get("is_placeholder", False)):
+                        continue
+                    display_entries.append(e)
+                if display_entries:
+                    df = pd.DataFrame(display_entries[-200:])
+                    df = self._humanize_df_timestamps(df, ["ts", "entry_ts", "exit_ts"])
+                    lines.append(df.to_string(index=False))
+                else:
+                    lines.append("No non-placeholder ledger entries yet.")
             else:
                 lines.append("No ledger entries yet.")
             self.pf_ledger_text.insert("1.0", "\n".join(lines))
@@ -4757,6 +5074,7 @@ class StrataGuiApp:
             self.pf_signal_text.delete("1.0", tk.END)
             if signal_entries:
                 sig_df = pd.DataFrame(signal_entries[-200:])
+                sig_df = self._humanize_df_timestamps(sig_df, ["ts", "entry_ts", "exit_ts"])
                 self.pf_signal_text.insert("1.0", sig_df.to_string(index=False))
             else:
                 self.pf_signal_text.insert("1.0", "No signal-only entries.")
@@ -4764,8 +5082,9 @@ class StrataGuiApp:
 
         if hasattr(self, "pf_execution_text"):
             self.pf_execution_text.delete("1.0", tk.END)
-            if execution_entries:
-                exe_df = pd.DataFrame(execution_entries[-200:])
+            if visible_execution_entries:
+                exe_df = pd.DataFrame(visible_execution_entries[-200:])
+                exe_df = self._humanize_df_timestamps(exe_df, ["ts", "entry_ts", "exit_ts"])
                 for col in ["pnl_pct", "pnl_quote", "pnl_display"]:
                     if col not in exe_df.columns:
                         exe_df[col] = ""
@@ -5226,6 +5545,15 @@ class StrataGuiApp:
                 )
             except Exception:
                 self.state["agent_guard_max_exposure_pct"] = 40.0
+        if hasattr(self, "pf_auto_refresh_var"):
+            self.state["portfolio_auto_refresh_enabled"] = bool(self.pf_auto_refresh_var.get())
+        if hasattr(self, "pf_auto_refresh_secs_var"):
+            try:
+                self.state["portfolio_auto_refresh_seconds"] = max(
+                    10, int((self.pf_auto_refresh_secs_var.get() or "45").strip())
+                )
+            except Exception:
+                self.state["portfolio_auto_refresh_seconds"] = 45
         self.state["auto_refresh_seconds"] = int(self.refresh_secs_var.get().strip() or "120")
         mode_var = getattr(self, "parallel_mode_var", None)
         jobs_var = getattr(self, "parallel_jobs_var", None)
@@ -5247,6 +5575,7 @@ def run_gui() -> None:
     def _shutdown():
         app._stop_pipeline_scheduler()
         app._stop_protection_monitor()
+        app._stop_portfolio_auto_refresh()
         app._close_task_monitor()
         if app.task_tab_job:
             try:
