@@ -521,7 +521,7 @@ class StrataGuiApp:
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
         ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
 
-        pending_frame = ttk.LabelFrame(self.portfolio_tab, text="Pending Recommendations (Review & Approve)", padding=8)
+        pending_frame = ttk.LabelFrame(body, text="Pending Recommendations (Review & Approve)", padding=8)
         pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
@@ -564,7 +564,7 @@ class StrataGuiApp:
         ttk.Button(pending_btns_row2, text="Remove Selected", command=self._remove_selected_pending_orders).pack(side="left", padx=6)
         ttk.Button(pending_btns_row2, text="Clear All", command=self._clear_pending_recommendations).pack(side="left")
 
-        manual = ttk.LabelFrame(self.portfolio_tab, text="Manual Ledger Event", padding=8)
+        manual = ttk.LabelFrame(body, text="Manual Ledger Event", padding=8)
         manual.pack(fill="x", padx=8, pady=(0, 8))
         self._labeled_entry(manual, "Asset", self.pf_manual_asset_var)
         self._labeled_combo(manual, "Action", self.pf_manual_action_var, ["BUY", "SELL", "HOLD"], state="readonly")
@@ -574,7 +574,7 @@ class StrataGuiApp:
         self._labeled_entry(manual, "Note", self.pf_manual_note_var)
         ttk.Button(manual, text="Add Manual Event", command=self._add_manual_ledger_event).pack(fill="x", pady=(6, 0))
 
-        orders = ttk.LabelFrame(self.portfolio_tab, text="Open Binance Orders (Cancel via GUI)", padding=8)
+        orders = ttk.LabelFrame(body, text="Open Binance Orders (Cancel via GUI)", padding=8)
         orders.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         order_top = ttk.Frame(orders)
         order_top.pack(fill="x")
