@@ -350,6 +350,16 @@ def detect_cuda_backend() -> Tuple[bool, str, Optional[object]]:
 
 
 def ensure_table() -> None:
+    # SQLite tuning for better concurrent read/write responsiveness in GUI + workers.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-8000")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_data'")
     exists = cur.fetchone() is not None
     if not exists:
@@ -368,11 +378,16 @@ def ensure_table() -> None:
             )
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_tf_date ON price_data (timeframe, date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_ticker_date ON price_data (ticker, date)")
         conn.commit()
         return
 
     cols = [r[1] for r in conn.execute("PRAGMA table_info(price_data)").fetchall()]
     if "timeframe" in cols:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_tf_date ON price_data (timeframe, date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_ticker_date ON price_data (ticker, date)")
+        conn.commit()
         return
 
     conn.execute("ALTER TABLE price_data RENAME TO price_data_old")
@@ -398,6 +413,8 @@ def ensure_table() -> None:
         FROM price_data_old
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_tf_date ON price_data (timeframe, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_data_ticker_date ON price_data (ticker, date)")
     conn.execute("DROP TABLE price_data_old")
     conn.commit()
 

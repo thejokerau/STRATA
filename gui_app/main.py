@@ -1,4 +1,5 @@
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, asdict
@@ -92,6 +93,10 @@ class StrataGuiApp:
         self._running_tasks: Dict[int, str] = {}
         self.task_queue = deque()
         self.queue_paused = False
+        self._task_meta: Dict[int, Dict[str, Any]] = {}
+        self._task_history: deque = deque(maxlen=200)
+        self._last_running_snapshot: List[str] = []
+        self._last_queued_snapshot: List[str] = []
         self.ai_last_source_text = ""
         self.ai_conversation: List[Dict[str, str]] = []
         self.latest_live_output_text = ""
@@ -561,8 +566,8 @@ class StrataGuiApp:
         ttk.Combobox(
             pending_btns_row1,
             textvariable=self.pf_pending_type_var,
-            values=["MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"],
-            width=16,
+            values=["MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "OCO_BRACKET"],
+            width=18,
             state="readonly",
         ).pack(side="left", padx=4)
         ttk.Button(pending_btns_row1, text="Apply to Selected", command=self._apply_pending_edit_to_selected).pack(side="left", padx=6)
@@ -882,6 +887,35 @@ class StrataGuiApp:
         xbar.grid(row=1, column=0, sticky="ew")
         self._install_tree_bindings(tree)
         return frame, tree
+
+    def _sync_tree_rows(self, tree: ttk.Treeview, rows_by_iid: Dict[str, Tuple[Any, ...]]) -> None:
+        try:
+            existing = set(tree.get_children())
+        except Exception:
+            existing = set()
+        desired = set(rows_by_iid.keys())
+        for iid in (existing - desired):
+            try:
+                tree.delete(iid)
+            except Exception:
+                pass
+        for iid, vals in rows_by_iid.items():
+            if iid in existing:
+                try:
+                    cur = tuple(tree.item(iid, "values"))
+                except Exception:
+                    cur = ()
+                if cur != tuple(vals):
+                    try:
+                        tree.item(iid, values=vals)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    tree.insert("", "end", iid=iid, values=vals)
+                except Exception:
+                    # Fallback for invalid iid values.
+                    tree.insert("", "end", values=vals)
 
     def _install_text_console_bindings(self, text: tk.Text) -> None:
         menu = tk.Menu(text, tearoff=0)
@@ -1275,6 +1309,11 @@ class StrataGuiApp:
             self._task_id_seq += 1
             task_id = int(self._task_id_seq)
             self._running_tasks[task_id] = task_name or "Task"
+            self._task_meta[task_id] = {
+                "name": task_name or "Task",
+                "started_at": time.time(),
+                "started_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
         else:
             task_id = None
             # Backward-compatible no-op return var for non-start calls.
@@ -1316,6 +1355,18 @@ class StrataGuiApp:
         return task_id
 
     def _finish_task(self, task_id: Optional[int], task_name: str = "") -> None:
+        finished_name = task_name or "Task"
+        duration_sec: Optional[float] = None
+        started_ts: str = ""
+        if task_id is not None and task_id in self._task_meta:
+            meta = self._task_meta.pop(task_id, {})
+            try:
+                duration_sec = max(0.0, time.time() - float(meta.get("started_at", time.time())))
+            except Exception:
+                duration_sec = None
+            started_ts = str(meta.get("started_ts", "") or "")
+            if str(meta.get("name", "")).strip():
+                finished_name = str(meta.get("name", "")).strip()
         if task_id is not None and task_id in self._running_tasks:
             del self._running_tasks[task_id]
         elif task_name:
@@ -1327,6 +1378,17 @@ class StrataGuiApp:
             # Fallback: remove oldest active task.
             oldest = sorted(self._running_tasks.keys())[0]
             del self._running_tasks[oldest]
+        if duration_sec is not None:
+            rec = {
+                "name": finished_name,
+                "duration_sec": round(float(duration_sec), 3),
+                "finished_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "started_ts": started_ts,
+            }
+            self._task_history.append(rec)
+            self._append_task_terminal(
+                f"TASK METRIC name={rec['name']} duration={rec['duration_sec']:.3f}s started={rec['started_ts'] or 'n/a'}"
+            )
         self._set_busy(False, task_name=task_name)
 
     def _update_run_controls_and_status(self) -> None:
@@ -1394,11 +1456,19 @@ class StrataGuiApp:
         lines: List[str] = []
         lines.append(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f"Running slots: {self.running_tasks}/{self._task_limit()}")
+        if self._task_history:
+            recent = list(self._task_history)[-10:]
+            avg = sum([float(x.get("duration_sec", 0.0) or 0.0) for x in recent]) / float(len(recent))
+            lines.append(f"Recent (last {len(recent)}) avg duration: {avg:.2f}s")
+        else:
+            lines.append("Recent durations: n/a")
         lines.append("")
         lines.append("Current Running Tasks:")
-        if running:
-            for i, name in enumerate(running, 1):
-                lines.append(f"{i}. {name}")
+        if running and self._running_tasks:
+            for i, (tid, name) in enumerate(sorted(self._running_tasks.items()), 1):
+                meta = self._task_meta.get(int(tid), {}) if isinstance(tid, int) else {}
+                started = str(meta.get("started_ts", "") or "")
+                lines.append(f"{i}. #{tid} {name}" + (f" (started {started})" if started else ""))
         else:
             lines.append("None")
         lines.append("")
@@ -1406,6 +1476,16 @@ class StrataGuiApp:
         if queued:
             for i, name in enumerate(queued, 1):
                 lines.append(f"{i}. {name}")
+        else:
+            lines.append("None")
+        lines.append("")
+        lines.append("Recent Completed Tasks:")
+        if self._task_history:
+            for rec in list(self._task_history)[-10:]:
+                nm = str(rec.get("name", "Task"))
+                dur = float(rec.get("duration_sec", 0.0) or 0.0)
+                fin = str(rec.get("finished_ts", "") or "")
+                lines.append(f"- {nm}: {dur:.3f}s ({fin})")
         else:
             lines.append("None")
         if self.task_monitor_text is not None:
@@ -1433,21 +1513,71 @@ class StrataGuiApp:
     def _refresh_task_tab(self) -> None:
         if not hasattr(self, "running_list") or not hasattr(self, "queued_list"):
             return
-        self.running_list.delete(0, tk.END)
-        for i, name in enumerate(self.running_task_names, 1):
-            self.running_list.insert(tk.END, f"{i}. {name}")
-        self.queued_list.delete(0, tk.END)
-        for i, item in enumerate(list(self.task_queue), 1):
-            qname = str(item[0])
-            self.queued_list.insert(tk.END, f"{i}. {qname}")
+        running_lines = [f"{i}. {name}" for i, name in enumerate(self.running_task_names, 1)]
+        queued_lines = [f"{i}. {str(item[0])}" for i, item in enumerate(list(self.task_queue), 1)]
+        if running_lines != self._last_running_snapshot:
+            self.running_list.delete(0, tk.END)
+            for line in running_lines:
+                self.running_list.insert(tk.END, line)
+            self._last_running_snapshot = list(running_lines)
+        if queued_lines != self._last_queued_snapshot:
+            self.queued_list.delete(0, tk.END)
+            for line in queued_lines:
+                self.queued_list.insert(tk.END, line)
+            self._last_queued_snapshot = list(queued_lines)
         if hasattr(self, "btn_pause_queue"):
             self.btn_pause_queue.configure(text="Resume Queue" if self.queue_paused else "Pause Queue")
         if hasattr(self, "task_tab_output"):
             self.task_tab_output.delete("1.0", tk.END)
+            recent = list(self._task_history)[-5:]
+            avg = 0.0
+            if recent:
+                avg = sum([float(x.get("duration_sec", 0.0) or 0.0) for x in recent]) / float(len(recent))
             self.task_tab_output.insert(
                 "1.0",
-                f"Running: {self.running_tasks}/{self._task_limit()} | Queued: {len(self.task_queue)} | Queue paused: {self.queue_paused}",
+                (
+                    f"Running: {self.running_tasks}/{self._task_limit()} | Queued: {len(self.task_queue)} | Queue paused: {self.queue_paused}\n"
+                    f"Recent tasks tracked: {len(self._task_history)} | Last-5 avg duration: {avg:.2f}s"
+                ),
             )
+
+    def _log_bridge_perf(self, label: str, res: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(res, dict):
+            return
+        perf = res.get("perf", {})
+        if not isinstance(perf, dict) or not perf:
+            return
+        try:
+            ordered = []
+            for k in sorted(perf.keys()):
+                v = perf.get(k)
+                if isinstance(v, float):
+                    ordered.append(f"{k}={v:.4f}")
+                else:
+                    ordered.append(f"{k}={v}")
+            self._append_task_terminal(f"PERF {label}: " + ", ".join(ordered))
+        except Exception:
+            pass
+
+    def _perf_line_from_result(self, label: str, res: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(res, dict):
+            return ""
+        perf = res.get("perf", {})
+        if not isinstance(perf, dict) or not perf:
+            return ""
+        try:
+            parts = []
+            for k in sorted(perf.keys()):
+                v = perf.get(k)
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.4f}")
+                else:
+                    parts.append(f"{k}={v}")
+            if not parts:
+                return ""
+            return f"PERF {label}: " + ", ".join(parts)
+        except Exception:
+            return ""
 
     def _append_task_terminal(self, line: str) -> None:
         if not hasattr(self, "task_terminal"):
@@ -1591,6 +1721,14 @@ class StrataGuiApp:
             for p in self.live_panels:
                 cfg = asdict(p)
                 cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+                try:
+                    live_workers = max(
+                        1,
+                        int((self.parallel_jobs_var.get() or "2").strip()),
+                    ) if bool(self.parallel_mode_var.get()) else 1
+                except Exception:
+                    live_workers = 1
+                cfg["cache_workers"] = live_workers
                 if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
                     cfg["quote_currency"] = self._primary_quote_asset()
                 self._append_task_terminal_from_worker(
@@ -1600,6 +1738,9 @@ class StrataGuiApp:
                 log = (res.get("log", "") or "").strip()
                 if log:
                     self._append_task_terminal_from_worker(f"LOG [{p.name}] {log[:4000]}")
+                pl = self._perf_line_from_result(f"Live[{p.name}]", res)
+                if pl:
+                    self._append_task_terminal_from_worker(pl)
                 if not res.get("ok"):
                     chunks.append(f"=== {p.name} ===\nERROR: {res.get('error', 'unknown')}\n")
                     self._append_task_terminal_from_worker(f"VERBOSE Live panel failed: {p.name} -> {res.get('error', 'unknown')}")
@@ -1649,6 +1790,14 @@ class StrataGuiApp:
             bridge = self._bridge_for_task()
             cfg = asdict(panel)
             cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+            try:
+                live_workers = max(
+                    1,
+                    int((self.parallel_jobs_var.get() or "2").strip()),
+                ) if bool(self.parallel_mode_var.get()) else 1
+            except Exception:
+                live_workers = 1
+            cfg["cache_workers"] = live_workers
             if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
                 cfg["quote_currency"] = self._primary_quote_asset()
             self._append_task_terminal_from_worker(
@@ -1658,6 +1807,9 @@ class StrataGuiApp:
             log = (res.get("log", "") or "").strip()
             if log:
                 self._append_task_terminal_from_worker(f"LOG [{panel.name}] {log[:4000]}")
+            pl = self._perf_line_from_result(f"Live[{panel.name}]", res)
+            if pl:
+                self._append_task_terminal_from_worker(pl)
             if not res.get("ok"):
                 out = f"ERROR: {res.get('error', 'unknown')}"
             else:
@@ -1787,6 +1939,9 @@ class StrataGuiApp:
             log = (res.get("log", "") or "").strip()
             if log:
                 self._append_task_terminal_from_worker(f"LOG [Backtest] {log[:6000]}")
+            pl = self._perf_line_from_result("Backtest", res)
+            if pl:
+                self._append_task_terminal_from_worker(pl)
             self.root.after(0, lambda: self._finish_backtest_output(res, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2677,7 +2832,25 @@ class StrataGuiApp:
             if not out.get("ok"):
                 return {"ok": False, "error": str(out.get("error", "Submit failed."))}
             stop_msg = "No protective stop requested."
-            if sl > 0:
+            try:
+                tp_pct_agent = float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0
+            except Exception:
+                tp_pct_agent = 20.0
+            tp_agent = px * (1.0 + (max(0.0, tp_pct_agent) / 100.0)) if (px > 0 and tp_pct_agent > 0) else 0.0
+            if sl > 0 and tp_agent > 0:
+                oco_out = bridge.submit_binance_oco_sell(
+                    symbol=symbol,
+                    quantity=float(out.get("normalized_quantity", nq) or nq),
+                    take_profit_price=tp_agent,
+                    stop_price=sl,
+                    stop_limit_price=(sl * 0.995),
+                    profile_name=profile,
+                )
+                if oco_out.get("ok"):
+                    stop_msg = f"Protective OCO set (TP {tp_agent:.8f}, SL {sl:.8f})."
+                else:
+                    stop_msg = f"OCO placement failed: {oco_out.get('error', 'unknown')}. Falling back to stop-only."
+            if sl > 0 and ("Protective OCO set" not in stop_msg):
                 stop_limit = sl * 0.995
                 stop_out = bridge.submit_binance_order(
                     symbol=symbol,
@@ -2775,6 +2948,9 @@ class StrataGuiApp:
             log = (res.get("log", "") or "").strip()
             if log:
                 self._append_task_terminal_from_worker(f"LOG [AI] {log[:6000]}")
+            pl = self._perf_line_from_result("AI", res)
+            if pl:
+                self._append_task_terminal_from_worker(pl)
             self.root.after(0, lambda: self._finish_ai_output(res, task_id))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2808,9 +2984,20 @@ class StrataGuiApp:
             for p in self.live_panels:
                 cfg = asdict(p)
                 cfg["display_currency"] = self.display_currency_var.get().strip() or "USD"
+                try:
+                    live_workers = max(
+                        1,
+                        int((self.parallel_jobs_var.get() or "2").strip()),
+                    ) if bool(self.parallel_mode_var.get()) else 1
+                except Exception:
+                    live_workers = 1
+                cfg["cache_workers"] = live_workers
                 if str(cfg.get("market", "crypto")).strip().lower() == "crypto" and self._is_primary_quote_locked():
                     cfg["quote_currency"] = self._primary_quote_asset()
                 res = bridge.run_live_panel(cfg)
+                pl_live = self._perf_line_from_result(f"PipelineLive[{p.name}]", res)
+                if pl_live:
+                    self._append_task_terminal_from_worker(pl_live)
                 if not res.get("ok"):
                     self._append_task_terminal_from_worker(f"LOG [Pipeline Live] {p.name} failed: {res.get('error', 'unknown')}")
                     continue
@@ -2900,6 +3087,9 @@ class StrataGuiApp:
                     "display_currency": self.display_currency_var.get() or "USD",
                 }
                 bt_res = bridge.run_backtest(bt_cfg)
+                pl_bt = self._perf_line_from_result(f"PipelineBT[{mkt}:{tf}]", bt_res)
+                if pl_bt:
+                    self._append_task_terminal_from_worker(pl_bt)
                 if not bt_res.get("ok"):
                     targeted_parts.append(f"## {mkt.upper()} {tf} (assets={len(tks)})\nBACKTEST ERROR: {bt_res.get('error', 'unknown')}\n")
                 else:
@@ -2928,6 +3118,9 @@ class StrataGuiApp:
             dt = self.ai_datetime.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             prompt = self._build_ai_prompt(combined_source, dt)
             ai_res = bridge.run_ai_analysis(combined_source, dt, prompt_override=prompt)
+            pl_ai = self._perf_line_from_result("PipelineAI", ai_res)
+            if pl_ai:
+                self._append_task_terminal_from_worker(pl_ai)
             ai_res["combined_source"] = combined_source
             self.root.after(0, lambda: self._finish_live_backtest_ai_pipeline(ai_res, task_id, task_name))
 
@@ -3314,7 +3507,7 @@ class StrataGuiApp:
             seen.add(key)
 
             order_type = str(tr.get("order_type", "MARKET") or "MARKET").strip().upper()
-            if order_type not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
+            if order_type not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "OCO_BRACKET"):
                 order_type = "MARKET"
             timeframe = str(tr.get("timeframe", "") or "").strip().lower() or (self.timeframe_var.get().strip() or "1d")
             confidence = str(tr.get("confidence", "") or "").strip()
@@ -3508,26 +3701,23 @@ class StrataGuiApp:
     def _refresh_pending_recommendations_view(self) -> None:
         if not hasattr(self, "pending_tree"):
             return
-        self.pending_tree.delete(*self.pending_tree.get_children())
+        rows_by_iid: Dict[str, Tuple[Any, ...]] = {}
         for r in self.pending_recommendations:
-            self.pending_tree.insert(
-                "",
-                "end",
-                iid=str(r.get("id", "")),
-                values=(
-                    r.get("id", ""),
-                    r.get("symbol", ""),
-                    r.get("side", ""),
-                    r.get("order_type", "MARKET"),
-                    r.get("quantity", 0),
-                    r.get("stop_loss_price", ""),
-                    r.get("take_profit_price", ""),
-                    r.get("timeframe", ""),
-                    r.get("confidence", ""),
-                    r.get("status", "PENDING"),
-                    r.get("reason", ""),
-                ),
+            iid = str(r.get("id", ""))
+            rows_by_iid[iid] = (
+                r.get("id", ""),
+                r.get("symbol", ""),
+                r.get("side", ""),
+                r.get("order_type", "MARKET"),
+                r.get("quantity", 0),
+                r.get("stop_loss_price", ""),
+                r.get("take_profit_price", ""),
+                r.get("timeframe", ""),
+                r.get("confidence", ""),
+                r.get("status", "PENDING"),
+                r.get("reason", ""),
             )
+        self._sync_tree_rows(self.pending_tree, rows_by_iid)
 
     def _apply_bt_risk_defaults_to_recommendations(self, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not isinstance(recs, list) or not recs:
@@ -3843,10 +4033,11 @@ class StrataGuiApp:
                     rec["reason"] = f"No available {base} balance to auto-size SELL."
                     continue
 
+            validate_type = "MARKET" if otype == "OCO_BRACKET" else otype
             v = self.bridge.validate_binance_order(
                 symbol=symbol,
                 side=side,
-                order_type=otype,
+                order_type=validate_type,
                 quantity=qty_guess,
                 profile_name=profile,
             )
@@ -3979,6 +4170,98 @@ class StrataGuiApp:
             self._vlog(f"Submitting order: symbol={symbol} side={side} type={order_type} qty={qty}")
             price_arg = None
             stop_arg = None
+            tp_arg = None
+            if order_type == "OCO_BRACKET":
+                if side != "SELL":
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = "OCO_BRACKET currently supports SELL protective orders only."
+                    blocked += 1
+                    continue
+                try:
+                    stop_arg = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                except Exception:
+                    stop_arg = 0.0
+                try:
+                    tp_arg = float(rec.get("take_profit_price", 0.0) or 0.0)
+                except Exception:
+                    tp_arg = 0.0
+                try:
+                    price_arg = float(rec.get("limit_price", 0.0) or 0.0)
+                except Exception:
+                    price_arg = 0.0
+                if stop_arg <= 0 or tp_arg <= 0:
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = "OCO_BRACKET requires both stop_loss_price and take_profit_price > 0."
+                    blocked += 1
+                    continue
+                if not price_arg or price_arg <= 0:
+                    price_arg = float(stop_arg) * 0.995
+                if bool(rec.get("replace_existing_stop", False)) or bool(rec.get("replace_existing_take_profit", False)):
+                    oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
+                    if oo.get("ok"):
+                        for od in oo.get("orders", []) or []:
+                            if not isinstance(od, dict):
+                                continue
+                            o_side = str(od.get("side", "")).upper()
+                            o_type = str(od.get("type", "")).upper()
+                            o_status = str(od.get("status", "")).upper()
+                            if o_side != "SELL" or o_status not in ("NEW", "PARTIALLY_FILLED"):
+                                continue
+                            if o_type not in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET", "LIMIT"):
+                                continue
+                            try:
+                                oid = int(od.get("orderId", 0) or 0)
+                            except Exception:
+                                oid = 0
+                            if oid > 0:
+                                self.bridge.cancel_binance_order(symbol=symbol, order_id=oid, profile_name=profile)
+                                self._vlog(f"Canceled existing protective order before OCO replace: {symbol} oid={oid}")
+                out = self.bridge.submit_binance_oco_sell(
+                    symbol=symbol,
+                    quantity=qty,
+                    take_profit_price=tp_arg,
+                    stop_price=stop_arg,
+                    stop_limit_price=price_arg,
+                    profile_name=profile,
+                )
+                if not out.get("ok"):
+                    rec["status"] = "FAILED"
+                    rec["reason"] = str(out.get("error", "OCO submit failed"))
+                    self._vlog(f"OCO submit failed: symbol={symbol} error={rec['reason']}")
+                    failed += 1
+                    continue
+                rec["status"] = "SUBMITTED"
+                nq = out.get("normalized_quantity", None)
+                if nq is not None:
+                    rec["quantity"] = float(nq)
+                rec["reason"] = (
+                    str(rec.get("reason", "") or "")
+                    + f" | OCO set TP @{float(out.get('normalized_take_profit_price', tp_arg) or tp_arg):.8f}"
+                    + f" / SL @{float(out.get('normalized_stop_price', stop_arg) or stop_arg):.8f}"
+                ).strip(" |")
+                submitted += 1
+                lg = self.bridge.record_signal_event(
+                    {
+                        "market": "crypto",
+                        "timeframe": "spot",
+                        "panel": "ai_trade_queue",
+                        "asset": self._base_asset_from_symbol(symbol),
+                        "action": side,
+                        "qty": float(out.get("normalized_quantity", qty) or qty),
+                        "price": 0.0,
+                        "quote_currency": self._quote_asset_from_symbol(symbol),
+                        "display_currency": self.display_currency_var.get().strip() or "USD",
+                        "note": f"Submitted Binance OCO ({symbol})",
+                        "is_execution": True,
+                        "is_placeholder": True,
+                        "exchange_symbol": symbol,
+                        "exchange_order_id": int((out.get("data", {}) or {}).get("orderListId", 0) or 0),
+                    },
+                    allow_duplicate=True,
+                )
+                if not lg.get("ok"):
+                    self._vlog(f"OCO ledger placeholder write issue: {lg.get('error', 'unknown')}")
+                continue
             if order_type in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 try:
                     if order_type == "STOP_LOSS_LIMIT":
@@ -4124,7 +4407,39 @@ class StrataGuiApp:
                     sl = float(rec.get("stop_loss_price", 0.0) or 0.0)
                 except Exception:
                     sl = 0.0
-                if sl > 0:
+                if sl > 0 and float(rec.get("take_profit_price", 0.0) or 0.0) > 0:
+                    try:
+                        tp = float(rec.get("take_profit_price", 0.0) or 0.0)
+                    except Exception:
+                        tp = 0.0
+                    if tp > 0:
+                        oco_out = self.bridge.submit_binance_oco_sell(
+                            symbol=symbol,
+                            quantity=float(out.get("normalized_quantity", qty) or qty),
+                            take_profit_price=tp,
+                            stop_price=sl,
+                            stop_limit_price=(sl * 0.995),
+                            profile_name=profile,
+                        )
+                        if oco_out.get("ok"):
+                            rec["reason"] = (
+                                str(rec.get("reason", "") or "")
+                                + f" | protective OCO set TP @{tp:.8f} / SL @{sl:.8f}"
+                            ).strip(" |")
+                            self._vlog(f"Protective OCO placed: {symbol} tp={tp:.8f} stop={sl:.8f}")
+                        else:
+                            rec["reason"] = (
+                                str(rec.get("reason", "") or "")
+                                + f" | OCO set failed: {oco_out.get('error', 'unknown')} (falling back to separate orders)"
+                            ).strip(" |")
+                            self._vlog(f"Protective OCO failed: {symbol} err={oco_out.get('error', 'unknown')}")
+                            # Fallback to existing separate stop/tp placement logic below.
+                            tp = 0.0
+                    else:
+                        tp = 0.0
+                else:
+                    tp = 0.0
+                if sl > 0 and tp <= 0:
                     # Tighten-only guard for auto protective placement after BUY:
                     # if a stronger (higher) protective stop already exists, keep it.
                     try:
@@ -4176,11 +4491,12 @@ class StrataGuiApp:
                     else:
                         rec["reason"] = (str(rec.get("reason", "") or "") + f" | stop set failed: {stop_out.get('error', 'unknown')}").strip(" |")
                         self._vlog(f"Protective stop failed: {symbol} err={stop_out.get('error', 'unknown')}")
-                try:
-                    tp = float(rec.get("take_profit_price", 0.0) or 0.0)
-                except Exception:
-                    tp = 0.0
-                if tp > 0:
+                if tp <= 0:
+                    try:
+                        tp = float(rec.get("take_profit_price", 0.0) or 0.0)
+                    except Exception:
+                        tp = 0.0
+                if tp > 0 and sl <= 0:
                     tp_limit = tp * 0.999
                     tp_out = self.bridge.submit_binance_order(
                         symbol=symbol,
@@ -4237,26 +4553,24 @@ class StrataGuiApp:
         out = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol_filter)
         if not hasattr(self, "open_orders_tree"):
             return
-        self.open_orders_tree.delete(*self.open_orders_tree.get_children())
         if not out.get("ok"):
             self._append_task_terminal(f"Open orders refresh failed: {out.get('error', 'unknown')}")
             messagebox.showerror("Open Orders", str(out.get("error", "Failed to fetch open orders.")))
             return
+        rows_by_iid: Dict[str, Tuple[Any, ...]] = {}
         for o in out.get("orders", []) or []:
-            self.open_orders_tree.insert(
-                "",
-                "end",
-                values=(
-                    o.get("symbol", ""),
-                    o.get("orderId", ""),
-                    o.get("side", ""),
-                    o.get("type", ""),
-                    o.get("status", ""),
-                    o.get("price", ""),
-                    o.get("origQty", ""),
-                    o.get("executedQty", ""),
-                ),
+            iid = f"{o.get('symbol','')}:{o.get('orderId','')}"
+            rows_by_iid[iid] = (
+                o.get("symbol", ""),
+                o.get("orderId", ""),
+                o.get("side", ""),
+                o.get("type", ""),
+                o.get("status", ""),
+                o.get("price", ""),
+                o.get("origQty", ""),
+                o.get("executedQty", ""),
             )
+        self._sync_tree_rows(self.open_orders_tree, rows_by_iid)
         self._append_task_terminal(f"Open orders refreshed ({len(out.get('orders', []) or [])} rows).")
 
     def _reconcile_binance_fills(self) -> None:
@@ -4574,7 +4888,7 @@ class StrataGuiApp:
             reason = str(plan.get("reason", "Protection recommendation") or "Protection recommendation").strip()
             if trailing_pct > 0:
                 reason += f" | trailing suggested {trailing_pct:.2f}% (implemented as fixed stop for compatibility)"
-            if action in ("SET_STOP", "SET_TRAILING", "SET_BOTH"):
+            if action in ("SET_STOP", "SET_TRAILING"):
                 staged_recs.append(
                     {
                         "symbol": symbol,
@@ -4593,7 +4907,7 @@ class StrataGuiApp:
                         "protection_mode": action,
                     }
                 )
-            if action in ("SET_TAKE_PROFIT", "SET_BOTH"):
+            if action in ("SET_TAKE_PROFIT",):
                 tp_price = last_price * (1.0 + (take_profit_pct / 100.0))
                 tp_limit = tp_price * 0.999
                 staged_recs.append(
@@ -4610,6 +4924,29 @@ class StrataGuiApp:
                         "confidence": str(plan.get("confidence", "") or ""),
                         "status": "PENDING",
                         "reason": (reason + f" | take-profit {take_profit_pct:.2f}%").strip(),
+                        "replace_existing_take_profit": True,
+                        "protection_mode": action,
+                    }
+                )
+            if action == "SET_BOTH":
+                tp_price = last_price * (1.0 + (take_profit_pct / 100.0))
+                tp_limit = tp_price * 0.999
+                staged_recs.append(
+                    {
+                        "symbol": symbol,
+                        "asset": self._base_asset_from_symbol(symbol),
+                        "side": "SELL",
+                        "order_type": "OCO_BRACKET",
+                        "quantity": qty,
+                        "stop_loss_price": round(stop_price, 8),
+                        "take_profit_price": round(tp_price, 8),
+                        "limit_price": round((limit_price if limit_price > 0 else (stop_price * 0.995)), 8),
+                        "take_profit_limit_price": round(tp_limit, 8),
+                        "timeframe": str(pos.get("timeframe", "4h")),
+                        "confidence": str(plan.get("confidence", "") or ""),
+                        "status": "PENDING",
+                        "reason": (reason + f" | OCO bracket TP {take_profit_pct:.2f}%").strip(),
+                        "replace_existing_stop": True,
                         "replace_existing_take_profit": True,
                         "protection_mode": action,
                     }

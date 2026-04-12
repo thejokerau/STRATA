@@ -102,6 +102,12 @@ For `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` pending orders:
 - uses `limit_price` when provided; otherwise derives from trigger
 - can cancel existing open protective stop orders before replacement
 
+For `OCO_BRACKET` pending orders:
+
+- requires both `stop_loss_price` and `take_profit_price`
+- submits Binance `/api/v3/order/oco` as linked protective bracket
+- replacement mode cancels prior protective SELL orders before OCO placement
+
 ## 6. Protection Workflow Design
 
 ## 6.1 Manual Protection Run
@@ -134,6 +140,40 @@ Current execution mapping:
 Protection run executes in background thread via task queue:
 
 - avoids UI freeze / "Not Responding" perception.
+
+## 7. Performance Architecture
+
+### 7.1 Shared Engine Caches
+
+`EngineBridge` now uses short-lived in-memory caches to reduce repeated work:
+
+- raw data cache (ticker/timeframe/lookback key),
+- indicator cache (symbol-set + timeframe key),
+- live/backtest result cache (request signature key).
+
+This improves repeated refresh/pipeline responsiveness while preserving bounded staleness with TTL.
+
+### 7.2 Incremental UI Updates
+
+Pending recommendations and open-order tables now use row upsert/sync (update changed rows, remove stale rows) instead of full clear/reinsert each refresh.
+
+### 7.3 Runtime Profiling
+
+Task runtime profiling is captured and exposed in GUI:
+
+- per-task start time and completion duration,
+- recent-duration rolling average in Task Monitor,
+- stage-level `PERF ...` logs in task terminal for Live/Backtest/AI calls.
+
+### 7.4 SQLite Tuning
+
+Nightly data cache DB setup now applies:
+
+- `WAL` journal mode,
+- `synchronous=NORMAL`,
+- memory temp store,
+- cache-size hint and busy timeout,
+- supporting indexes on `(timeframe, date)` and `(ticker, date)`.
 - emits task terminal progress and completion logs.
 
 ## 6.3 Protection Monitor

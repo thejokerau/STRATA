@@ -222,11 +222,13 @@ GUI Portfolio & Ledger:
     - final quantity is validated/normalized against Binance symbol filters before submit
   - direct import of AI-interpreted signals into pending queue (with optional ledger logging)
   - open Binance order list + cancel selected orders from GUI
+  - incremental table refresh for pending recommendations/open orders (reduces redraw churn)
   - execution modes: `manual`, `semi_auto`, `full_auto` (mode-controlled behavior)
   - optional protective order placement on BUY execution:
     - if AI structured recommendation includes `invalidation`/`stop_loss_price`, GUI stores it
     - if AI/backtest context provides take-profit levels, GUI also stores `take_profit_price`
-    - submit flow attempts protective `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` SELL orders after BUY fill
+    - when both stop and take-profit are present, submit flow now prefers Binance `OCO` SELL bracket (TP + SL linked)
+    - if OCO fails, workflow falls back to separate protective order placement
   - Binance pre-submit order validation against exchange filters:
     - quantity step size / min-max qty
     - limit-price tick size / min-max price
@@ -235,6 +237,19 @@ GUI Portfolio & Ledger:
   - ledger open-position safety:
     - only execution-grade events (`is_execution=true` with non-zero qty) create/close open positions
     - signal-only entries (e.g., AI interpretation/imported signals) are kept in history but do not pollute open positions
+
+Performance & Profiling:
+
+- Engine bridge now reuses short-lived in-memory caches for:
+  - fetched raw market data
+  - indicator cache outputs
+  - live/backtest result payloads
+- Shared data-loading paths reduce duplicate work between Live, Backtest, and pipeline runs.
+- Task Monitor now shows:
+  - running task IDs + start timestamps
+  - recent completed-task durations
+  - rolling recent average duration
+- Task terminal emits `PERF ...` lines for Live/Backtest/AI pipeline stages.
     - invalid legacy zero-qty open positions are auto-cleaned on ledger read
   - ledger views now split into:
     - `Overall`
