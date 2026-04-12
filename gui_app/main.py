@@ -470,16 +470,10 @@ class StrataGuiApp:
         ttk.Button(btns, text="Show Agent Status", command=self._show_agent_status).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
-        split = self._create_paned(self.portfolio_tab, orient="vertical")
-        top = ttk.Frame(split, padding=8)
-        body = ttk.Frame(split, padding=8)
-        split.add(top, weight=1)
-        split.add(body, weight=4)
-        body_split = self._create_paned(body, orient="vertical")
-        upper = ttk.Frame(body_split)
-        lower = ttk.Frame(body_split)
-        body_split.add(upper, weight=3)
-        body_split.add(lower, weight=4)
+        top = ttk.Frame(self.portfolio_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.portfolio_tab, padding=8)
+        body.pack(fill="both", expand=True)
 
         self.pf_binance_profile_var = tk.StringVar(value="")
         self.pf_exec_mode_var = tk.StringVar(value="semi_auto")
@@ -526,7 +520,7 @@ class StrataGuiApp:
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
         ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
 
-        pending_frame = ttk.LabelFrame(upper, text="Pending Recommendations (Review & Approve)", padding=8)
+        pending_frame = ttk.LabelFrame(body, text="Pending Recommendations (Review & Approve)", padding=8)
         pending_frame.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
@@ -569,7 +563,7 @@ class StrataGuiApp:
         ttk.Button(pending_btns_row2, text="Remove Selected", command=self._remove_selected_pending_orders).pack(side="left", padx=6)
         ttk.Button(pending_btns_row2, text="Clear All", command=self._clear_pending_recommendations).pack(side="left")
 
-        manual = ttk.LabelFrame(upper, text="Manual Ledger Event", padding=8)
+        manual = ttk.LabelFrame(body, text="Manual Ledger Event", padding=8)
         manual.pack(fill="x", padx=8, pady=(0, 8))
         self._labeled_entry(manual, "Asset", self.pf_manual_asset_var)
         self._labeled_combo(manual, "Action", self.pf_manual_action_var, ["BUY", "SELL", "HOLD"], state="readonly")
@@ -579,7 +573,7 @@ class StrataGuiApp:
         self._labeled_entry(manual, "Note", self.pf_manual_note_var)
         ttk.Button(manual, text="Add Manual Event", command=self._add_manual_ledger_event).pack(fill="x", pady=(6, 0))
 
-        orders = ttk.LabelFrame(upper, text="Open Binance Orders (Cancel via GUI)", padding=8)
+        orders = ttk.LabelFrame(body, text="Open Binance Orders (Cancel via GUI)", padding=8)
         orders.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         order_top = ttk.Frame(orders)
         order_top.pack(fill="x")
@@ -609,7 +603,7 @@ class StrataGuiApp:
             self.open_orders_tree.column(c, width=w, anchor="w")
         open_orders_frame.pack(fill="x", expand=False, pady=(6, 0))
 
-        cols = ttk.Frame(upper)
+        cols = ttk.Frame(body)
         cols.pack(fill="x", expand=False)
         left = ttk.LabelFrame(cols, text="Current Portfolio (Binance)", padding=6)
         right = ttk.LabelFrame(cols, text="Open Positions (Ledger)", padding=6)
@@ -618,16 +612,16 @@ class StrataGuiApp:
         cols_split.add(left, weight=1)
         cols_split.add(right, weight=1)
 
-        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none", height=10)
+        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none", height=8)
         pf_portfolio_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_portfolio_text)
 
-        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none", height=10)
+        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none", height=8)
         pf_open_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_open_positions_text)
 
-        bottom = ttk.LabelFrame(lower, text="Trade Ledger (Signal + Execution Views)", padding=6)
-        bottom.pack(fill="both", expand=True, pady=(0, 0))
+        bottom = ttk.LabelFrame(body, text="Trade Ledger (Signal + Execution Views)", padding=6)
+        bottom.pack(fill="both", expand=True, pady=(8, 0))
         ledger_nb = ttk.Notebook(bottom)
         ledger_nb.pack(fill="both", expand=True)
         tab_overall = ttk.Frame(ledger_nb)
