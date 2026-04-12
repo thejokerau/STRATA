@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -35,8 +36,145 @@ class EngineBridge:
         self.scripts_dir = repo_root / "scripts"
         self._lock = threading.Lock()
         self._binance_exchange_info_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._result_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._raw_data_cache: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
+        self._indicator_cache_store: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
+        self._cache_ttl_live_sec = 20.0
+        self._cache_ttl_backtest_sec = 90.0
+        self._cache_ttl_raw_sec = 45.0
+        self._cache_ttl_indicator_sec = 60.0
         self.mod = self._load_nightly_module()
         self.mod.ensure_table()
+
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    @staticmethod
+    def _stable_cache_key(prefix: str, payload: Dict[str, Any]) -> str:
+        blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+        return f"{prefix}:{hashlib.sha1(blob.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _cache_get(cache: Dict[str, Tuple[float, Any]], key: str, ttl_sec: float) -> Optional[Any]:
+        rec = cache.get(key)
+        if not rec:
+            return None
+        ts, val = rec
+        if (time.time() - float(ts)) > float(ttl_sec):
+            try:
+                del cache[key]
+            except Exception:
+                pass
+            return None
+        return val
+
+    @staticmethod
+    def _cache_put(cache: Dict[str, Tuple[float, Any]], key: str, val: Any) -> None:
+        cache[key] = (time.time(), val)
+
+    def _resolve_tickers(
+        self,
+        is_crypto: bool,
+        top_n: int,
+        quote: str,
+        country: str,
+        explicit: Optional[List[str]] = None,
+    ) -> List[str]:
+        if isinstance(explicit, list) and explicit:
+            return [str(x).strip() for x in explicit if str(x).strip()]
+        if is_crypto:
+            return self.mod.filter_crypto_tickers_by_binance(self.mod.fetch_top_coins(top_n, quote_currency=quote))
+        return list(self.mod.TRADITIONAL_TOP.get(country, self.mod.TRADITIONAL_TOP["2"]))[: max(1, top_n)]
+
+    def _load_raw_data(
+        self,
+        tickers: List[str],
+        timeframe: str,
+        is_crypto: bool,
+        fetch_years: float,
+        min_bars: int = 60,
+        fetch_workers: int = 1,
+    ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+        perf: Dict[str, Any] = {"tickers": len(tickers), "fetch_workers": int(max(1, fetch_workers))}
+        raw_key = self._stable_cache_key(
+            "raw",
+            {
+                "tickers": sorted([str(t).upper() for t in tickers]),
+                "timeframe": str(timeframe),
+                "is_crypto": bool(is_crypto),
+                "years": round(float(fetch_years), 4),
+                "min_bars": int(min_bars),
+            },
+        )
+        t0 = self._now()
+        cached = self._cache_get(self._raw_data_cache, raw_key, self._cache_ttl_raw_sec)
+        if isinstance(cached, dict) and cached:
+            perf["raw_cache_hit"] = True
+            perf["raw_load_sec"] = round(self._now() - t0, 4)
+            return cached, perf
+
+        raw_data: Dict[str, pd.DataFrame] = {}
+        fetch_workers = max(1, int(fetch_workers))
+
+        def _fetch_one(t: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            df = self.mod.fetch_with_cache(t, timeframe, is_crypto=is_crypto, years=fetch_years)
+            if df is not None and len(df) >= min_bars:
+                return t, df
+            return t, None
+
+        t_fetch = self._now()
+        if fetch_workers <= 1 or len(tickers) <= 1:
+            for t in tickers:
+                sym, df = _fetch_one(t)
+                if df is not None:
+                    raw_data[sym] = df
+        else:
+            with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
+                futs = [ex.submit(_fetch_one, t) for t in tickers]
+                for fut in as_completed(futs):
+                    try:
+                        sym, df = fut.result()
+                    except Exception:
+                        continue
+                    if df is not None:
+                        raw_data[sym] = df
+        perf["fetch_sec"] = round(self._now() - t_fetch, 4)
+        perf["raw_cache_hit"] = False
+        perf["loaded_assets"] = len(raw_data)
+        perf["raw_load_sec"] = round(self._now() - t0, 4)
+        if raw_data:
+            self._cache_put(self._raw_data_cache, raw_key, raw_data)
+        return raw_data, perf
+
+    def _load_indicator_cache(
+        self,
+        raw_data: Dict[str, pd.DataFrame],
+        timeframe: str,
+        workers: int,
+    ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+        perf: Dict[str, Any] = {}
+        ind_key = self._stable_cache_key(
+            "ind",
+            {
+                "keys": sorted([str(k).upper() for k in raw_data.keys()]),
+                "timeframe": str(timeframe),
+            },
+        )
+        t0 = self._now()
+        cached = self._cache_get(self._indicator_cache_store, ind_key, self._cache_ttl_indicator_sec)
+        if isinstance(cached, dict) and cached:
+            perf["indicator_cache_hit"] = True
+            perf["indicator_sec"] = round(self._now() - t0, 4)
+            return cached, perf
+        workers = max(1, int(workers))
+        t_ind = self._now()
+        enriched = self.mod.build_indicator_cache(raw_data, timeframe, max_workers=workers, verbose=False)
+        perf["indicator_cache_hit"] = False
+        perf["indicator_sec"] = round(self._now() - t_ind, 4)
+        if enriched:
+            self._cache_put(self._indicator_cache_store, ind_key, enriched)
+        return enriched, perf
 
     def _load_nightly_module(self):
         spec = importlib.util.spec_from_file_location("ctmt_nightly_gui", str(self.nightly_path))
@@ -58,12 +196,40 @@ class EngineBridge:
         return universe[:max(1, top_n)]
 
     def run_live_panel(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        ck = self._stable_cache_key(
+            "live_result",
+            {
+                "market": str(cfg.get("market", "crypto")),
+                "timeframe": str(cfg.get("timeframe", "1d")),
+                "top_n": int(cfg.get("top_n", 20)),
+                "quote_currency": str(cfg.get("quote_currency", "USD")).upper(),
+                "country": str(cfg.get("country", "2")),
+                "display_currency": str(cfg.get("display_currency", "USD")).upper(),
+                "name": str(cfg.get("name", "")),
+            },
+        )
+        cached = self._cache_get(self._result_cache, ck, self._cache_ttl_live_sec)
+        if isinstance(cached, dict):
+            out = dict(cached)
+            p = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
+            p["result_cache_hit"] = True
+            out["perf"] = p
+            out["log"] = ""
+            return out
+
+        stream = io.StringIO()
+        t0 = self._now()
         with self._lock:
-            stream = io.StringIO()
             with redirect_stdout(stream), redirect_stderr(stream):
                 out = self._run_live_panel_impl(cfg)
-            out["log"] = stream.getvalue()
-            return out
+        out["log"] = stream.getvalue()
+        perf = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
+        perf["total_sec"] = round(self._now() - t0, 4)
+        perf["result_cache_hit"] = False
+        out["perf"] = perf
+        if out.get("ok"):
+            self._cache_put(self._result_cache, ck, dict(out))
+        return out
 
     def _run_live_panel_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         is_crypto = str(cfg.get("market", "crypto")).lower() == "crypto"
@@ -71,20 +237,27 @@ class EngineBridge:
         display_currency = str(cfg.get("display_currency", "USD")).upper()
         tickers = self._assets_for_live(cfg)
         fetch_years = 2.2
-        raw_data: Dict[str, pd.DataFrame] = {}
-        for t in tickers:
-            df = self.mod.fetch_with_cache(t, timeframe, is_crypto=is_crypto, years=fetch_years)
-            if df is not None and len(df) >= 60:
-                raw_data[t] = df
+        fetch_workers = max(1, int(cfg.get("fetch_workers", 1) or 1))
+        raw_data, perf_raw = self._load_raw_data(
+            tickers=tickers,
+            timeframe=timeframe,
+            is_crypto=is_crypto,
+            fetch_years=fetch_years,
+            min_bars=60,
+            fetch_workers=fetch_workers,
+        )
         if not raw_data:
             return {"ok": False, "error": "No usable data returned."}
 
         tuned = self.mod.TunedParams()
-        enriched = self.mod.build_indicator_cache(raw_data, timeframe, max_workers=1, verbose=False)
+        indicator_workers = max(1, int(cfg.get("cache_workers", 1) or 1))
+        enriched, perf_ind = self._load_indicator_cache(raw_data, timeframe, workers=indicator_workers)
         if not enriched:
             return {"ok": False, "error": "No indicator-ready data."}
 
+        t_table = self._now()
         table, risk = self.mod.build_live_tables(enriched, is_crypto, tuned, timeframe)
+        table_sec = round(self._now() - t_table, 4)
         if table.empty:
             return {"ok": False, "error": "No scored assets."}
         notes = self.mod.build_portfolio_insights(enriched, table)
@@ -106,15 +279,64 @@ class EngineBridge:
             "requested_assets": len(tickers),
             "timeframe": timeframe,
             "market": "Crypto" if is_crypto else "Traditional",
+            "perf": {
+                **perf_raw,
+                **perf_ind,
+                "table_sec": table_sec,
+            },
         }
 
     def run_backtest(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        ck = self._stable_cache_key(
+            "backtest_result",
+            {
+                "market": str(cfg.get("market", "crypto")).lower(),
+                "timeframe": str(cfg.get("timeframe", "1d")),
+                "months": int(cfg.get("months", 12)),
+                "top_n": int(cfg.get("top_n", 20)),
+                "quote_currency": str(cfg.get("quote_currency", "USD")).upper(),
+                "country": str(cfg.get("country", "2")),
+                "tickers": list(cfg.get("tickers", []) or []),
+                "risk": {
+                    "sl": float(cfg.get("stop_loss_pct", 8.0)),
+                    "tp": float(cfg.get("take_profit_pct", 20.0)),
+                    "hold": int(cfg.get("max_hold_days", 45)),
+                    "fee": float(cfg.get("fee_pct", 0.10)),
+                    "slip": float(cfg.get("slippage_pct", 0.05)),
+                },
+                "tuned": {
+                    "position_size": float(cfg.get("position_size", 0.30)),
+                    "atr": float(cfg.get("atr_multiplier", 2.2)),
+                    "adx": float(cfg.get("adx_threshold", 25.0)),
+                    "cmf": float(cfg.get("cmf_threshold", 0.02)),
+                    "obv": float(cfg.get("obv_slope_threshold", 0.0)),
+                    "buy_t": int(cfg.get("buy_threshold", 2)),
+                    "sell_t": int(cfg.get("sell_threshold", -2)),
+                },
+            },
+        )
+        cached = self._cache_get(self._result_cache, ck, self._cache_ttl_backtest_sec)
+        if isinstance(cached, dict):
+            out = dict(cached)
+            p = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
+            p["result_cache_hit"] = True
+            out["perf"] = p
+            out["log"] = ""
+            return out
+
+        stream = io.StringIO()
+        t0 = self._now()
         with self._lock:
-            stream = io.StringIO()
             with redirect_stdout(stream), redirect_stderr(stream):
                 out = self._run_backtest_impl(cfg)
-            out["log"] = stream.getvalue()
-            return out
+        out["log"] = stream.getvalue()
+        perf = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
+        perf["total_sec"] = round(self._now() - t0, 4)
+        perf["result_cache_hit"] = False
+        out["perf"] = perf
+        if out.get("ok"):
+            self._cache_put(self._result_cache, ck, dict(out))
+        return out
 
     def _run_backtest_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         is_crypto = str(cfg.get("market", "crypto")).lower() == "crypto"
@@ -126,19 +348,18 @@ class EngineBridge:
         country = str(cfg.get("country", "2"))
 
         explicit = cfg.get("tickers", None)
-        if isinstance(explicit, list) and explicit:
-            tickers = [str(x).strip() for x in explicit if str(x).strip()]
-        elif is_crypto:
-            tickers = self.mod.filter_crypto_tickers_by_binance(self.mod.fetch_top_coins(top_n, quote_currency=quote))
-        else:
-            tickers = list(self.mod.TRADITIONAL_TOP.get(country, self.mod.TRADITIONAL_TOP["2"]))[:max(1, top_n)]
+        tickers = self._resolve_tickers(is_crypto, top_n, quote, country, explicit=explicit if isinstance(explicit, list) else None)
 
         fetch_years = max(2.2, (months / 12.0) + 0.25)
-        raw_data: Dict[str, pd.DataFrame] = {}
-        for t in tickers:
-            df = self.mod.fetch_with_cache(t, timeframe, is_crypto=is_crypto, years=fetch_years)
-            if df is not None and len(df) >= 60:
-                raw_data[t] = df
+        fetch_workers = max(1, int(cfg.get("fetch_workers", 1) or 1))
+        raw_data, perf_raw = self._load_raw_data(
+            tickers=tickers,
+            timeframe=timeframe,
+            is_crypto=is_crypto,
+            fetch_years=fetch_years,
+            min_bars=60,
+            fetch_workers=fetch_workers,
+        )
         if not raw_data:
             return {"ok": False, "error": "No usable data."}
 
@@ -167,7 +388,11 @@ class EngineBridge:
             tuned=tuned,
         )
 
-        indicator_cache = self.mod.build_indicator_cache(raw_data, timeframe, max_workers=int(cfg.get("cache_workers", 4)), verbose=False)
+        indicator_cache, perf_ind = self._load_indicator_cache(
+            raw_data=raw_data,
+            timeframe=timeframe,
+            workers=max(1, int(cfg.get("cache_workers", 4) or 4)),
+        )
         if not indicator_cache:
             return {"ok": False, "error": "No indicator-ready data for backtest."}
 
@@ -176,6 +401,7 @@ class EngineBridge:
         backtest_days = int(round(months * 365.25 / 12.0))
         start_date = end_date - pd.Timedelta(days=backtest_days)
 
+        t_sim = self._now()
         result = self.mod.simulate_backtest(
             raw_data,
             timeframe,
@@ -186,6 +412,7 @@ class EngineBridge:
             indicator_cache=indicator_cache,
             verbose=False,
         )
+        sim_sec = round(self._now() - t_sim, 4)
         eq = result.get("equity", [])
         if not eq:
             return {"ok": False, "error": "Backtest returned no results."}
@@ -211,6 +438,11 @@ class EngineBridge:
             "summary_text": "\n".join(summary),
             "trades_text": trade_df.to_string(index=False) if not trade_df.empty else "No closed trades.",
             "metrics": metrics,
+            "perf": {
+                **perf_raw,
+                **perf_ind,
+                "simulate_sec": sim_sec,
+            },
         }
 
     def build_dashboard_prompt(self, dashboard_text: str, datetime_context: str) -> str:
@@ -601,8 +833,8 @@ class EngineBridge:
         t = str(order_type).strip().upper()
         if not sym or s not in ("BUY", "SELL"):
             return {"ok": False, "error": "Valid symbol and side (BUY/SELL) are required."}
-        if t not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT"):
-            return {"ok": False, "error": "order_type must be MARKET, LIMIT, or STOP_LOSS_LIMIT."}
+        if t not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
+            return {"ok": False, "error": "order_type must be MARKET, LIMIT, STOP_LOSS_LIMIT, or TAKE_PROFIT_LIMIT."}
 
         qty = self._to_decimal(quantity)
         if qty <= Decimal("0"):
@@ -661,7 +893,7 @@ class EngineBridge:
 
         norm_price: Optional[Decimal] = None
         norm_stop: Optional[Decimal] = None
-        if t in ("LIMIT", "STOP_LOSS_LIMIT"):
+        if t in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
             p = self._to_decimal(price or 0)
             if p <= Decimal("0"):
                 return {"ok": False, "error": f"{t} orders require positive price."}
@@ -673,10 +905,10 @@ class EngineBridge:
                 return {"ok": False, "error": f"Price {norm_price} below minPrice {min_p}."}
             if max_p > Decimal("0") and norm_price > max_p:
                 return {"ok": False, "error": f"Price {norm_price} above maxPrice {max_p}."}
-            if t == "STOP_LOSS_LIMIT":
+            if t in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 sp = self._to_decimal(stop_price or 0)
                 if sp <= Decimal("0"):
-                    return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                    return {"ok": False, "error": f"{t} orders require positive stop_price."}
                 norm_stop = self._round_to_step(sp, tick) if tick > Decimal("0") else sp
                 if min_p > Decimal("0") and norm_stop < min_p:
                     return {"ok": False, "error": f"Stop price {norm_stop} below minPrice {min_p}."}
@@ -747,6 +979,42 @@ class EngineBridge:
             if px is None or px <= Decimal("0"):
                 return {"ok": False, "error": f"Unable to fetch last price for {sym}."}
             return {"ok": True, "symbol": sym, "price": float(px)}
+
+    def get_binance_symbol_filters(self, symbol: str, profile_name: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            sym = str(symbol).strip().upper()
+            if not sym:
+                return {"ok": False, "error": "Symbol is required."}
+            _, profile, _, err = self._resolve_active_binance_profile(profile_name)
+            if err:
+                return {"ok": False, "error": err}
+            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            info = self._get_symbol_exchange_info(endpoint, sym)
+            if not info:
+                return {"ok": False, "error": f"Unable to load exchange info for {sym}."}
+            filters = info.get("filters", []) if isinstance(info, dict) else []
+            if not isinstance(filters, list):
+                filters = []
+            f_map: Dict[str, Dict[str, Any]] = {}
+            for f in filters:
+                if isinstance(f, dict):
+                    k = str(f.get("filterType", "")).strip()
+                    if k:
+                        f_map[k] = f
+            min_notional = 0.0
+            mn = f_map.get("MIN_NOTIONAL", {})
+            nt = f_map.get("NOTIONAL", {})
+            try:
+                if isinstance(mn, dict):
+                    min_notional = max(min_notional, float(mn.get("minNotional", 0.0) or 0.0))
+            except Exception:
+                pass
+            try:
+                if isinstance(nt, dict):
+                    min_notional = max(min_notional, float(nt.get("minNotional", 0.0) or 0.0))
+            except Exception:
+                pass
+            return {"ok": True, "symbol": sym, "min_notional": float(min_notional)}
 
     def list_binance_profiles(self) -> Dict[str, Any]:
         with self._lock:
@@ -1103,7 +1371,7 @@ class EngineBridge:
                 "type": t,
                 "quantity": f"{qty:.8f}".rstrip("0").rstrip("."),
             }
-            if t in ("LIMIT", "STOP_LOSS_LIMIT"):
+            if t in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 try:
                     px = float(px_norm if px_norm is not None else (price or 0.0))
                 except Exception:
@@ -1112,13 +1380,13 @@ class EngineBridge:
                     return {"ok": False, "error": f"{t} orders require positive price."}
                 params["price"] = f"{px:.8f}".rstrip("0").rstrip(".")
                 params["timeInForce"] = str(time_in_force or "GTC").upper()
-                if t == "STOP_LOSS_LIMIT":
+                if t in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                     try:
                         sp = float(sp_norm if sp_norm is not None else (stop_price or 0.0))
                     except Exception:
                         sp = 0.0
                     if sp <= 0:
-                        return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                        return {"ok": False, "error": f"{t} orders require positive stop_price."}
                     params["stopPrice"] = f"{sp:.8f}".rstrip("0").rstrip(".")
             out = self._signed_binance_request(
                 "POST",
@@ -1137,6 +1405,92 @@ class EngineBridge:
                 "normalized_quantity": qty,
                 "normalized_price": px_norm,
                 "normalized_stop_price": sp_norm,
+            }
+
+    def submit_binance_oco_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        take_profit_price: float,
+        stop_price: float,
+        stop_limit_price: Optional[float] = None,
+        profile_name: Optional[str] = None,
+        stop_limit_time_in_force: str = "GTC",
+    ) -> Dict[str, Any]:
+        with self._lock:
+            sym = str(symbol).strip().upper()
+            if not sym:
+                return {"ok": False, "error": "Symbol is required."}
+            try:
+                tp = float(take_profit_price or 0.0)
+                sp = float(stop_price or 0.0)
+                slp = float(stop_limit_price if stop_limit_price is not None else (sp * 0.995))
+                qty = float(quantity or 0.0)
+            except Exception:
+                return {"ok": False, "error": "Invalid OCO numeric inputs."}
+            if qty <= 0 or tp <= 0 or sp <= 0 or slp <= 0:
+                return {"ok": False, "error": "OCO requires qty>0, take_profit_price>0, stop_price>0, stop_limit_price>0."}
+
+            # Normalize and validate quantity + prices using existing filters.
+            v_lim = self.validate_binance_order(
+                symbol=sym,
+                side="SELL",
+                order_type="LIMIT",
+                quantity=qty,
+                profile_name=profile_name,
+                price=tp,
+            )
+            if not v_lim.get("ok"):
+                return {"ok": False, "error": f"OCO limit leg invalid: {v_lim.get('error', 'unknown')}"}
+
+            v_stop = self.validate_binance_order(
+                symbol=sym,
+                side="SELL",
+                order_type="STOP_LOSS_LIMIT",
+                quantity=float(v_lim.get("normalized_quantity", qty) or qty),
+                profile_name=profile_name,
+                price=slp,
+                stop_price=sp,
+            )
+            if not v_stop.get("ok"):
+                return {"ok": False, "error": f"OCO stop leg invalid: {v_stop.get('error', 'unknown')}"}
+
+            nq = float(v_lim.get("normalized_quantity", qty) or qty)
+            tp_norm = float(v_lim.get("normalized_price", tp) or tp)
+            sp_norm = float(v_stop.get("normalized_stop_price", sp) or sp)
+            slp_norm = float(v_stop.get("normalized_price", slp) or slp)
+
+            active, profile, creds, err = self._resolve_active_binance_profile(profile_name)
+            if err:
+                return {"ok": False, "error": err}
+            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+            params: Dict[str, Any] = {
+                "symbol": sym,
+                "side": "SELL",
+                "quantity": f"{nq:.8f}".rstrip("0").rstrip("."),
+                "price": f"{tp_norm:.8f}".rstrip("0").rstrip("."),
+                "stopPrice": f"{sp_norm:.8f}".rstrip("0").rstrip("."),
+                "stopLimitPrice": f"{slp_norm:.8f}".rstrip("0").rstrip("."),
+                "stopLimitTimeInForce": str(stop_limit_time_in_force or "GTC").upper(),
+            }
+            out = self._signed_binance_request(
+                "POST",
+                endpoint,
+                "/api/v3/order/oco",
+                str(creds["api_key"]),
+                str(creds["api_secret"]),
+                params=params,
+            )
+            if not out.get("ok"):
+                return {"ok": False, "status": out.get("status"), "error": out.get("error", "OCO submit failed")}
+            return {
+                "ok": True,
+                "profile": active,
+                "data": out.get("data", {}),
+                "normalized_quantity": nq,
+                "normalized_take_profit_price": tp_norm,
+                "normalized_stop_price": sp_norm,
+                "normalized_stop_limit_price": slp_norm,
             }
 
     def analyze_open_positions_multi_tf(

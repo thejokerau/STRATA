@@ -93,14 +93,20 @@ Submit path (`_submit_selected_pending_orders`) performs:
 3. Binance validation and normalization,
 4. optional min-notional adjustment retry,
 5. order submission,
-6. optional protective stop placement on BUY,
+6. optional protective stop/take-profit placement on BUY,
 7. ledger execution logging.
 
-For `STOP_LOSS_LIMIT` pending orders:
+For `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` pending orders:
 
-- requires `stop_loss_price`
-- uses `limit_price` when provided; otherwise derives from stop
+- requires trigger price (`stop_loss_price` for stop, `take_profit_price` for take-profit)
+- uses `limit_price` when provided; otherwise derives from trigger
 - can cancel existing open protective stop orders before replacement
+
+For `OCO_BRACKET` pending orders:
+
+- requires both `stop_loss_price` and `take_profit_price`
+- submits Binance `/api/v3/order/oco` as linked protective bracket
+- replacement mode cancels prior protective SELL orders before OCO placement
 
 ## 6. Protection Workflow Design
 
@@ -119,17 +125,55 @@ Supported AI actions:
 
 - `SET_STOP`
 - `SET_TRAILING`
+- `SET_TAKE_PROFIT`
+- `SET_BOTH`
 - `HOLD`
 
 Current execution mapping:
 
 - `SET_TRAILING` is mapped to fixed stop recommendation with explicit annotation.
+- `SET_TAKE_PROFIT` creates `TAKE_PROFIT_LIMIT` protective orders.
+- `SET_BOTH` stages both stop-loss and take-profit protective orders.
 
 ## 6.2 Background Execution Model
 
 Protection run executes in background thread via task queue:
 
 - avoids UI freeze / "Not Responding" perception.
+
+## 7. Performance Architecture
+
+### 7.1 Shared Engine Caches
+
+`EngineBridge` now uses short-lived in-memory caches to reduce repeated work:
+
+- raw data cache (ticker/timeframe/lookback key),
+- indicator cache (symbol-set + timeframe key),
+- live/backtest result cache (request signature key).
+
+This improves repeated refresh/pipeline responsiveness while preserving bounded staleness with TTL.
+
+### 7.2 Incremental UI Updates
+
+Pending recommendations and open-order tables now use row upsert/sync (update changed rows, remove stale rows) instead of full clear/reinsert each refresh.
+
+### 7.3 Runtime Profiling
+
+Task runtime profiling is captured and exposed in GUI:
+
+- per-task start time and completion duration,
+- recent-duration rolling average in Task Monitor,
+- stage-level `PERF ...` logs in task terminal for Live/Backtest/AI calls.
+
+### 7.4 SQLite Tuning
+
+Nightly data cache DB setup now applies:
+
+- `WAL` journal mode,
+- `synchronous=NORMAL`,
+- memory temp store,
+- cache-size hint and busy timeout,
+- supporting indexes on `(timeframe, date)` and `(ticker, date)`.
 - emits task terminal progress and completion logs.
 
 ## 6.3 Protection Monitor
