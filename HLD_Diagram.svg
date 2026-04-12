@@ -63,7 +63,7 @@
   <text x="858" y="412" class="txt">Walk-forward/optuna and data transforms</text>
 
   <rect x="1230" y="325" width="310" height="130" class="box box-risk" />
-  <text x="1248" y="350" class="head">Risk & Validation Guardrails</text>
+  <text x="1248" y="350" class="head">Risk &amp; Validation Guardrails</text>
   <text x="1248" y="372" class="txt">Max loss/trades/exposure, stop-required policy</text>
   <text x="1248" y="392" class="txt">Exchange filters: lot/tick/notional checks</text>
   <text x="1248" y="412" class="txt">Duplicate-signal cooldown + activity guard</text>
@@ -113,7 +113,7 @@
   <text x="468" y="892" class="txt">Walk-forward and holdout metrics</text>
 
   <rect x="840" y="825" width="360" height="95" class="box" />
-  <text x="858" y="850" class="head">Portfolio & Ledger Views</text>
+  <text x="858" y="850" class="head">Portfolio &amp; Ledger Views</text>
   <text x="858" y="872" class="txt">Open positions + realized/unrealized PnL</text>
   <text x="858" y="892" class="txt">Execution and signal journals, open orders</text>
 

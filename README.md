@@ -12,9 +12,11 @@ It reflects the platform workflow:
 
 ## Architecture Docs
 
-- HLD Diagram: `HLD_Diagram.svg`
+- HLD Diagram: [HLD_Diagram.svg](./HLD_Diagram.svg)
 - High-Level Design: `docs/HLD.md`
 - Detailed Design: `docs/DETAILED_DESIGN.md`
+
+![STRATA HLD](./HLD_Diagram.svg)
 
 ## Release & Branch Strategy (Best Practice)
 

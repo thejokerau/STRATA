@@ -76,7 +76,9 @@ Local systems:
 
 Visual:
 
-- High-level architecture diagram: `HLD_Diagram.svg`
+- High-level architecture diagram: [HLD_Diagram.svg](../HLD_Diagram.svg)
+
+![STRATA HLD](../HLD_Diagram.svg)
 
 ## 7. Key Data Flows
 

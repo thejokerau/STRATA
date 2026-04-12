@@ -4463,21 +4463,48 @@ class StrataGuiApp:
         if not profile:
             messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
             return
+        task_name = "Open Position Review (MTF)"
+        if self._queue_if_busy(task_name, self._start_review_open_positions_mtf):
+            return
+        self._start_review_open_positions_mtf()
+
+    def _start_review_open_positions_mtf(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
+            return
+        task_name = "Open Position Review (MTF)"
+        task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START Open Position Review (4h/8h/12h/1d)")
-        out = self.bridge.analyze_open_positions_multi_tf(
-            profile_name=profile,
-            timeframes=["4h", "8h", "12h", "1d"],
-            display_currency=self.display_currency_var.get().strip() or "USD",
-        )
+        display_ccy = self.display_currency_var.get().strip() or "USD"
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                res = bridge.analyze_open_positions_multi_tf(
+                    profile_name=profile,
+                    timeframes=["4h", "8h", "12h", "1d"],
+                    display_currency=display_ccy,
+                )
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            self.root.after(0, lambda: self._finish_review_open_positions_mtf(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_review_open_positions_mtf(self, out: Dict[str, Any], task_id: Optional[int]) -> None:
+        task_name = "Open Position Review (MTF)"
         if not out.get("ok"):
             self._append_task_terminal(f"DONE Open Position Review (error: {out.get('error', 'unknown')})")
             messagebox.showerror("Open Position Review", str(out.get("error", "Failed to analyze open positions.")))
+            self._finish_task(task_id, task_name=task_name)
             return
         rows = out.get("rows", []) or []
         if not rows:
             note = str(out.get("note", "") or "No open positions to analyze.")
             self._append_task_terminal(f"DONE Open Position Review ({note})")
             messagebox.showinfo("Open Position Review", note)
+            self._finish_task(task_id, task_name=task_name)
             return
         lines = []
         lines.append("OPEN POSITION MTF REVIEW")
@@ -4495,6 +4522,7 @@ class StrataGuiApp:
         self._append_task_terminal(blob)
         self._append_task_terminal(f"DONE Open Position Review ({len(rows)} positions)")
         messagebox.showinfo("Open Position Review", f"Reviewed {len(rows)} open position(s).\nSee Task Terminal for detailed breakdown.")
+        self._finish_task(task_id, task_name=task_name)
 
     def _cancel_selected_open_orders(self) -> None:
         if not hasattr(self, "open_orders_tree"):
