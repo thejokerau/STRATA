@@ -2973,29 +2973,49 @@ class StrataGuiApp:
             self._append_task_terminal("Stopped Live->AI pipeline scheduler.")
 
     def _finish_ai_output(self, res: Dict[str, Any], task_id: Optional[int] = None) -> None:
-        if not res.get("ok"):
+        try:
+            self.ai_output.delete("1.0", tk.END)
+            ok = bool(res.get("ok"))
+            response = str(res.get("response", "") or "")
             err = str(res.get("error", "") or "").strip()
-            self.ai_output.insert("1.0", "AI analysis failed or returned empty response.\n")
-            if err:
-                self.ai_output.insert("end", f"\nError: {err}\n")
-            self.ai_output.insert("end", "\nPrompt preview:\n\n")
-            self.ai_output.insert("end", (res.get("prompt", "") or "")[:4000])
-            self._append_task_terminal("DONE AI Analysis (failed/empty)")
-            if err:
-                messagebox.showerror("AI Analysis Failed", err)
-            self._vlog(f"AI failed: {err or 'empty response'}")
-        else:
-            response = res.get("response", "")
-            self.ai_output.insert("1.0", response)
-            used_prompt = res.get("prompt", "")
-            if used_prompt:
-                self.ai_conversation.append({"role": "user", "content": used_prompt})
-            self.ai_conversation.append({"role": "assistant", "content": response})
-            if bool(self.ai_auto_stage_var.get()):
-                staged = self._stage_ai_recommendations(silent=True)
-                self._append_task_terminal(f"Auto-stage after AI run: {staged} recommendation(s).")
-            self._vlog(f"AI success: response_chars={len(response)}")
-            self._append_task_terminal("DONE AI Analysis")
+            prompt_used = str(res.get("prompt", "") or "")
+            log_txt = str(res.get("log", "") or "")
+
+            if ok and response.strip():
+                self.ai_output.insert("1.0", response)
+                if prompt_used:
+                    self.ai_conversation.append({"role": "user", "content": prompt_used})
+                self.ai_conversation.append({"role": "assistant", "content": response})
+                if bool(self.ai_auto_stage_var.get()):
+                    try:
+                        staged = self._stage_ai_recommendations(silent=True)
+                        self._append_task_terminal(f"Auto-stage after AI run: {staged} recommendation(s).")
+                    except Exception as stage_exc:
+                        self._append_task_terminal(f"Auto-stage after AI run failed: {type(stage_exc).__name__}")
+                self._vlog(f"AI success: response_chars={len(response)}")
+                self._append_task_terminal("DONE AI Analysis")
+            else:
+                self.ai_output.insert("1.0", "AI analysis returned no visible response.\n")
+                if err:
+                    self.ai_output.insert("end", f"\nError: {err}\n")
+                if log_txt.strip():
+                    self.ai_output.insert("end", "\nRuntime log (tail):\n")
+                    self.ai_output.insert("end", log_txt[-4000:])
+                    self.ai_output.insert("end", "\n")
+                if prompt_used:
+                    self.ai_output.insert("end", "\nPrompt preview:\n\n")
+                    self.ai_output.insert("end", prompt_used[:4000])
+                self._append_task_terminal("DONE AI Analysis (failed/empty)")
+                if err:
+                    messagebox.showerror("AI Analysis Failed", err)
+                self._vlog(f"AI failed: {err or 'empty response'}")
+        except Exception as exc:
+            try:
+                self.ai_output.delete("1.0", tk.END)
+                self.ai_output.insert("1.0", f"AI output render error: {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+            self._append_task_terminal(f"DONE AI Analysis (render error: {type(exc).__name__})")
         self._finish_task(task_id, task_name="AI Analysis")
 
     def _run_ai_followup(self) -> None:
