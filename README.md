@@ -1,4 +1,16 @@
-﻿## Release & Branch Strategy (Best Practice)
+## What STRATA Means
+
+STRATA stands for **Signal, Timing, Risk, Allocation, Trade Automation**.
+
+It reflects the platform workflow:
+
+- **Signal**: identify opportunities from live/backtest analytics
+- **Timing**: align entries/exits to timeframe and regime
+- **Risk**: enforce stops, exposure limits, and guardrails
+- **Allocation**: size positions using balance, confidence, and constraints
+- **Trade Automation**: stage, approve, execute, reconcile, and monitor
+
+## Release & Branch Strategy (Best Practice)
 
 Use separate long-lived branches for release channels:
 
@@ -138,6 +150,22 @@ GUI AI configuration:
   - supports intents such as:
     - "find best buys top 10 crypto on 4h"
     - "buy btc 10% capital stop loss 5%"
+    - "buy 10 usdt of btc with stop loss 5%"
+    - "buy btc with 30% of my usdt"
+    - "with my current usdt, look for signals and allocate buy strategy"
+    - "do a comprehensive search for top 5 coins ... expand search until found"
+    - "open detailed view" (jumps to Portfolio & Ledger tab)
+    - "run every 30 minutes" / "pause scheduler" / "stop scheduler" / "agent status"
+    - "exclude TRX DOGE" / "clear exclusions"
+    - "execute staged"
+    - "show pnl" / "pnl today" / "pnl last 10 trades"
+  - agent now emits a deterministic plan card before staging/execution so parsed intent is transparent.
+  - optional `AI fallback` in Agent Console:
+    - deterministic parser runs first
+    - ambiguous commands are sent to the active AI profile to produce strict structured intent JSON
+    - all resulting actions still pass normal STRATA validation/guardrails before execution
+  - agent context memory persists across runs (timeframe, top-N, quote, stop %, exclusions).
+  - `Execute Last Staged` button in Agent Console accelerates review->size->submit workflow.
 
 Quote lock + local-currency ledger:
 
@@ -167,6 +195,17 @@ GUI Portfolio & Ledger:
 - New `Portfolio & Ledger` tab:
   - Binance account portfolio snapshot (balances + estimated USD value)
   - `Reconcile Fills` action to backfill missing execution rows/open positions from Binance trade history
+  - `Protect Open Positions (AI+BT)` action:
+    - analyzes current open positions
+    - includes targeted backtest context for each open symbol/timeframe
+    - requests AI protection plan (`SET_STOP` / `SET_TRAILING` / `HOLD`)
+    - stages protective `STOP_LOSS_LIMIT` sell orders for review/submit
+    - trailing recommendations currently map to fixed-stop execution for compatibility (annotated in reason)
+  - Protection monitor controls:
+    - configurable interval (`Protect every (min)`)
+    - `Start/Stop Protect Monitor`
+    - optional `Auto-send protection` to submit newly staged protective orders without confirmation prompts
+  - Protection generation now runs as a background task to avoid GUI freeze during heavy AI/backtest processing.
   - `Review Open Positions (MTF)` action:
     - evaluates open-position assets across `4h/8h/12h/1d`
     - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)
@@ -400,4 +439,5 @@ Ollama behavior:
 - Nightly will try to call local Ollama directly.
 - If unreachable, it attempts to start `ollama serve` automatically.
 - If model is missing, it attempts auto-pull (`OLLAMA_AUTO_PULL=1` by default).
+
 
