@@ -214,6 +214,17 @@ GUI Portfolio & Ledger:
   - Duplicate-signal activity guard (cooldown-based) to reduce repeated same-signal actions
   - Manual ledger event entry (`BUY/SELL/HOLD`)
   - Current open-position tracking + historical ledger view
+
+GUI Position Graph:
+
+- New end-tab `Position Graph` provides a visual view of open positions.
+- Per position, the graph shows:
+  - entry marker
+  - current price marker
+  - active stop-loss marker (from open SELL stop orders)
+  - active take-profit marker (from open SELL TP/limit maker orders)
+  - PnL %
+- Includes profile selector + manual refresh and optional auto-refresh while tab is active.
   - AI recommendation staging queue with selective approval/submit flow
   - Pending queue can now size selected rows by quote notional target (for example USDT amount) instead of raw qty
   - Pending table shows estimated quote notional and symbol min-notional for faster filter debugging

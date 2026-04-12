@@ -114,6 +114,8 @@ class StrataGuiApp:
         self.protection_monitor_job: Optional[str] = None
         self.portfolio_auto_refresh_job: Optional[str] = None
         self.portfolio_auto_refresh_running = False
+        self.position_graph_auto_refresh_job: Optional[str] = None
+        self.position_graph_auto_refresh_running = False
         self.agent_last_staged_ids: List[int] = []
         self.agent_context: Dict[str, Any] = dict(self.state.get("agent_context", {})) if isinstance(self.state.get("agent_context", {}), dict) else {}
         self.agent_context.setdefault("timeframe", "4h")
@@ -145,6 +147,7 @@ class StrataGuiApp:
         self.research_tab = self._create_scrollable_tab("Auto-Research", "research")
         self.task_tab = self._create_scrollable_tab("Task Monitor", "task")
         self.settings_tab = self._create_scrollable_tab("Settings", "settings")
+        self.position_graph_tab = self._create_scrollable_tab("Position Graph", "position_graph")
 
         self._build_live_tab()
         self._build_backtest_tab()
@@ -154,6 +157,7 @@ class StrataGuiApp:
         self._build_research_tab()
         self._build_task_tab()
         self._build_settings_tab()
+        self._build_position_graph_tab()
         self._build_status_bar()
         self.nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
@@ -853,6 +857,322 @@ class StrataGuiApp:
         self.bn_profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_binance_profile_into_form())
         self._refresh_ai_profiles()
         self._refresh_binance_profiles_from_settings()
+
+    def _build_position_graph_tab(self) -> None:
+        top = ttk.Frame(self.position_graph_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.position_graph_tab, padding=8)
+        body.pack(fill="both", expand=True)
+
+        self.pg_profile_var = tk.StringVar(value="")
+        self.pg_auto_refresh_var = tk.BooleanVar(value=True)
+        self.pg_auto_refresh_secs_var = tk.StringVar(value="45")
+        self.pg_summary_var = tk.StringVar(value="No data loaded yet.")
+        self.pg_rows: List[Dict[str, Any]] = []
+
+        ttk.Label(top, text="Binance Profile").pack(side="left")
+        self.pg_profile_combo = ttk.Combobox(top, textvariable=self.pg_profile_var, values=[], width=22, state="readonly")
+        self.pg_profile_combo.pack(side="left", padx=4)
+        ttk.Button(top, text="Use Portfolio Profile", command=self._sync_position_graph_profile).pack(side="left", padx=(4, 8))
+        ttk.Button(top, text="Refresh Graph", command=self._refresh_position_graph).pack(side="left")
+        ttk.Label(top, text="Auto refresh (s)").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pg_auto_refresh_secs_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="While on this tab", variable=self.pg_auto_refresh_var).pack(side="left", padx=(4, 0))
+
+        summary = ttk.Label(body, textvariable=self.pg_summary_var, anchor="w")
+        summary.pack(fill="x", pady=(0, 6))
+
+        graph_frame = ttk.Frame(body)
+        graph_frame.pack(fill="both", expand=True)
+        self.pg_canvas = tk.Canvas(graph_frame, bg="#0f1115", highlightthickness=0)
+        self.pg_canvas.grid(row=0, column=0, sticky="nsew")
+        self.pg_ybar = ttk.Scrollbar(graph_frame, orient="vertical", command=self.pg_canvas.yview)
+        self.pg_xbar = ttk.Scrollbar(graph_frame, orient="horizontal", command=self.pg_canvas.xview)
+        self.pg_ybar.grid(row=0, column=1, sticky="ns")
+        self.pg_xbar.grid(row=1, column=0, sticky="ew")
+        self.pg_canvas.configure(yscrollcommand=self.pg_ybar.set, xscrollcommand=self.pg_xbar.set)
+        graph_frame.rowconfigure(0, weight=1)
+        graph_frame.columnconfigure(0, weight=1)
+        self.pg_canvas.bind("<Configure>", lambda _e: self._draw_position_graph())
+
+        self._sync_position_graph_profile()
+        self._draw_position_graph()
+
+    def _sync_position_graph_profile(self) -> None:
+        try:
+            pref = (self.pf_binance_profile_var.get().strip() if hasattr(self, "pf_binance_profile_var") else "") or ""
+        except Exception:
+            pref = ""
+        try:
+            profiles = self.bridge.list_binance_profiles().get("profiles", {}) or {}
+            names = sorted([str(k) for k in profiles.keys()])
+        except Exception:
+            names = []
+        if hasattr(self, "pg_profile_combo"):
+            try:
+                self.pg_profile_combo.configure(values=names)
+            except Exception:
+                pass
+        if pref and (not names or pref in names):
+            self.pg_profile_var.set(pref)
+        elif names and not self.pg_profile_var.get().strip():
+            self.pg_profile_var.set(names[0])
+
+    def _refresh_position_graph(self) -> None:
+        task_name = "Position Graph Refresh"
+        if self._queue_if_busy(task_name, self._start_refresh_position_graph):
+            return
+        self._start_refresh_position_graph()
+
+    def _start_refresh_position_graph(self) -> None:
+        profile = self.pg_profile_var.get().strip() or (self.pf_binance_profile_var.get().strip() if hasattr(self, "pf_binance_profile_var") else "")
+        if not profile:
+            messagebox.showinfo("Position Graph", "Select a Binance profile first.")
+            return
+        task_name = "Position Graph Refresh"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal(f"START {task_name}")
+
+        def worker() -> None:
+            bridge = self._bridge_for_task()
+            try:
+                res = self._compute_position_graph_data(bridge, profile)
+            except Exception as exc:
+                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "rows": []}
+            self.root.after(0, lambda: self._finish_refresh_position_graph(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _compute_position_graph_data(self, bridge: EngineBridge, profile: str) -> Dict[str, Any]:
+        out = bridge.get_trade_ledger()
+        if not out.get("ok"):
+            return {"ok": False, "error": str(out.get("error", "Failed to load ledger.")), "rows": []}
+        ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
+        open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
+        if not isinstance(open_positions, dict) or not open_positions:
+            return {"ok": True, "rows": [], "count": 0}
+
+        ords = bridge.list_open_binance_orders(profile_name=profile)
+        open_orders = ords.get("orders", []) if isinstance(ords, dict) and ords.get("ok") else []
+        by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for o in open_orders:
+            if not isinstance(o, dict):
+                continue
+            sym = str(o.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            by_symbol.setdefault(sym, []).append(o)
+
+        rows: List[Dict[str, Any]] = []
+        for _, pos in open_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            asset = str(pos.get("asset", "")).strip().upper()
+            if not asset:
+                continue
+            try:
+                qty = float(pos.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                continue
+            quote = str(pos.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+            symbol = str(pos.get("symbol", "")).strip().upper() or f"{asset}{quote}"
+            timeframe = str(pos.get("timeframe", "spot") or "spot").strip()
+            try:
+                entry = float(pos.get("entry_price", 0.0) or 0.0)
+            except Exception:
+                entry = 0.0
+            lp = bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+            current = float(lp.get("price", 0.0) or 0.0) if lp.get("ok") else 0.0
+
+            stop_price = 0.0
+            tp_price = 0.0
+            for o in by_symbol.get(symbol, []):
+                if str(o.get("side", "")).strip().upper() != "SELL":
+                    continue
+                ot = str(o.get("type", "")).strip().upper()
+                try:
+                    px = float(o.get("price", 0.0) or 0.0)
+                except Exception:
+                    px = 0.0
+                try:
+                    sp = float(o.get("stopPrice", 0.0) or 0.0)
+                except Exception:
+                    sp = 0.0
+                if "STOP" in ot:
+                    cand = sp if sp > 0 else px
+                    if cand > 0 and (stop_price <= 0 or cand > stop_price):
+                        stop_price = cand
+                elif ("TAKE_PROFIT" in ot) or (ot == "LIMIT_MAKER") or (ot == "LIMIT"):
+                    cand = px if px > 0 else sp
+                    if cand > 0 and (tp_price <= 0 or cand < tp_price):
+                        tp_price = cand
+
+            pnl_pct = ((current - entry) / entry * 100.0) if (entry > 0 and current > 0) else 0.0
+            protected = (stop_price > 0) or (tp_price > 0)
+            protection_state = "PROTECTED" if (stop_price > 0 and tp_price > 0) else ("PARTIAL" if protected else "UNPROTECTED")
+            rows.append(
+                {
+                    "asset": asset,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "qty": qty,
+                    "entry": entry,
+                    "current": current,
+                    "stop": stop_price,
+                    "tp": tp_price,
+                    "pnl_pct": pnl_pct,
+                    "protection_state": protection_state,
+                }
+            )
+        rows.sort(key=lambda r: str(r.get("symbol", "")))
+        return {"ok": True, "rows": rows, "count": len(rows)}
+
+    def _finish_refresh_position_graph(self, res: Dict[str, Any], task_id: Optional[int]) -> None:
+        task_name = "Position Graph Refresh"
+        if not res.get("ok"):
+            self.pg_rows = []
+            self.pg_summary_var.set(f"Error: {res.get('error', 'unknown')}")
+            self._draw_position_graph()
+            self._append_task_terminal(f"DONE {task_name} (error: {res.get('error', 'unknown')})")
+            self._finish_task(task_id, task_name=task_name)
+            return
+        self.pg_rows = res.get("rows", []) if isinstance(res.get("rows"), list) else []
+        n = len(self.pg_rows)
+        protected = len([r for r in self.pg_rows if isinstance(r, dict) and str(r.get("protection_state", "")) == "PROTECTED"])
+        partial = len([r for r in self.pg_rows if isinstance(r, dict) and str(r.get("protection_state", "")) == "PARTIAL"])
+        unprotected = max(0, n - protected - partial)
+        self.pg_summary_var.set(
+            f"Open positions: {n} | Protected: {protected} | Partial: {partial} | Unprotected: {unprotected}"
+        )
+        self._draw_position_graph()
+        self._append_task_terminal(f"DONE {task_name} ({n} position(s))")
+        self._finish_task(task_id, task_name=task_name)
+
+    def _draw_position_graph(self) -> None:
+        if not hasattr(self, "pg_canvas"):
+            return
+        c = self.pg_canvas
+        c.delete("all")
+        rows = self.pg_rows if isinstance(getattr(self, "pg_rows", []), list) else []
+        if not rows:
+            c.create_text(20, 20, text="No open positions to graph.", fill="#d5d8dc", anchor="nw", font=("Segoe UI", 10, "bold"))
+            c.configure(scrollregion=(0, 0, max(c.winfo_width(), 800), 120))
+            return
+
+        w = max(int(c.winfo_width() or 1200), 980)
+        left_col = 260
+        right_pad = 120
+        graph_w = max(420, w - left_col - right_pad)
+        row_h = 58
+        top = 50
+        total_h = top + (len(rows) * row_h) + 70
+
+        c.create_rectangle(0, 0, w, total_h, fill="#0f1115", outline="")
+        c.create_text(16, 14, text="Open Positions: Entry / Current / Stop / TP", fill="#f2f4f8", anchor="nw", font=("Segoe UI", 11, "bold"))
+
+        legend_y = 32
+        c.create_oval(16, legend_y, 24, legend_y + 8, fill="#67b7ff", outline="")
+        c.create_text(28, legend_y - 1, text="Entry", fill="#c8d0d8", anchor="nw", font=("Segoe UI", 9))
+        c.create_oval(80, legend_y, 88, legend_y + 8, fill="#ffffff", outline="#9aa4af")
+        c.create_text(92, legend_y - 1, text="Current", fill="#c8d0d8", anchor="nw", font=("Segoe UI", 9))
+        c.create_rectangle(160, legend_y, 168, legend_y + 8, fill="#ff6b6b", outline="")
+        c.create_text(172, legend_y - 1, text="Stop", fill="#c8d0d8", anchor="nw", font=("Segoe UI", 9))
+        c.create_rectangle(220, legend_y, 228, legend_y + 8, fill="#39d98a", outline="")
+        c.create_text(232, legend_y - 1, text="Take Profit", fill="#c8d0d8", anchor="nw", font=("Segoe UI", 9))
+
+        for i, row in enumerate(rows):
+            y = top + (i * row_h)
+            symbol = str(row.get("symbol", "") or "")
+            tf = str(row.get("timeframe", "") or "")
+            qty = float(row.get("qty", 0.0) or 0.0)
+            entry = float(row.get("entry", 0.0) or 0.0)
+            cur = float(row.get("current", 0.0) or 0.0)
+            stp = float(row.get("stop", 0.0) or 0.0)
+            tp = float(row.get("tp", 0.0) or 0.0)
+            pnl = float(row.get("pnl_pct", 0.0) or 0.0)
+            protection_state = str(row.get("protection_state", "") or "")
+
+            vals = [v for v in [entry, cur, stp, tp] if v > 0]
+            if not vals:
+                continue
+            lo = min(vals)
+            hi = max(vals)
+            span = max(hi - lo, max(hi * 0.02, 1e-6))
+            lo -= span * 0.1
+            hi += span * 0.1
+
+            def xmap(v: float) -> float:
+                if v <= 0 or hi <= lo:
+                    return float(left_col)
+                return float(left_col + ((v - lo) / (hi - lo)) * graph_w)
+
+            y_mid = y + 24
+            c.create_line(left_col, y_mid, left_col + graph_w, y_mid, fill="#3a4350", width=1)
+            c.create_text(16, y + 7, text=f"{symbol} [{tf}]  qty={qty:.6f}", fill="#e6eaef", anchor="nw", font=("Consolas", 9, "bold"))
+            c.create_text(16, y + 26, text=f"PnL {pnl:+.2f}%", fill=("#39d98a" if pnl >= 0 else "#ff6b6b"), anchor="nw", font=("Consolas", 9))
+
+            x_entry = xmap(entry)
+            x_cur = xmap(cur)
+            c.create_oval(x_entry - 4, y_mid - 4, x_entry + 4, y_mid + 4, fill="#67b7ff", outline="")
+            c.create_oval(x_cur - 4, y_mid - 4, x_cur + 4, y_mid + 4, fill="#ffffff", outline="#9aa4af")
+            c.create_text(x_cur + 6, y_mid - 12, text=f"{cur:.6g}", fill="#dbe3ec", anchor="nw", font=("Consolas", 8))
+
+            if stp > 0:
+                xs = xmap(stp)
+                c.create_rectangle(xs - 3, y_mid - 9, xs + 3, y_mid + 9, fill="#ff6b6b", outline="")
+                c.create_text(xs + 6, y_mid + 2, text=f"SL {stp:.6g}", fill="#ffb3b3", anchor="nw", font=("Consolas", 8))
+            if tp > 0:
+                xt = xmap(tp)
+                c.create_rectangle(xt - 3, y_mid - 9, xt + 3, y_mid + 9, fill="#39d98a", outline="")
+                c.create_text(xt + 6, y_mid - 16, text=f"TP {tp:.6g}", fill="#9df0c5", anchor="nw", font=("Consolas", 8))
+
+            state_color = "#39d98a" if protection_state == "PROTECTED" else ("#ffc857" if protection_state == "PARTIAL" else "#ff6b6b")
+            c.create_text(left_col + graph_w + 12, y + 18, text=protection_state, fill=state_color, anchor="w", font=("Segoe UI", 9, "bold"))
+
+        c.configure(scrollregion=(0, 0, w + 220, total_h))
+
+    def _is_position_graph_tab_selected(self) -> bool:
+        try:
+            cur = self.nb.select()
+            return bool(cur) and (self.nb.tab(cur, "text") == "Position Graph")
+        except Exception:
+            return False
+
+    def _start_position_graph_auto_refresh(self) -> None:
+        self._stop_position_graph_auto_refresh()
+        if not hasattr(self, "pg_auto_refresh_var") or not bool(self.pg_auto_refresh_var.get()):
+            return
+        self.position_graph_auto_refresh_running = True
+        self._schedule_position_graph_auto_refresh_tick(initial=True)
+
+    def _stop_position_graph_auto_refresh(self) -> None:
+        self.position_graph_auto_refresh_running = False
+        if self.position_graph_auto_refresh_job:
+            try:
+                self.root.after_cancel(self.position_graph_auto_refresh_job)
+            except Exception:
+                pass
+            self.position_graph_auto_refresh_job = None
+
+    def _schedule_position_graph_auto_refresh_tick(self, initial: bool = False) -> None:
+        if not self.position_graph_auto_refresh_running:
+            return
+        if not self._is_position_graph_tab_selected():
+            self._stop_position_graph_auto_refresh()
+            return
+        try:
+            secs = max(10, int((self.pg_auto_refresh_secs_var.get() or "45").strip()))
+        except Exception:
+            secs = 45
+        if initial:
+            self._append_task_terminal(f"Position graph auto-refresh started ({secs}s).")
+        self._refresh_position_graph()
+        self.position_graph_auto_refresh_job = self.root.after(
+            secs * 1000,
+            lambda: self._schedule_position_graph_auto_refresh_tick(initial=False),
+        )
 
     def _labeled_entry(self, parent, label: str, var: tk.StringVar) -> None:
         row = ttk.Frame(parent)
@@ -3695,13 +4015,21 @@ class StrataGuiApp:
         names = list(self._binance_profiles_cache.keys())
         if hasattr(self, "pf_binance_profile_combo"):
             self.pf_binance_profile_combo["values"] = names
+        if hasattr(self, "pg_profile_combo"):
+            self.pg_profile_combo["values"] = names
         active = str(res.get("active_profile", "") or "")
         if active and active in self._binance_profiles_cache:
             self.pf_binance_profile_var.set(active)
+            if hasattr(self, "pg_profile_var"):
+                self.pg_profile_var.set(active)
         elif names:
             self.pf_binance_profile_var.set(names[0])
+            if hasattr(self, "pg_profile_var") and not self.pg_profile_var.get().strip():
+                self.pg_profile_var.set(names[0])
         else:
             self.pf_binance_profile_var.set("")
+            if hasattr(self, "pg_profile_var"):
+                self.pg_profile_var.set("")
         self._append_settings(f"Binance profiles loaded: {len(names)} (active: {self.pf_binance_profile_var.get() or 'none'})")
 
     def _refresh_pending_recommendations_view(self) -> None:
@@ -5371,8 +5699,16 @@ class StrataGuiApp:
             self._refresh_portfolio_suite()
             if hasattr(self, "pf_auto_refresh_var") and bool(self.pf_auto_refresh_var.get()):
                 self._start_portfolio_auto_refresh()
+            self._stop_position_graph_auto_refresh()
+        elif self._is_position_graph_tab_selected():
+            self._sync_position_graph_profile()
+            self._refresh_position_graph()
+            if hasattr(self, "pg_auto_refresh_var") and bool(self.pg_auto_refresh_var.get()):
+                self._start_position_graph_auto_refresh()
+            self._stop_portfolio_auto_refresh()
         else:
             self._stop_portfolio_auto_refresh()
+            self._stop_position_graph_auto_refresh()
 
     def _review_open_positions_mtf(self) -> None:
         profile = self.pf_binance_profile_var.get().strip() or None
@@ -6378,6 +6714,7 @@ def run_gui() -> None:
         app._stop_pipeline_scheduler()
         app._stop_protection_monitor()
         app._stop_portfolio_auto_refresh()
+        app._stop_position_graph_auto_refresh()
         app._close_task_monitor()
         if app.task_tab_job:
             try:
