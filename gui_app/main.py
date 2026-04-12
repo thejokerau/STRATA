@@ -106,6 +106,16 @@ class StrataGuiApp:
         self.pending_recommendations: List[Dict[str, Any]] = []
         self._pending_rec_seq = 0
         self.pipeline_job: Optional[str] = None
+        self.protection_monitor_job: Optional[str] = None
+        self.portfolio_auto_refresh_job: Optional[str] = None
+        self.portfolio_auto_refresh_running = False
+        self.agent_last_staged_ids: List[int] = []
+        self.agent_context: Dict[str, Any] = dict(self.state.get("agent_context", {})) if isinstance(self.state.get("agent_context", {}), dict) else {}
+        self.agent_context.setdefault("timeframe", "4h")
+        self.agent_context.setdefault("top_n", 10)
+        self.agent_context.setdefault("quote_asset", self._effective_crypto_quote("USDT"))
+        self.agent_context.setdefault("stop_pct", 5.0)
+        self.agent_context.setdefault("exclude_assets", [])
 
         self.live_panels: List[LivePanelConfig] = []
         for p in self.state.get("live_panels", []):
@@ -140,6 +150,7 @@ class StrataGuiApp:
         self._build_task_tab()
         self._build_settings_tab()
         self._build_status_bar()
+        self.nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _create_scrollable_tab(self, title: str, key: str) -> ttk.Frame:
         container = ttk.Frame(self.nb)
@@ -186,10 +197,11 @@ class StrataGuiApp:
         self.status_progress.pack(side="right")
 
     def _build_live_tab(self) -> None:
-        left = ttk.Frame(self.live_tab, padding=8)
-        right = ttk.Frame(self.live_tab, padding=8)
-        left.pack(side="left", fill="y")
-        right.pack(side="left", fill="both", expand=True)
+        split = self._create_paned(self.live_tab, orient="horizontal")
+        left = ttk.Frame(split, padding=8)
+        right = ttk.Frame(split, padding=8)
+        split.add(left, weight=1)
+        split.add(right, weight=3)
 
         ttk.Label(left, text="Panels").pack(anchor="w")
         self.panel_list = tk.Listbox(left, width=40, height=18, selectmode="extended")
@@ -261,10 +273,11 @@ class StrataGuiApp:
         ttk.Button(live_copy_row, text="Clear Output", command=lambda: self.live_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_backtest_tab(self) -> None:
-        top = ttk.Frame(self.backtest_tab, padding=8)
-        top.pack(fill="x")
-        out = ttk.Frame(self.backtest_tab, padding=8)
-        out.pack(fill="both", expand=True)
+        split = self._create_paned(self.backtest_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        out = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(out, weight=3)
 
         self.bt_market = tk.StringVar(value="crypto")
         self.bt_tf = tk.StringVar(value="1d")
@@ -345,10 +358,11 @@ class StrataGuiApp:
         ttk.Button(bt_btns, text="Copy Trades", command=lambda: self._copy_text_widget(self.bt_trades, "Backtest trades")).pack(side="left", padx=6)
 
     def _build_ai_tab(self) -> None:
-        top = ttk.Frame(self.ai_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.ai_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.ai_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=3)
 
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -417,13 +431,15 @@ class StrataGuiApp:
         ttk.Button(ai_btns, text="Clear AI Output", command=lambda: self.ai_output.delete("1.0", tk.END)).pack(side="left", padx=6)
 
     def _build_agent_tab(self) -> None:
-        top = ttk.Frame(self.agent_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.agent_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.agent_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=3)
 
         self.agent_mode_var = tk.StringVar(value="plan")
         self.agent_cmd_var = tk.StringVar(value="find me the best buys across the top 10 crypto coins on 4h and keep risk tight")
+        self.agent_ai_fallback_var = tk.BooleanVar(value=bool(self.state.get("agent_ai_fallback_enabled", True)))
         self.agent_guard_enabled_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_enabled", True)))
         self.agent_guard_require_stop_var = tk.BooleanVar(value=bool(self.state.get("agent_guard_require_stop", True)))
         self.agent_guard_max_daily_loss_var = tk.StringVar(value=str(self.state.get("agent_guard_max_daily_loss_pct", 5.0)))
@@ -434,6 +450,7 @@ class StrataGuiApp:
         ttk.Label(top, text="Command").pack(side="left", padx=(10, 0))
         ttk.Entry(top, textvariable=self.agent_cmd_var, width=120).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(top, text="Run Command", command=self._run_agent_command).pack(side="left", padx=6)
+        ttk.Checkbutton(top, text="AI fallback", variable=self.agent_ai_fallback_var).pack(side="left", padx=(6, 0))
 
         guard = ttk.LabelFrame(self.agent_tab, text="Agent Guardrails", padding=8)
         guard.pack(fill="x", padx=8, pady=(0, 8))
@@ -452,6 +469,8 @@ class StrataGuiApp:
         btns.pack(fill="x", pady=(6, 0))
         ttk.Button(btns, text="Copy Output", command=lambda: self._copy_text_widget(self.agent_output, "Agent output")).pack(side="left")
         ttk.Button(btns, text="Clear Output", command=lambda: self.agent_output.delete("1.0", tk.END)).pack(side="left", padx=6)
+        ttk.Button(btns, text="Execute Last Staged", command=self._execute_last_agent_staged).pack(side="left", padx=6)
+        ttk.Button(btns, text="Show Agent Status", command=self._show_agent_status).pack(side="left", padx=6)
 
     def _build_portfolio_tab(self) -> None:
         top = ttk.Frame(self.portfolio_tab, padding=8)
@@ -476,6 +495,10 @@ class StrataGuiApp:
         self.pf_auto_buy_pct_var = tk.StringVar(value="10")
         self.pf_auto_sell_pct_var = tk.StringVar(value="100")
         self.pf_auto_confidence_var = tk.BooleanVar(value=True)
+        self.pf_protect_interval_min_var = tk.StringVar(value="30")
+        self.pf_protect_auto_send_var = tk.BooleanVar(value=False)
+        self.pf_auto_refresh_var = tk.BooleanVar(value=bool(self.state.get("portfolio_auto_refresh_enabled", True)))
+        self.pf_auto_refresh_secs_var = tk.StringVar(value=str(self.state.get("portfolio_auto_refresh_seconds", 45)))
 
         ttk.Label(top, text="Binance Profile").pack(side="left")
         self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
@@ -488,6 +511,12 @@ class StrataGuiApp:
         ttk.Button(top, text="Refresh Portfolio", command=self._refresh_portfolio).pack(side="left")
         ttk.Button(top, text="Reconcile Fills", command=self._reconcile_binance_fills).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Review Open Positions (MTF)", command=self._review_open_positions_mtf).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Protect Open Positions (AI+BT)", command=self._run_protect_open_positions_ai).pack(side="left", padx=(6, 0))
+        ttk.Label(top, text="Protect every (min)").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pf_protect_interval_min_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="Auto-send protection", variable=self.pf_protect_auto_send_var).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Start Protect Monitor", command=self._start_protection_monitor).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Stop Protect Monitor", command=self._stop_protection_monitor).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
         ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
@@ -495,9 +524,13 @@ class StrataGuiApp:
         ttk.Button(top, text="Import Signals from Live", command=self._import_signals_from_live).pack(side="left", padx=8)
         ttk.Button(top, text="Refresh Ledger", command=self._refresh_ledger_view).pack(side="left")
         ttk.Button(top, text="Prune Signal History", command=self._prune_signal_history).pack(side="left", padx=(6, 0))
+        ttk.Label(top, text="Auto refresh (s)").pack(side="left", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.pf_auto_refresh_secs_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="While on this tab", variable=self.pf_auto_refresh_var).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="Refresh All Now", command=self._refresh_portfolio_suite).pack(side="left", padx=(6, 0))
 
-        pending_frame = ttk.LabelFrame(self.portfolio_tab, text="Pending Recommendations (Review & Approve)", padding=8)
-        pending_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        pending_frame = ttk.LabelFrame(body, text="Pending Recommendations (Review & Approve)", padding=8)
+        pending_frame.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
             columns=("id", "symbol", "side", "type", "qty", "stop", "tf", "conf", "status", "reason"),
@@ -525,7 +558,7 @@ class StrataGuiApp:
         ttk.Label(pending_btns_row1, text="Set qty").pack(side="left")
         ttk.Entry(pending_btns_row1, textvariable=self.pf_pending_qty_var, width=10).pack(side="left", padx=4)
         ttk.Label(pending_btns_row1, text="type").pack(side="left")
-        ttk.Combobox(pending_btns_row1, textvariable=self.pf_pending_type_var, values=["MARKET", "LIMIT"], width=8, state="readonly").pack(side="left", padx=4)
+        ttk.Combobox(pending_btns_row1, textvariable=self.pf_pending_type_var, values=["MARKET", "LIMIT", "STOP_LOSS_LIMIT"], width=14, state="readonly").pack(side="left", padx=4)
         ttk.Button(pending_btns_row1, text="Apply to Selected", command=self._apply_pending_edit_to_selected).pack(side="left", padx=6)
         ttk.Label(pending_btns_row1, text="Auto BUY %").pack(side="left", padx=(10, 0))
         ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_buy_pct_var, width=6).pack(side="left", padx=4)
@@ -539,7 +572,7 @@ class StrataGuiApp:
         ttk.Button(pending_btns_row2, text="Remove Selected", command=self._remove_selected_pending_orders).pack(side="left", padx=6)
         ttk.Button(pending_btns_row2, text="Clear All", command=self._clear_pending_recommendations).pack(side="left")
 
-        manual = ttk.LabelFrame(self.portfolio_tab, text="Manual Ledger Event", padding=8)
+        manual = ttk.LabelFrame(body, text="Manual Ledger Event", padding=8)
         manual.pack(fill="x", padx=8, pady=(0, 8))
         self._labeled_entry(manual, "Asset", self.pf_manual_asset_var)
         self._labeled_combo(manual, "Action", self.pf_manual_action_var, ["BUY", "SELL", "HOLD"], state="readonly")
@@ -549,8 +582,8 @@ class StrataGuiApp:
         self._labeled_entry(manual, "Note", self.pf_manual_note_var)
         ttk.Button(manual, text="Add Manual Event", command=self._add_manual_ledger_event).pack(fill="x", pady=(6, 0))
 
-        orders = ttk.LabelFrame(self.portfolio_tab, text="Open Binance Orders (Cancel via GUI)", padding=8)
-        orders.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        orders = ttk.LabelFrame(body, text="Open Binance Orders (Cancel via GUI)", padding=8)
+        orders.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         order_top = ttk.Frame(orders)
         order_top.pack(fill="x")
         self.pf_open_symbol_filter_var = tk.StringVar(value="")
@@ -580,17 +613,19 @@ class StrataGuiApp:
         open_orders_frame.pack(fill="x", expand=False, pady=(6, 0))
 
         cols = ttk.Frame(body)
-        cols.pack(fill="both", expand=True)
+        cols.pack(fill="both", expand=False, pady=(0, 8))
+        cols.configure(height=220)
+        cols.pack_propagate(False)
         left = ttk.LabelFrame(cols, text="Current Portfolio (Binance)", padding=6)
         right = ttk.LabelFrame(cols, text="Open Positions (Ledger)", padding=6)
         left.pack(side="left", fill="both", expand=True, padx=(0, 6))
         right.pack(side="left", fill="both", expand=True)
 
-        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none")
+        pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none", height=8)
         pf_portfolio_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_portfolio_text)
 
-        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none")
+        pf_open_frame, self.pf_open_positions_text = self._create_scrolled_text(right, wrap="none", height=8)
         pf_open_frame.pack(fill="both", expand=True)
         self._configure_dashboard_tags(self.pf_open_positions_text)
 
@@ -617,10 +652,12 @@ class StrataGuiApp:
         self._refresh_binance_profiles()
         self._refresh_ledger_view()
         self._refresh_pending_recommendations_view()
+        self.root.after(300, self._refresh_portfolio_suite)
 
     def _build_research_tab(self) -> None:
-        top = ttk.Frame(self.research_tab, padding=8)
-        top.pack(fill="x")
+        split = self._create_paned(self.research_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
         self.rs_market_scope = tk.StringVar(value="both")
         self.rs_quote = tk.StringVar(value="USD")
         self.rs_country = tk.StringVar(value=country_code_to_display("2"))
@@ -646,14 +683,17 @@ class StrataGuiApp:
         self.btn_run_research_comp = ttk.Button(top, text="Run Comprehensive", command=self._run_comprehensive_research)
         self.btn_run_research_comp.pack(side="left")
 
-        rs_frame, self.rs_output = self._create_scrolled_text(self.research_tab, wrap="none")
+        rs_host = ttk.Frame(split, padding=8)
+        split.add(rs_host, weight=3)
+        rs_frame, self.rs_output = self._create_scrolled_text(rs_host, wrap="none")
         rs_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_task_tab(self) -> None:
-        top = ttk.Frame(self.task_tab, padding=8)
-        top.pack(fill="x")
-        body = ttk.Frame(self.task_tab, padding=8)
-        body.pack(fill="both", expand=True)
+        split = self._create_paned(self.task_tab, orient="vertical")
+        top = ttk.Frame(split, padding=8)
+        body = ttk.Frame(split, padding=8)
+        split.add(top, weight=1)
+        split.add(body, weight=4)
 
         ttk.Button(top, text="Refresh", command=self._refresh_task_tab).pack(side="left")
         self.btn_pause_queue = ttk.Button(top, text="Pause Queue", command=self._toggle_queue_pause)
@@ -666,25 +706,29 @@ class StrataGuiApp:
         cols.pack(fill="both", expand=True)
         left = ttk.LabelFrame(cols, text="Running", padding=6)
         right = ttk.LabelFrame(cols, text="Queued", padding=6)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        right.pack(side="left", fill="both", expand=True)
+        cols_split = self._create_paned(cols, orient="horizontal")
+        cols_split.pack(fill="both", expand=True)
+        cols_split.add(left, weight=1)
+        cols_split.add(right, weight=1)
 
         self.running_list = tk.Listbox(left, height=12)
         self.running_list.pack(fill="both", expand=True)
         self.queued_list = tk.Listbox(right, height=12)
         self.queued_list.pack(fill="both", expand=True)
 
-        task_out_frame, self.task_tab_output = self._create_scrolled_text(body, height=4, wrap="none")
-        task_out_frame.pack(fill="x", pady=(8, 0))
+        logs_split = self._create_paned(body, orient="vertical")
+        logs_split.pack(fill="both", expand=True, pady=(8, 0))
+        task_out_frame, self.task_tab_output = self._create_scrolled_text(logs_split, height=4, wrap="none")
+        logs_split.add(task_out_frame, weight=1)
         task_term_frame, self.task_terminal = self._create_scrolled_text(
-            body,
+            logs_split,
             height=12,
             wrap="none",
             bg="#101315",
             fg="#9CF5C6",
             insertbackground="#9CF5C6",
         )
-        task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
+        logs_split.add(task_term_frame, weight=3)
         self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
         term_btns = ttk.Frame(body)
         term_btns.pack(fill="x", pady=(6, 0))
@@ -694,8 +738,9 @@ class StrataGuiApp:
         self._schedule_task_tab_refresh()
 
     def _build_settings_tab(self) -> None:
-        frame = ttk.Frame(self.settings_tab, padding=8)
-        frame.pack(fill="both", expand=True)
+        split = self._create_paned(self.settings_tab, orient="vertical")
+        frame = ttk.Frame(split, padding=8)
+        split.add(frame, weight=3)
 
         self.display_currency_var = tk.StringVar(value=self.state.get("display_currency", "USD"))
         self._labeled_combo(frame, "Display Currency", self.display_currency_var, ["USD", "AUD", "EUR", "GBP", "CAD", "JPY", "NZD", "SGD", "HKD", "CHF"])
@@ -784,8 +829,8 @@ class StrataGuiApp:
 
         ttk.Button(frame, text="Save Settings", command=self._persist_state).pack(fill="x")
 
-        settings_frame, self.settings_output = self._create_scrolled_text(frame, height=8, wrap="none")
-        settings_frame.pack(fill="both", expand=True, pady=(8, 0))
+        settings_frame, self.settings_output = self._create_scrolled_text(split, height=8, wrap="none")
+        split.add(settings_frame, weight=1)
         settings_btns = ttk.Frame(frame)
         settings_btns.pack(fill="x", pady=(6, 0))
         ttk.Button(settings_btns, text="Copy Settings Log", command=lambda: self._copy_text_widget(self.settings_output, "Settings log")).pack(side="left")
@@ -800,6 +845,12 @@ class StrataGuiApp:
         row.pack(fill="x", pady=2)
         ttk.Label(row, text=label, width=16).pack(side="left")
         ttk.Entry(row, textvariable=var, width=18).pack(side="left")
+
+    def _create_paned(self, parent, orient: str = "horizontal") -> ttk.Panedwindow:
+        o = tk.HORIZONTAL if str(orient).lower().startswith("h") else tk.VERTICAL
+        pane = ttk.Panedwindow(parent, orient=o)
+        pane.pack(fill="both", expand=True)
+        return pane
 
     def _create_scrolled_text(self, parent, **text_kwargs):
         frame = ttk.Frame(parent)
@@ -887,6 +938,27 @@ class StrataGuiApp:
         self.root.clipboard_append(payload)
         self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
 
+    def _human_readable_ts(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return raw
+        try:
+            ts = pd.to_datetime(raw, utc=True, errors="raise")
+        except Exception:
+            return raw
+        try:
+            local_ts = ts.tz_convert(datetime.now().astimezone().tzinfo)
+            return local_ts.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        except Exception:
+            return str(ts)
+
+    def _humanize_df_timestamps(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        out = df.copy()
+        for c in cols:
+            if c in out.columns:
+                out[c] = out[c].apply(self._human_readable_ts)
+        return out
+
     def _configure_dashboard_tags(self, widget: tk.Text) -> None:
         # Section/header emphasis
         widget.tag_configure("hdr", foreground="#7FDBFF")
@@ -895,6 +967,10 @@ class StrataGuiApp:
         widget.tag_configure("buy", foreground="#2ECC71")
         widget.tag_configure("hold", foreground="#F39C12")
         widget.tag_configure("sell", foreground="#E74C3C")
+        # Open position protection emphasis
+        widget.tag_configure("protected", foreground="#2ECC71")
+        widget.tag_configure("stale_protected", foreground="#F39C12")
+        widget.tag_configure("unprotected", foreground="#E74C3C")
         # Result emphasis
         widget.tag_configure("okline", foreground="#2ECC71")
         widget.tag_configure("errline", foreground="#FF6B6B")
@@ -903,7 +979,18 @@ class StrataGuiApp:
         if widget is None:
             return
         # Clear prior highlights
-        for tag in ("hdr", "subhdr", "buy", "hold", "sell", "okline", "errline"):
+        for tag in (
+            "hdr",
+            "subhdr",
+            "buy",
+            "hold",
+            "sell",
+            "protected",
+            "stale_protected",
+            "unprotected",
+            "okline",
+            "errline",
+        ):
             widget.tag_remove(tag, "1.0", tk.END)
 
         def _tag_all(needle: str, tag: str, nocase: bool = True) -> None:
@@ -929,6 +1016,14 @@ class StrataGuiApp:
             _tag_all(k, "hold")
         for k in ("🔴 SELL", " SELL "):
             _tag_all(k, "sell")
+
+        # Open-position protection markers
+        for k in ("PROTECTED",):
+            _tag_all(k, "protected", nocase=False)
+        for k in ("STALE_PROTECTED",):
+            _tag_all(k, "stale_protected", nocase=False)
+        for k in ("UNPROTECTED",):
+            _tag_all(k, "unprotected", nocase=False)
 
         # Outcome markers
         for k in ("DONE", "SUCCESS", "OK"):
@@ -1752,6 +1847,7 @@ class StrataGuiApp:
         staged = out.get("staged_recs", []) or []
         if staged:
             self.pending_recommendations.extend(staged)
+            self.agent_last_staged_ids = [int(r.get("id", 0) or 0) for r in staged if int(r.get("id", 0) or 0) > 0]
             self._refresh_pending_recommendations_view()
             self._append_task_terminal(f"Agent staged {len(staged)} recommendation(s).")
         if out.get("auto_size", False) and staged:
@@ -1809,114 +1905,677 @@ class StrataGuiApp:
                 self._submit_selected_pending_orders()
         if out.get("refresh_ledger", False):
             self._refresh_ledger_view()
+        if bool(out.get("execute_last_staged", False)):
+            self._execute_last_agent_staged()
+        sched = str(out.get("scheduler_action", "") or "").strip().lower()
+        if sched == "start":
+            mins = out.get("scheduler_minutes")
+            if isinstance(mins, (int, float)) and float(mins) > 0:
+                self.pipeline_interval_min_var.set(str(int(float(mins))))
+            self._start_pipeline_scheduler()
+        elif sched in ("stop", "pause"):
+            self._stop_pipeline_scheduler()
+        view = str(out.get("open_view", "") or "").strip().lower()
+        if view in ("portfolio", "ledger", "detailed"):
+            try:
+                self.nb.select(self.portfolio_tab)
+            except Exception:
+                pass
         self._append_task_terminal("DONE Agent Command")
         self._finish_task(task_id, task_name="Agent Command")
 
-    def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
-        c = str(cmd or "").strip().lower()
-        top_n = 10
+    def _show_agent_status(self) -> None:
+        excl = self.agent_context.get("exclude_assets", []) or []
+        ex_txt = ", ".join([str(x) for x in excl[:12]]) if excl else "none"
+        sched = "running" if bool(self.pipeline_job) else "stopped"
+        msg = (
+            "Agent Status\n"
+            f"- Context timeframe: {self.agent_context.get('timeframe', '4h')}\n"
+            f"- Context top_n: {self.agent_context.get('top_n', 10)}\n"
+            f"- Context quote: {self.agent_context.get('quote_asset', self._effective_crypto_quote('USDT'))}\n"
+            f"- Context stop %: {self.agent_context.get('stop_pct', 5.0)}\n"
+            f"- Exclusions: {ex_txt}\n"
+            f"- Scheduler: {sched} (interval {self.pipeline_interval_min_var.get().strip() or '30'} min)\n"
+            f"- Last staged ids: {len(self.agent_last_staged_ids)}"
+        )
+        self.agent_output.delete("1.0", tk.END)
+        self.agent_output.insert("1.0", msg)
+
+    def _execute_last_agent_staged(self) -> None:
+        ids = [int(x) for x in (self.agent_last_staged_ids or []) if int(x) > 0]
+        if not ids:
+            messagebox.showinfo("Agent", "No staged recommendations from the latest agent run.")
+            return
+        sel = []
+        for rec in self.pending_recommendations:
+            try:
+                rid = int(rec.get("id", 0) or 0)
+            except Exception:
+                rid = 0
+            if rid in ids:
+                sel.append(str(rid))
+        if not sel:
+            messagebox.showinfo("Agent", "Latest staged recommendations are no longer pending.")
+            return
+        try:
+            self.pending_tree.selection_set(*sel)
+        except Exception:
+            pass
+        self._auto_size_selected_pending_orders()
+        if str(self.agent_mode_var.get() or "").strip().lower() == "auto_execute":
+            self._submit_selected_pending_orders()
+            self._refresh_ledger_view()
+            self._append_task_terminal(f"Agent executed {len(sel)} staged recommendation(s).")
+            return
+        self._append_task_terminal(f"Agent prepared {len(sel)} staged recommendation(s). Review then Submit Selected.")
+
+    def _resolve_agent_quote_from_text(self, cmd_lower: str) -> str:
+        m = re.search(r"\b(usdt|usdc|fdusd|busd|usd|btc|eth|bnb)\b", cmd_lower)
+        if m:
+            q = m.group(1).upper()
+            if q == "USD" and self._is_primary_quote_locked():
+                return self._primary_quote_asset()
+            return q
+        return self._effective_crypto_quote("USDT")
+
+    def _build_agent_plan_card(self, intent: Dict[str, Any]) -> str:
+        lines = ["Agent Plan"]
+        lines.append(f"- Intent: {intent.get('intent', 'unknown')}")
+        tf = str(intent.get("timeframe", "") or "").strip()
+        if tf:
+            lines.append(f"- Timeframe: {tf}")
+        q = str(intent.get("quote_asset", "") or "").strip()
+        if q:
+            lines.append(f"- Quote Asset: {q}")
+        top_n = intent.get("top_n")
+        if isinstance(top_n, int) and top_n > 0:
+            lines.append(f"- Universe Size: top {top_n}")
+        stop_pct = intent.get("stop_pct")
+        if isinstance(stop_pct, (int, float)) and stop_pct > 0:
+            lines.append(f"- Stop Loss: {float(stop_pct):.2f}%")
+        if intent.get("amount_mode") == "quote_amount":
+            lines.append(f"- Spend: {float(intent.get('amount_value', 0.0) or 0.0):.4f} {q or 'QUOTE'}")
+        if intent.get("amount_mode") == "quote_percent":
+            lines.append(f"- Spend: {float(intent.get('amount_value', 0.0) or 0.0):.2f}% of free {q or 'QUOTE'}")
+        if bool(intent.get("expand_until_found", False)):
+            lines.append("- Search Strategy: expand top-N tiers until BUY signal(s) found")
+        excl = intent.get("exclude_assets")
+        if isinstance(excl, list) and excl:
+            lines.append("- Exclusions: " + ", ".join([str(x) for x in excl[:12]]))
+        lines.append(
+            "- Execution: "
+            + ("auto-submit allowed" if bool(intent.get("execute_requested", False)) else "stage/plan first")
+        )
+        return "\n".join(lines)
+
+    def _build_agent_ai_intent_prompt(self, cmd: str, mode: str) -> str:
+        ctx = self.agent_context if isinstance(self.agent_context, dict) else {}
+        payload = {
+            "command": str(cmd or "").strip(),
+            "mode": str(mode or "plan").strip().lower(),
+            "context": {
+                "timeframe": str(ctx.get("timeframe", "4h")),
+                "top_n": int(ctx.get("top_n", 10) or 10),
+                "quote_asset": str(ctx.get("quote_asset", self._effective_crypto_quote("USDT"))),
+                "stop_pct": float(ctx.get("stop_pct", 5.0) or 5.0),
+                "exclude_assets": ctx.get("exclude_assets", []),
+            },
+            "allowed_intents": [
+                "buy",
+                "scan_allocate",
+                "portfolio_pnl",
+                "portfolio_balance",
+                "open_view",
+                "scheduler",
+                "status",
+                "set_context",
+                "execute_staged",
+                "unknown",
+            ],
+            "allowed_timeframes": ["1d", "4h", "8h", "12h"],
+            "allowed_quote_assets": ["USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "BNB"],
+        }
+        return (
+            "Interpret the user trading command into strict JSON for the STRATA agent.\n"
+            "Return ONLY one JSON object between the markers below.\n"
+            "Do not include commentary.\n\n"
+            "BEGIN_STRATA_AGENT_INTENT_JSON\n"
+            "{\n"
+            "  \"intent\": \"buy|scan_allocate|portfolio_pnl|portfolio_balance|open_view|scheduler|status|set_context|execute_staged|unknown\",\n"
+            "  \"asset\": \"BTC\",\n"
+            "  \"symbol\": \"BTCUSDT\",\n"
+            "  \"timeframe\": \"4h\",\n"
+            "  \"top_n\": 10,\n"
+            "  \"quote_asset\": \"USDT\",\n"
+            "  \"stop_pct\": 5.0,\n"
+            "  \"amount_mode\": \"quote_amount|quote_percent\",\n"
+            "  \"amount_value\": 10.0,\n"
+            "  \"auto_size\": true,\n"
+            "  \"execute_requested\": false,\n"
+            "  \"expand_until_found\": false,\n"
+            "  \"scheduler_action\": \"start|stop\",\n"
+            "  \"scheduler_minutes\": 30,\n"
+            "  \"open_view\": \"portfolio\",\n"
+            "  \"context_updates\": {\"exclude_assets\": [\"TRX\"]},\n"
+            "  \"exclude_assets\": [\"TRX\"],\n"
+            "  \"error\": \"\"\n"
+            "}\n"
+            "END_STRATA_AGENT_INTENT_JSON\n\n"
+            "User command + runtime context JSON:\n"
+            + json.dumps(payload, indent=2)
+        )
+
+    def _parse_agent_intent_ai_response(self, text: str) -> Dict[str, Any]:
+        raw = str(text or "")
+        if not raw.strip():
+            return {"intent": "unknown", "error": "Empty AI response."}
+        m = re.search(
+            r"BEGIN_STRATA_AGENT_INTENT_JSON\s*(\{[\s\S]*?\})\s*END_STRATA_AGENT_INTENT_JSON",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        blob = ""
+        if m:
+            blob = m.group(1).strip()
+        else:
+            m2 = re.search(r"(\{[\s\S]*\})", raw)
+            if m2:
+                blob = m2.group(1).strip()
+        if not blob:
+            return {"intent": "unknown", "error": "AI intent JSON not found in response."}
+        try:
+            parsed = json.loads(blob)
+        except Exception as exc:
+            return {"intent": "unknown", "error": f"AI intent JSON parse failed: {type(exc).__name__}"}
+        if not isinstance(parsed, dict):
+            return {"intent": "unknown", "error": "AI intent payload is not an object."}
+        intent = str(parsed.get("intent", "unknown")).strip().lower()
+        allowed = {"buy", "scan_allocate", "portfolio_pnl", "portfolio_balance", "open_view", "scheduler", "status", "set_context", "execute_staged", "unknown"}
+        if intent not in allowed:
+            return {"intent": "unknown", "error": f"AI returned unsupported intent: {intent}"}
+        parsed["intent"] = intent
+        return parsed
+
+    def _parse_agent_intent(self, cmd: str, mode: str) -> Dict[str, Any]:
+        c_raw = str(cmd or "").strip()
+        c = c_raw.lower()
+        tf = str(self.agent_context.get("timeframe", "4h")).strip().lower() or "4h"
+        m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
+        if m_tf:
+            tf = m_tf.group(1)
+        top_n = int(self.agent_context.get("top_n", 10) or 10)
         m_top = re.search(r"top\s+(\d+)", c)
         if m_top:
             try:
                 top_n = max(1, min(100, int(m_top.group(1))))
             except Exception:
                 top_n = 10
-        tf = "4h"
-        m_tf = re.search(r"\b(1d|4h|8h|12h)\b", c)
-        if m_tf:
-            tf = m_tf.group(1)
-        stop_pct = 5.0
-        m_stop = re.search(r"stop(?:\s*loss)?[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)\s*%?", c)
-        if m_stop:
-            try:
-                stop_pct = max(0.1, min(25.0, float(m_stop.group(1))))
-            except Exception:
-                stop_pct = 5.0
-
-        if ("best buy" in c) or ("best buys" in c):
-            quote = self._effective_crypto_quote("USDT")
-            live_cfg = {
-                "name": "Agent Scan",
-                "market": "crypto",
-                "timeframe": tf,
-                "quote_currency": quote,
-                "top_n": top_n,
-                "display_currency": self.display_currency_var.get().strip() or "USD",
-            }
-            live = bridge.run_live_panel(live_cfg)
-            if not live.get("ok"):
-                return {"ok": False, "error": live.get("error", "Live scan failed")}
-            rows = live.get("table_rows", []) if isinstance(live.get("table_rows"), list) else []
-            buys: List[Dict[str, Any]] = []
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                act = str(r.get("Action", "")).upper()
-                if "BUY" not in act:
-                    continue
-                asset = str(r.get("Asset", "")).strip().upper()
-                if not asset:
-                    continue
+        stop_pct = float(self.agent_context.get("stop_pct", 5.0) or 5.0)
+        if re.search(r"\b(no stop|without stop)\b", c):
+            stop_pct = 0.0
+        else:
+            m_stop = re.search(r"stop(?:\s*loss)?[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)\s*%?", c)
+            if m_stop:
                 try:
-                    px = float(r.get("Price", 0.0) or 0.0)
+                    stop_pct = max(0.0, min(25.0, float(m_stop.group(1))))
                 except Exception:
-                    px = 0.0
-                sl = px * (1.0 - (stop_pct / 100.0)) if px > 0 else 0.0
-                self._pending_rec_seq += 1
-                buys.append(
-                    {
-                        "id": self._pending_rec_seq,
-                        "symbol": f"{asset}{quote}",
-                        "asset": asset,
-                        "side": "BUY",
-                        "order_type": "MARKET",
-                        "quantity": 0.0,
-                        "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
-                        "timeframe": tf,
-                        "confidence": "",
-                        "status": "PENDING",
-                        "reason": f"Agent best-buy scan ({tf}, top {top_n})",
-                    }
-                )
-            if not buys:
-                return {"ok": True, "text": f"No BUY signals found for top {top_n} on {tf}.", "staged_recs": []}
-            lines = [f"Agent scan found {len(buys)} BUY candidate(s) on {tf} (top {top_n}, quote {quote})."]
-            for b in buys[:10]:
-                lines.append(f"- {b['symbol']} stop~{b.get('stop_loss_price', 0)}")
-            exec_words = ("execute", "submit", "place order", "buy now", "transaction")
-            do_execute = any([w in c for w in exec_words]) and mode in ("semi_auto", "auto_execute")
-            if do_execute:
-                if mode == "auto_execute":
-                    lines.append("Will auto-size and auto-execute staged recommendations.")
-                else:
-                    lines.append("Will auto-size staged recommendations (semi_auto).")
-                return {
-                    "ok": True,
-                    "text": "\n".join(lines),
-                    "staged_recs": buys,
-                    "auto_size": True,
-                    "auto_execute": (mode == "auto_execute"),
-                    "refresh_ledger": True,
+                    stop_pct = 5.0
+        quote = str(self.agent_context.get("quote_asset", self._resolve_agent_quote_from_text(c))).strip().upper()
+        if re.search(r"\b(usdt|usdc|fdusd|busd|usd|btc|eth|bnb)\b", c):
+            quote = self._resolve_agent_quote_from_text(c)
+        exec_words = ("execute", "submit", "place order", "buy now", "transaction", "go live")
+        execute_requested = any([w in c for w in exec_words])
+        scan_words = ("best buy", "best buys", "look for signals", "search for", "allocate", "invest in")
+        expand_words = ("expand search", "until found", "comprehensive")
+        excl = self.agent_context.get("exclude_assets", [])
+        if not isinstance(excl, list):
+            excl = []
+
+        m_every = re.search(r"\brun\s+every\s+(\d+)\s*(m|min|mins|minute|minutes)\b", c)
+        if m_every:
+            mins = max(1, min(240, int(m_every.group(1))))
+            return {"intent": "scheduler", "scheduler_action": "start", "scheduler_minutes": mins}
+        if re.search(r"\b(pause|stop)\b.*\b(scheduler|pipeline|auto)\b", c) or c in {"pause", "stop"}:
+            return {"intent": "scheduler", "scheduler_action": "stop"}
+        if re.search(r"\b(status|show status|agent status)\b", c):
+            return {"intent": "status"}
+        if re.search(r"\b(pnl|profit|performance|return)\b", c):
+            window = "all"
+            n = 20
+            m_last = re.search(r"\blast\s+(\d+)\b", c)
+            if m_last:
+                window = "last_n"
+                try:
+                    n = max(1, min(500, int(m_last.group(1))))
+                except Exception:
+                    n = 20
+            if re.search(r"\b(today|24h)\b", c):
+                window = "today"
+            return {"intent": "portfolio_pnl", "window": window, "last_n": n}
+        if re.search(r"\b(how much|balance|holdings?|position|portfolio)\b", c):
+            asset = ""
+            m_asset = re.search(r"\b(?:of|for|in)\s+([a-z0-9]{2,12})\b", c)
+            if m_asset:
+                asset = str(m_asset.group(1) or "").upper()
+            if not asset:
+                tokens = [t.upper() for t in re.findall(r"\b[a-z0-9]{2,12}\b", c)]
+                ignore = {
+                    "HOW", "MUCH", "DO", "I", "HAVE", "MY", "BALANCE", "HOLDING", "HOLDINGS",
+                    "POSITION", "PORTFOLIO", "SHOW", "IN", "OF", "FOR", "THE", "A", "AN", "PLEASE",
                 }
-            return {"ok": True, "text": "\n".join(lines), "staged_recs": buys}
+                for t in tokens:
+                    if t in ignore:
+                        continue
+                    if t in COMMON_CRYPTO_BASES or t in {"USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "BNB"}:
+                        asset = t
+                        break
+            return {"intent": "portfolio_balance", "asset": asset}
+
+        m_excl = re.search(r"\bexclude\s+([a-z0-9,\s]+)$", c)
+        if m_excl:
+            raw = m_excl.group(1)
+            tokens = [x.strip().upper() for x in re.split(r"[,\s]+", raw) if x.strip()]
+            tokens = [t for t in tokens if re.fullmatch(r"[A-Z0-9]{2,12}", t)]
+            new_excl = sorted(list(set(excl + tokens)))
+            return {"intent": "set_context", "context_updates": {"exclude_assets": new_excl}}
+        if re.search(r"\b(clear exclusions|reset exclusions)\b", c):
+            return {"intent": "set_context", "context_updates": {"exclude_assets": []}}
+
+        if ("open detailed view" in c) or ("open detail view" in c) or ("open portfolio" in c):
+            return {"intent": "open_view", "open_view": "portfolio"}
+        if re.search(r"\b(execute|submit)\s+(last\s+)?staged\b", c):
+            return {"intent": "execute_staged"}
+
+        if any([w in c for w in scan_words]):
+            return {
+                "intent": "scan_allocate",
+                "timeframe": tf,
+                "top_n": top_n,
+                "quote_asset": quote,
+                "stop_pct": stop_pct,
+                "expand_until_found": any([w in c for w in expand_words]),
+                "auto_size": ("allocate" in c) or ("current " + quote.lower() in c) or ("with my current" in c),
+                "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+                "exclude_assets": excl,
+            }
 
         if "buy" in c:
+            m_amt = re.search(
+                r"\bbuy\s+([0-9]+(?:\.[0-9]+)?)\s*(usd|usdt|usdc|fdusd|busd)?\s*(?:of\s+)?([a-z0-9]{2,12})\b",
+                c,
+            )
             m_sym = re.search(r"\bbuy\s+([a-z0-9]{2,12})\b", c)
-            if not m_sym:
-                return {"ok": False, "error": "Could not parse buy symbol. Try: buy btc with 5% stop loss"}
-            base = m_sym.group(1).upper()
-            quote = self._effective_crypto_quote("USDT")
-            symbol = f"{base}{quote}"
+            base = ""
+            amount_mode = "quote_percent"
+            amount_value = 10.0
+            if m_amt:
+                base = str(m_amt.group(3) or "").upper()
+                amount_mode = "quote_amount"
+                try:
+                    amount_value = max(0.01, float(m_amt.group(1)))
+                except Exception:
+                    amount_value = 10.0
+                if m_amt.group(2):
+                    qtxt = str(m_amt.group(2)).upper()
+                    if qtxt == "USD" and self._is_primary_quote_locked():
+                        qtxt = self._primary_quote_asset()
+                    quote = qtxt
+            elif m_sym:
+                base = str(m_sym.group(1) or "").upper()
+            banned = {"SIGNAL", "SIGNALS", "STRATEGY", "ORDER", "ORDERS", "VIEW", "DETAIL", "DETAILED"}
+            if (not base) or (base in banned):
+                return {"intent": "unknown", "error": "Could not parse buy symbol."}
+            m_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:of\s+my\s+)?(usdt|usd|usdc|fdusd|busd|balance|capital)?", c)
+            if amount_mode != "quote_amount" and m_pct:
+                amount_mode = "quote_percent"
+                try:
+                    amount_value = max(0.1, min(100.0, float(m_pct.group(1))))
+                except Exception:
+                    amount_value = 10.0
+                pool = str(m_pct.group(2) or "").strip().upper()
+                if pool in {"USDT", "USD", "USDC", "FDUSD", "BUSD"}:
+                    quote = self._primary_quote_asset() if (pool == "USD" and self._is_primary_quote_locked()) else pool
+            return {
+                "intent": "buy",
+                "asset": base,
+                "symbol": f"{base}{quote}",
+                "timeframe": tf,
+                "quote_asset": quote,
+                "stop_pct": stop_pct,
+                "amount_mode": amount_mode,
+                "amount_value": amount_value,
+                "execute_requested": execute_requested and mode in ("semi_auto", "auto_execute"),
+                "exclude_assets": excl,
+            }
+
+        return {"intent": "unknown"}
+
+    def _execute_agent_command(self, bridge: EngineBridge, cmd: str, mode: str) -> Dict[str, Any]:
+        parsed = self._parse_agent_intent(cmd, mode)
+        intent = str(parsed.get("intent", "unknown")).strip().lower()
+        ai_used = False
+        ai_fallback_enabled = bool(self.agent_ai_fallback_var.get()) if hasattr(self, "agent_ai_fallback_var") else False
+        if intent == "unknown" and ai_fallback_enabled:
+            dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ai_prompt = self._build_agent_ai_intent_prompt(cmd, mode)
+            ai_res = bridge.run_ai_analysis(
+                dashboard_text=str(cmd or ""),
+                datetime_context=dt,
+                prompt_override=ai_prompt,
+                system_prompt_override=(
+                    "You are a strict command parser for a trading copilot. "
+                    "Output only the requested JSON object between markers."
+                ),
+            )
+            if ai_res.get("ok"):
+                parsed_ai = self._parse_agent_intent_ai_response(ai_res.get("response", ""))
+                if str(parsed_ai.get("intent", "unknown")).strip().lower() != "unknown":
+                    parsed = parsed_ai
+                    intent = str(parsed.get("intent", "unknown")).strip().lower()
+                    ai_used = True
+            else:
+                self._append_task_terminal(f"AI fallback unavailable: {ai_res.get('error', 'unknown')}")
+        if intent == "set_context":
+            upd = parsed.get("context_updates", {})
+            if not isinstance(upd, dict):
+                upd = {}
+            for k, v in upd.items():
+                self.agent_context[k] = v
+            self.state["agent_context"] = self.agent_context
+            save_state(self.state)
+            return {"ok": True, "text": self._build_agent_plan_card({"intent": "context_updated", **self.agent_context})}
+        if intent == "status":
+            excl = self.agent_context.get("exclude_assets", []) or []
+            ex_txt = ", ".join([str(x) for x in excl[:12]]) if excl else "none"
+            sched = "running" if bool(self.pipeline_job) else "stopped"
+            return {
+                "ok": True,
+                "text": (
+                    "Agent Status\n"
+                    f"- Timeframe: {self.agent_context.get('timeframe', '4h')}\n"
+                    f"- Top-N: {self.agent_context.get('top_n', 10)}\n"
+                    f"- Quote: {self.agent_context.get('quote_asset', self._effective_crypto_quote('USDT'))}\n"
+                    f"- Stop %: {self.agent_context.get('stop_pct', 5.0)}\n"
+                    f"- Exclusions: {ex_txt}\n"
+                    f"- Scheduler: {sched} ({self.pipeline_interval_min_var.get().strip() or '30'} min)"
+                ),
+            }
+        if intent == "scheduler":
+            act = str(parsed.get("scheduler_action", "")).strip().lower()
+            mins = parsed.get("scheduler_minutes")
+            if act == "start":
+                return {
+                    "ok": True,
+                    "text": f"Starting Live->AI pipeline scheduler every {int(float(mins or 30))} minutes.",
+                    "scheduler_action": "start",
+                    "scheduler_minutes": int(float(mins or 30)),
+                }
+            return {"ok": True, "text": "Stopping Live->AI pipeline scheduler.", "scheduler_action": "stop"}
+        if intent == "portfolio_balance":
             profile = self.pf_binance_profile_var.get().strip() or None
             if not profile:
                 return {"ok": False, "error": "Select a Binance profile first."}
-            pct = 10.0
-            m_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:capital|balance|allocation|size)?", c)
-            if m_pct:
+            fres = bridge.fetch_binance_portfolio(profile_name=profile)
+            if not fres.get("ok"):
+                return {"ok": False, "error": str(fres.get("error", "Failed to fetch portfolio."))}
+            asset = str(parsed.get("asset", "") or "").strip().upper()
+            balances = fres.get("balances", []) if isinstance(fres.get("balances"), list) else []
+            total_est_usd = float(fres.get("total_est_usd", 0.0) or 0.0)
+            if asset:
+                row = None
+                for b in balances:
+                    if isinstance(b, dict) and str(b.get("asset", "")).upper() == asset:
+                        row = b
+                        break
+                if row is None:
+                    return {
+                        "ok": True,
+                        "text": (
+                            f"Holding check ({profile})\n"
+                            f"- {asset}: free=0, locked=0, total=0\n"
+                            f"- Portfolio est USD: {total_est_usd:,.2f}"
+                        ),
+                        "open_view": "portfolio",
+                    }
+                free = float(row.get("free", 0.0) or 0.0)
+                locked = float(row.get("locked", 0.0) or 0.0)
+                total = float(row.get("total", 0.0) or 0.0)
+                est_usd = float(row.get("est_usd", 0.0) or 0.0)
+                return {
+                    "ok": True,
+                    "text": (
+                        f"Holding check ({profile})\n"
+                        f"- {asset}: free={free:.8f}, locked={locked:.8f}, total={total:.8f}\n"
+                        f"- Est USD value: {est_usd:,.2f}\n"
+                        f"- Portfolio est USD: {total_est_usd:,.2f}"
+                    ),
+                    "open_view": "portfolio",
+                }
+            lines = [
+                f"Portfolio balance summary ({profile})",
+                f"- Total est USD: {total_est_usd:,.2f}",
+                "- Top holdings:",
+            ]
+            for b in balances[:10]:
+                if not isinstance(b, dict):
+                    continue
+                a = str(b.get("asset", "")).upper()
+                t = float(b.get("total", 0.0) or 0.0)
+                u = float(b.get("est_usd", 0.0) or 0.0)
+                lines.append(f"  - {a}: total={t:.8f} (~${u:,.2f})")
+            return {"ok": True, "text": "\n".join(lines), "open_view": "portfolio"}
+        if intent == "portfolio_pnl":
+            out = bridge.get_trade_ledger()
+            if not out.get("ok"):
+                return {"ok": False, "error": str(out.get("error", "Failed to load trade ledger."))}
+            execution_entries = out.get("execution_entries", [])
+            if not isinstance(execution_entries, list):
+                execution_entries = []
+            rows: List[Dict[str, Any]] = []
+            for e in execution_entries:
+                if not isinstance(e, dict):
+                    continue
+                pq_raw = e.get("pnl_quote", None)
+                pd_raw = e.get("pnl_display", None)
+                if pq_raw is None and pd_raw is None:
+                    continue
+                ee = dict(e)
                 try:
-                    pct = max(0.1, min(100.0, float(m_pct.group(1))))
+                    ee["_pnl_quote"] = float(pq_raw or 0.0)
                 except Exception:
-                    pct = 10.0
+                    ee["_pnl_quote"] = 0.0
+                try:
+                    ee["_pnl_display"] = float(pd_raw or 0.0)
+                except Exception:
+                    ee["_pnl_display"] = ee["_pnl_quote"]
+                ee["_ts"] = pd.to_datetime(ee.get("ts", ""), utc=True, errors="coerce")
+                rows.append(ee)
+            if not rows:
+                return {"ok": True, "text": "PnL summary: no realized execution PnL entries yet.", "open_view": "portfolio"}
+
+            window = str(parsed.get("window", "all") or "all").strip().lower()
+            last_n = int(parsed.get("last_n", 20) or 20)
+            filt = rows
+            if window == "today":
+                local_today = pd.Timestamp.now(tz="Australia/Sydney").date()
+                tmp = []
+                for r in rows:
+                    ts = r.get("_ts")
+                    if isinstance(ts, pd.Timestamp) and not pd.isna(ts):
+                        try:
+                            if ts.tz_convert("Australia/Sydney").date() == local_today:
+                                tmp.append(r)
+                        except Exception:
+                            pass
+                filt = tmp
+            elif window == "last_n":
+                filt = sorted(rows, key=lambda x: x.get("_ts", pd.Timestamp.min), reverse=True)[:last_n]
+
+            if not filt:
+                if window == "today":
+                    return {"ok": True, "text": "PnL summary (today): no realized entries today.", "open_view": "portfolio"}
+                return {"ok": True, "text": f"PnL summary: no entries for selected window ({window}).", "open_view": "portfolio"}
+
+            qsum = float(sum([float(r.get("_pnl_quote", 0.0) or 0.0) for r in filt]))
+            dsum = float(sum([float(r.get("_pnl_display", 0.0) or 0.0) for r in filt]))
+            wins = sum([1 for r in filt if float(r.get("_pnl_quote", 0.0) or 0.0) > 0])
+            losses = sum([1 for r in filt if float(r.get("_pnl_quote", 0.0) or 0.0) < 0])
+            total = len(filt)
+            win_rate = (wins / total * 100.0) if total > 0 else 0.0
+            scope = "all realized executions"
+            if window == "today":
+                scope = "today"
+            elif window == "last_n":
+                scope = f"last {last_n} realized executions"
+            txt = (
+                "PnL Summary\n"
+                f"- Scope: {scope}\n"
+                f"- Trades: {total} (wins={wins}, losses={losses}, win-rate={win_rate:.1f}%)\n"
+                f"- Realized PnL (Quote): {qsum:,.4f}\n"
+                f"- Realized PnL (Display): {dsum:,.4f}"
+            )
+            return {"ok": True, "text": txt, "open_view": "portfolio"}
+        if intent == "execute_staged":
+            return {"ok": True, "text": "Executing latest staged recommendations.", "execute_last_staged": True}
+        if intent == "open_view":
+            txt = "Opening Portfolio & Ledger detailed view."
+            if ai_used:
+                txt = "[AI intent parsed]\n" + txt
+            return {"ok": True, "text": txt, "open_view": parsed.get("open_view", "portfolio")}
+        if intent == "unknown":
+            err = str(parsed.get("error", "")).strip()
+            if err:
+                return {"ok": False, "error": err + " Try: 'buy 10 usdt of btc with stop loss 5%'."}
+            return {
+                "ok": True,
+                "text": (
+                    "Command understood, but no executable intent matched yet.\n"
+                    "Try:\n"
+                    "- find best buys top 10 crypto 4h and allocate\n"
+                    "- buy 10 usdt of btc with stop loss 5%\n"
+                    "- buy btc with 30% of my usdt\n"
+                    "- open detailed view"
+                ),
+            }
+
+        plan_card = self._build_agent_plan_card(parsed)
+        tf = str(parsed.get("timeframe", "4h")).strip().lower() or "4h"
+        quote = str(parsed.get("quote_asset", self._effective_crypto_quote("USDT"))).strip().upper()
+        stop_pct = float(parsed.get("stop_pct", 5.0) or 0.0)
+        self.agent_context["timeframe"] = tf
+        self.agent_context["quote_asset"] = quote
+        self.agent_context["stop_pct"] = stop_pct
+        try:
+            self.agent_context["top_n"] = int(parsed.get("top_n", self.agent_context.get("top_n", 10)) or 10)
+        except Exception:
+            self.agent_context["top_n"] = 10
+        if isinstance(parsed.get("exclude_assets"), list):
+            self.agent_context["exclude_assets"] = parsed.get("exclude_assets")
+        self.state["agent_context"] = self.agent_context
+        save_state(self.state)
+
+        if intent == "scan_allocate":
+            top_n = int(parsed.get("top_n", 10) or 10)
+            exclude_assets = {str(x).strip().upper() for x in (parsed.get("exclude_assets", []) or []) if str(x).strip()}
+            tiers = [top_n]
+            if bool(parsed.get("expand_until_found", False)):
+                for t in [10, 20, 50, 100]:
+                    if t not in tiers:
+                        tiers.append(t)
+            buys: List[Dict[str, Any]] = []
+            matched_top = top_n
+            for n in tiers:
+                live_cfg = {
+                    "name": "Agent Scan",
+                    "market": "crypto",
+                    "timeframe": tf,
+                    "quote_currency": quote,
+                    "top_n": n,
+                    "display_currency": self.display_currency_var.get().strip() or "USD",
+                }
+                live = bridge.run_live_panel(live_cfg)
+                if not live.get("ok"):
+                    continue
+                rows = live.get("table_rows", []) if isinstance(live.get("table_rows"), list) else []
+                staged: List[Dict[str, Any]] = []
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    act = str(r.get("Action", "")).upper()
+                    if "BUY" not in act:
+                        continue
+                    asset = str(r.get("Asset", "")).strip().upper()
+                    if not asset:
+                        continue
+                    if asset in exclude_assets:
+                        continue
+                    try:
+                        px = float(r.get("Price", 0.0) or 0.0)
+                    except Exception:
+                        px = 0.0
+                    sl = px * (1.0 - (stop_pct / 100.0)) if (px > 0 and stop_pct > 0) else 0.0
+                    score_raw = str(r.get("Raw Score", "") or r.get("Score", "")).strip()
+                    conf = ""
+                    m_sc = re.search(r"(-?\d+)\s*/\s*5", score_raw)
+                    if m_sc:
+                        try:
+                            sc = int(m_sc.group(1))
+                            conf = str(max(1.0, min(99.0, 50.0 + (sc * 10.0))))
+                        except Exception:
+                            conf = ""
+                    self._pending_rec_seq += 1
+                    staged.append(
+                        {
+                            "id": self._pending_rec_seq,
+                            "symbol": f"{asset}{quote}",
+                            "asset": asset,
+                            "side": "BUY",
+                            "order_type": "MARKET",
+                            "quantity": 0.0,
+                            "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
+                            "timeframe": tf,
+                            "confidence": conf,
+                            "status": "PENDING",
+                            "reason": f"Agent scan allocation ({tf}, top {n})",
+                        }
+                    )
+                if staged:
+                    buys = staged
+                    matched_top = n
+                    break
+            if not buys:
+                tiers_txt = ", ".join([str(t) for t in tiers])
+                return {"ok": True, "text": plan_card + f"\n\nNo BUY signals found (searched top tiers: {tiers_txt}) on {tf}.", "staged_recs": []}
+            lines = [plan_card, "", f"Signal scan found {len(buys)} BUY candidate(s) on {tf} (top {matched_top}, quote {quote})."]
+            for b in buys[:10]:
+                lines.append(f"- {b['symbol']} stop~{b.get('stop_loss_price', 0)}")
+            auto_size = bool(parsed.get("auto_size", False))
+            auto_exec = bool(parsed.get("execute_requested", False)) and mode == "auto_execute"
+            if auto_size:
+                lines.append("Allocation step: will auto-size recommendations from available balances.")
+            if auto_exec:
+                lines.append("Execution step: will submit immediately (auto_execute mode).")
+            out = {
+                "ok": True,
+                "text": "\n".join(lines),
+                "staged_recs": buys,
+                "auto_size": auto_size,
+                "auto_execute": auto_exec,
+                "refresh_ledger": auto_exec,
+            }
+            if ai_used:
+                out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+            return out
+
+        if intent == "buy":
+            base = str(parsed.get("asset", "")).strip().upper()
+            symbol = str(parsed.get("symbol", f"{base}{quote}")).strip().upper()
+            amount_mode = str(parsed.get("amount_mode", "quote_percent")).strip().lower()
+            amount_value = float(parsed.get("amount_value", 0.0) or 0.0)
+            execute_requested = bool(parsed.get("execute_requested", False))
+            profile = self.pf_binance_profile_var.get().strip() or None
+            if not profile:
+                return {"ok": False, "error": "Select a Binance profile first."}
             fres = bridge.fetch_binance_portfolio(profile_name=profile)
             if not fres.get("ok"):
                 return {"ok": False, "error": str(fres.get("error", "Failed to fetch portfolio."))}
@@ -1936,29 +2595,46 @@ class StrataGuiApp:
             px = float(p.get("price", 0.0) or 0.0)
             if px <= 0:
                 return {"ok": False, "error": "Invalid market price."}
-            spend = free_quote * (pct / 100.0)
+            if amount_mode == "quote_amount":
+                spend = max(0.01, amount_value)
+            else:
+                pct = max(0.1, min(100.0, amount_value if amount_value > 0 else 10.0))
+                spend = free_quote * (pct / 100.0)
+            if spend > free_quote:
+                return {"ok": False, "error": f"Requested spend {spend:.4f} {quote} exceeds free balance {free_quote:.4f} {quote}."}
             qty = spend / px
             v = bridge.validate_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=qty, profile_name=profile)
             if not v.get("ok"):
                 return {"ok": False, "error": str(v.get("error", "Order validation failed."))}
             nq = float(v.get("normalized_quantity", 0.0) or 0.0)
-            sl = px * (1.0 - (stop_pct / 100.0))
-            if mode == "plan":
-                self._pending_rec_seq += 1
-                rec = {
-                    "id": self._pending_rec_seq,
-                    "symbol": symbol,
-                    "asset": base,
-                    "side": "BUY",
-                    "order_type": "MARKET",
-                    "quantity": nq,
-                    "stop_loss_price": round(sl, 8),
-                    "timeframe": tf,
-                    "confidence": "",
-                    "status": "PENDING",
-                    "reason": f"Agent planned BUY using {pct:.1f}% {quote} balance; stop {stop_pct:.2f}%",
+            sl = px * (1.0 - (stop_pct / 100.0)) if stop_pct > 0 else 0.0
+            self._pending_rec_seq += 1
+            rec = {
+                "id": self._pending_rec_seq,
+                "symbol": symbol,
+                "asset": base,
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": nq,
+                "stop_loss_price": round(sl, 8) if sl > 0 else 0.0,
+                "timeframe": tf,
+                "confidence": "",
+                "status": "PENDING",
+                "reason": (
+                    f"Agent BUY plan using {spend:.4f} {quote}"
+                    + (f" ({amount_value:.2f}% balance)" if amount_mode == "quote_percent" else "")
+                    + (f"; stop {stop_pct:.2f}%" if stop_pct > 0 else "; no stop")
+                ),
+            }
+            if mode == "plan" or not execute_requested:
+                out = {
+                    "ok": True,
+                    "text": plan_card + f"\n\nPlanned BUY {symbol}: qty={nq:.8f}, est spend={spend:.4f} {quote}, stop~{sl:.8f}",
+                    "staged_recs": [rec],
                 }
-                return {"ok": True, "text": f"Planned BUY {symbol}: qty={nq:.8f}, stop~{sl:.8f}", "staged_recs": [rec]}
+                if ai_used:
+                    out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+                return out
 
             if bool(self.agent_guard_enabled_var.get()):
                 try:
@@ -1990,16 +2666,22 @@ class StrataGuiApp:
             out = bridge.submit_binance_order(symbol=symbol, side="BUY", order_type="MARKET", quantity=nq, profile_name=profile)
             if not out.get("ok"):
                 return {"ok": False, "error": str(out.get("error", "Submit failed."))}
-            stop_limit = sl * 0.995
-            stop_out = bridge.submit_binance_order(
-                symbol=symbol,
-                side="SELL",
-                order_type="STOP_LOSS_LIMIT",
-                quantity=float(out.get("normalized_quantity", nq) or nq),
-                profile_name=profile,
-                price=stop_limit,
-                stop_price=sl,
-            )
+            stop_msg = "No protective stop requested."
+            if sl > 0:
+                stop_limit = sl * 0.995
+                stop_out = bridge.submit_binance_order(
+                    symbol=symbol,
+                    side="SELL",
+                    order_type="STOP_LOSS_LIMIT",
+                    quantity=float(out.get("normalized_quantity", nq) or nq),
+                    profile_name=profile,
+                    price=stop_limit,
+                    stop_price=sl,
+                )
+                if stop_out.get("ok"):
+                    stop_msg = f"Protective stop set at {sl:.8f}."
+                else:
+                    stop_msg = f"Stop placement failed: {stop_out.get('error', 'unknown')}."
             bridge.record_signal_event(
                 {
                     "market": "crypto",
@@ -2016,14 +2698,17 @@ class StrataGuiApp:
                 },
                 allow_duplicate=True,
             )
-            msg = f"Executed BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}. "
-            if stop_out.get("ok"):
-                msg += f"Protective stop set at {sl:.8f}."
-            else:
-                msg += f"Stop placement failed: {stop_out.get('error', 'unknown')}."
-            return {"ok": True, "text": msg, "refresh_ledger": True}
+            msg = (
+                plan_card
+                + f"\n\nExecuted BUY {symbol}: qty={float(out.get('normalized_quantity', nq) or nq):.8f}, "
+                + f"est spend={spend:.4f} {quote}. {stop_msg}"
+            )
+            out = {"ok": True, "text": msg, "refresh_ledger": True}
+            if ai_used:
+                out["text"] = "[AI intent parsed]\n" + str(out.get("text", ""))
+            return out
 
-        return {"ok": True, "text": "Command understood, but no executable intent matched yet. Try: 'find best buys top 10 crypto 4h' or 'buy btc 10% capital stop loss 5%'."}
+        return {"ok": False, "error": "Unhandled agent intent."}
 
     def _start_run_ai_analysis(self) -> None:
         self._start_run_ai_analysis_internal(source_override=None, force_no_confirm=False)
@@ -3095,8 +3780,8 @@ class StrataGuiApp:
             f"SELL sizing: {sell_pct:.1f}% of available base balance",
         )
 
-    def _submit_selected_pending_orders(self) -> None:
-        ids = self._selected_pending_ids()
+    def _submit_selected_pending_orders(self, ids_override: Optional[List[int]] = None, require_confirm: bool = True) -> None:
+        ids = list(ids_override) if isinstance(ids_override, list) and ids_override else self._selected_pending_ids()
         if not ids:
             messagebox.showinfo("Pending Orders", "Select one or more rows to submit.")
             return
@@ -3108,9 +3793,10 @@ class StrataGuiApp:
         if not profile:
             messagebox.showinfo("Pending Orders", "Select a Binance profile first.")
             return
-        ok = messagebox.askyesno("Submit Orders", f"Submit {len(ids)} selected order(s) to Binance?")
-        if not ok:
-            return
+        if require_confirm:
+            ok = messagebox.askyesno("Submit Orders", f"Submit {len(ids)} selected order(s) to Binance?")
+            if not ok:
+                return
         try:
             cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
         except Exception:
@@ -3176,12 +3862,92 @@ class StrataGuiApp:
                         blocked += 1
                         continue
             self._vlog(f"Submitting order: symbol={symbol} side={side} type={order_type} qty={qty}")
+            price_arg = None
+            stop_arg = None
+            if order_type == "STOP_LOSS_LIMIT":
+                try:
+                    stop_arg = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                except Exception:
+                    stop_arg = 0.0
+                try:
+                    price_arg = float(rec.get("limit_price", 0.0) or 0.0)
+                except Exception:
+                    price_arg = 0.0
+                if stop_arg <= 0:
+                    rec["status"] = "BLOCKED"
+                    rec["reason"] = "STOP_LOSS_LIMIT requires stop_loss_price > 0."
+                    blocked += 1
+                    continue
+                if not price_arg or price_arg <= 0:
+                    price_arg = float(stop_arg) * 0.995
+
+                if side == "SELL":
+                    # Tighten-only guard: never move a protective stop backwards for long positions.
+                    # If an existing protective stop is higher, block this update.
+                    oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
+                    if not oo.get("ok"):
+                        rec["status"] = "BLOCKED"
+                        rec["reason"] = (
+                            f"Could not verify existing protective stops ({oo.get('error', 'unknown')}). "
+                            "Tighten-only guard blocked update."
+                        )
+                        blocked += 1
+                        continue
+
+                    protective_orders: List[Dict[str, Any]] = []
+                    best_existing_stop = 0.0
+                    for od in oo.get("orders", []) or []:
+                        if not isinstance(od, dict):
+                            continue
+                        o_side = str(od.get("side", "")).upper()
+                        o_type = str(od.get("type", "")).upper()
+                        o_status = str(od.get("status", "")).upper()
+                        if o_side != "SELL" or o_status not in ("NEW", "PARTIALLY_FILLED"):
+                            continue
+                        if o_type not in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"):
+                            continue
+                        protective_orders.append(od)
+                        try:
+                            o_stop = float(od.get("stopPrice", 0.0) or 0.0)
+                        except Exception:
+                            o_stop = 0.0
+                        if o_stop <= 0:
+                            try:
+                                o_stop = float(od.get("price", 0.0) or 0.0)
+                            except Exception:
+                                o_stop = 0.0
+                        if o_stop > best_existing_stop:
+                            best_existing_stop = o_stop
+
+                    if best_existing_stop > 0 and float(stop_arg) + 1e-12 < float(best_existing_stop):
+                        rec["status"] = "BLOCKED"
+                        rec["reason"] = (
+                            f"Tighten-only guard: new stop {float(stop_arg):.8f} is below "
+                            f"existing protective stop {float(best_existing_stop):.8f}."
+                        )
+                        self._vlog(f"Submit blocked tighten-only: {symbol} new_stop={stop_arg} existing_stop={best_existing_stop}")
+                        blocked += 1
+                        continue
+
+                    if bool(rec.get("replace_existing_stop", False)):
+                        for od in protective_orders:
+                            try:
+                                oid = int(od.get("orderId", 0) or 0)
+                            except Exception:
+                                oid = 0
+                            if oid <= 0:
+                                continue
+                            self.bridge.cancel_binance_order(symbol=symbol, order_id=oid, profile_name=profile)
+                            self._vlog(f"Canceled existing protective order before replace: {symbol} oid={oid}")
+
             out = self.bridge.submit_binance_order(
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
                 quantity=qty,
                 profile_name=profile,
+                price=price_arg,
+                stop_price=stop_arg,
             )
             if not out.get("ok"):
                 err_text = str(out.get("error", "submit failed"))
@@ -3233,6 +3999,41 @@ class StrataGuiApp:
                 except Exception:
                     sl = 0.0
                 if sl > 0:
+                    # Tighten-only guard for auto protective placement after BUY:
+                    # if a stronger (higher) protective stop already exists, keep it.
+                    try:
+                        oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
+                    except Exception:
+                        oo = {"ok": False}
+                    if oo.get("ok"):
+                        best_existing_stop = 0.0
+                        for od in oo.get("orders", []) or []:
+                            if not isinstance(od, dict):
+                                continue
+                            o_side = str(od.get("side", "")).upper()
+                            o_type = str(od.get("type", "")).upper()
+                            o_status = str(od.get("status", "")).upper()
+                            if o_side != "SELL" or o_status not in ("NEW", "PARTIALLY_FILLED"):
+                                continue
+                            if o_type not in ("STOP_LOSS_LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"):
+                                continue
+                            try:
+                                o_stop = float(od.get("stopPrice", 0.0) or 0.0)
+                            except Exception:
+                                o_stop = 0.0
+                            if o_stop <= 0:
+                                try:
+                                    o_stop = float(od.get("price", 0.0) or 0.0)
+                                except Exception:
+                                    o_stop = 0.0
+                            if o_stop > best_existing_stop:
+                                best_existing_stop = o_stop
+                        if best_existing_stop > 0 and sl < best_existing_stop:
+                            self._vlog(
+                                f"Tighten-only guard adjusted BUY protective stop for {symbol}: "
+                                f"{sl:.8f} -> {best_existing_stop:.8f}"
+                            )
+                            sl = float(best_existing_stop)
                     stop_limit = sl * 0.995
                     stop_out = self.bridge.submit_binance_order(
                         symbol=symbol,
@@ -3252,7 +4053,7 @@ class StrataGuiApp:
             lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
-                    "timeframe": str(rec.get("timeframe", "1d")),
+                    "timeframe": "spot",
                     "panel": "ai_trade_queue",
                     "asset": self._base_asset_from_symbol(symbol),
                     "action": side,
@@ -3262,6 +4063,9 @@ class StrataGuiApp:
                     "display_currency": self.display_currency_var.get().strip() or "USD",
                     "note": f"Submitted to Binance ({symbol})",
                     "is_execution": True,
+                    "is_placeholder": True,
+                    "exchange_symbol": symbol,
+                    "exchange_order_id": int((out.get("data", {}) or {}).get("orderId", 0) or 0),
                 },
                 cooldown_minutes=cooldown,
                 # Execution events must be recorded even if a recent signal exists.
@@ -3375,26 +4179,446 @@ class StrataGuiApp:
             msg += f"\n\nFirst error:\n{errs[0]}"
         messagebox.showinfo("Reconcile Fills", msg)
 
+    def _extract_protection_plan_from_ai_text(self, text: str) -> List[Dict[str, Any]]:
+        raw = str(text or "")
+        if not raw.strip():
+            return []
+        m = re.search(
+            r"BEGIN_STRATA_PROTECTION_PLAN_JSON\s*(\{[\s\S]*?\})\s*END_STRATA_PROTECTION_PLAN_JSON",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        blob = ""
+        if m:
+            blob = m.group(1).strip()
+        else:
+            m2 = re.search(r"(\{[\s\S]*\})", raw)
+            if m2:
+                blob = m2.group(1).strip()
+        if not blob:
+            return []
+        try:
+            obj = json.loads(blob)
+        except Exception:
+            return []
+        if not isinstance(obj, dict):
+            return []
+        arr = obj.get("protections", [])
+        if not isinstance(arr, list):
+            return []
+        return [x for x in arr if isinstance(x, dict) and str(x.get("symbol", "")).strip()]
+
+    def _build_protection_ai_prompt(self, position_rows: List[Dict[str, Any]], bt_context: Dict[str, Dict[str, Any]]) -> str:
+        payload = {
+            "positions": position_rows,
+            "targeted_backtests": bt_context,
+            "constraints": {
+                "allowed_actions": ["SET_STOP", "SET_TRAILING", "HOLD"],
+                "stop_pct_bounds": [1.0, 20.0],
+                "trailing_pct_bounds": [0.5, 15.0],
+            },
+        }
+        return (
+            "You are a risk manager for open spot positions.\n"
+            "Use positions and targeted backtest context to recommend protection.\n"
+            "Return ONLY JSON between markers.\n\n"
+            "BEGIN_STRATA_PROTECTION_PLAN_JSON\n"
+            "{\n"
+            "  \"protections\": [\n"
+            "    {\n"
+            "      \"symbol\": \"BTCUSDT\",\n"
+            "      \"action\": \"SET_STOP|SET_TRAILING|HOLD\",\n"
+            "      \"stop_pct\": 5.0,\n"
+            "      \"trailing_pct\": 2.0,\n"
+            "      \"confidence\": 75,\n"
+            "      \"reason\": \"short reason\"\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "END_STRATA_PROTECTION_PLAN_JSON\n\n"
+            "Data:\n"
+            + json.dumps(payload, indent=2)
+        )
+
+    def _run_protect_open_positions_ai(self, auto_submit: bool = False, source: str = "manual") -> None:
+        task_name = "Protect Open Positions"
+        starter = lambda: self._start_protect_open_positions_ai(auto_submit=auto_submit, source=source)
+        if self._queue_if_busy(task_name, starter):
+            return
+        starter()
+
+    def _start_protect_open_positions_ai(self, auto_submit: bool = False, source: str = "manual") -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Protection", "Select a Binance profile first.")
+            return
+        task_name = "Protect Open Positions"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal(f"START Protect Open Positions ({source})")
+        cfg = {
+            "profile": profile,
+            "display_currency": self.display_currency_var.get().strip() or "USD",
+            "bt": {
+                "months": int(self.bt_months.get()) if hasattr(self, "bt_months") else 12,
+                "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()) if hasattr(self, "bt_country") else "2",
+                "initial_capital": float(self.bt_initial.get()) if hasattr(self, "bt_initial") else 10000.0,
+                "stop_loss_pct": float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0,
+                "take_profit_pct": float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0,
+                "max_hold_days": int(self.bt_max_hold_days.get()) if hasattr(self, "bt_max_hold_days") else 45,
+                "min_hold_bars": int(self.bt_min_hold_bars.get()) if hasattr(self, "bt_min_hold_bars") else 2,
+                "cooldown_bars": int(self.bt_cooldown_bars.get()) if hasattr(self, "bt_cooldown_bars") else 1,
+                "same_asset_cooldown_bars": int(self.bt_same_asset_cooldown.get()) if hasattr(self, "bt_same_asset_cooldown") else 3,
+                "max_consecutive_same_asset_entries": int(self.bt_max_same_asset_entries.get()) if hasattr(self, "bt_max_same_asset_entries") else 3,
+                "fee_pct": float(self.bt_fee_pct.get()) if hasattr(self, "bt_fee_pct") else 0.10,
+                "slippage_pct": float(self.bt_slippage_pct.get()) if hasattr(self, "bt_slippage_pct") else 0.05,
+                "position_size": max(0.01, min(1.0, (float(self.bt_position_size_pct.get()) if hasattr(self, "bt_position_size_pct") else 30.0) / 100.0)),
+                "atr_multiplier": float(self.bt_atr_mult.get()) if hasattr(self, "bt_atr_mult") else 2.2,
+                "adx_threshold": float(self.bt_adx_threshold.get()) if hasattr(self, "bt_adx_threshold") else 25.0,
+                "cmf_threshold": float(self.bt_cmf_threshold.get()) if hasattr(self, "bt_cmf_threshold") else 0.02,
+                "obv_slope_threshold": float(self.bt_obv_threshold.get()) if hasattr(self, "bt_obv_threshold") else 0.0,
+                "max_drawdown_limit_pct": float(self.bt_max_dd_target_pct.get()) if hasattr(self, "bt_max_dd_target_pct") else 35.0,
+                "max_exposure_pct": max(0.01, min(1.0, (float(self.bt_max_exposure_pct.get()) if hasattr(self, "bt_max_exposure_pct") else 40.0) / 100.0)),
+                "cache_workers": int(self.bt_cache_workers.get()) if hasattr(self, "bt_cache_workers") else 4,
+                "buy_threshold": int(self.bt_buy_threshold.get()) if hasattr(self, "bt_buy_threshold") else 2,
+                "sell_threshold": int(self.bt_sell_threshold.get()) if hasattr(self, "bt_sell_threshold") else -2,
+            },
+            "auto_submit": bool(auto_submit),
+            "source": source,
+        }
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                res = self._compute_protection_recommendations(bridge, cfg)
+            except Exception as exc:
+                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "source": source}
+            self.root.after(0, lambda: self._finish_protect_open_positions_ai(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _compute_protection_recommendations(self, bridge: EngineBridge, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        profile = str(cfg.get("profile", "")).strip() or None
+        out = bridge.get_trade_ledger()
+        if not out.get("ok"):
+            return {"ok": False, "error": str(out.get("error", "Failed to load ledger."))}
+        ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
+        open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
+        if not isinstance(open_positions, dict) or not open_positions:
+            return {"ok": True, "staged_recs": [], "positions": 0, "ai_ok": False, "bt_ctx": 0, "note": "No open positions in ledger."}
+
+        display_ccy = str(cfg.get("display_currency", "USD") or "USD")
+        bt_opts = cfg.get("bt", {}) if isinstance(cfg.get("bt"), dict) else {}
+        pos_rows: List[Dict[str, Any]] = []
+        bt_context: Dict[str, Dict[str, Any]] = {}
+        for _, pos in open_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            asset = str(pos.get("asset", "")).strip().upper()
+            if not asset:
+                continue
+            quote = str(pos.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+            symbol = str(pos.get("symbol", "")).strip().upper() or f"{asset}{quote}"
+            timeframe = str(pos.get("timeframe", "4h") or "4h").strip().lower()
+            try:
+                qty = float(pos.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            try:
+                entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            if qty <= 0:
+                continue
+            lp = bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+            last_price = float(lp.get("price", 0.0) or 0.0) if lp.get("ok") else 0.0
+            pnl_pct = ((last_price - entry_price) / entry_price * 100.0) if (entry_price > 0 and last_price > 0) else 0.0
+            pos_rows.append(
+                {
+                    "asset": asset,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "qty": round(qty, 8),
+                    "entry_price": round(entry_price, 8),
+                    "last_price": round(last_price, 8),
+                    "pnl_pct": round(pnl_pct, 4),
+                }
+            )
+            try:
+                bt_cfg = dict(bt_opts)
+                bt_cfg.update(
+                    {
+                        "market": "crypto",
+                        "timeframe": timeframe if timeframe in ("1d", "4h", "8h", "12h") else "4h",
+                        "top_n": 1,
+                        "quote_currency": quote,
+                        "display_currency": display_ccy,
+                        "tickers": [f"{asset}-USD" if quote == "USD" else f"{asset}-{quote}"],
+                    }
+                )
+                bt = bridge.run_backtest(bt_cfg)
+                bt_context[symbol] = {"ok": bool(bt.get("ok")), "summary_text": str(bt.get("summary_text", "") or "")[:3500]}
+            except Exception as exc:
+                bt_context[symbol] = {"ok": False, "summary_text": f"Backtest context error: {type(exc).__name__}"}
+
+        if not pos_rows:
+            return {"ok": True, "staged_recs": [], "positions": 0, "ai_ok": False, "bt_ctx": 0, "note": "No valid open positions found."}
+
+        prompt = self._build_protection_ai_prompt(pos_rows, bt_context)
+        dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ai_res = bridge.run_ai_analysis(
+            dashboard_text=json.dumps({"positions": pos_rows}),
+            datetime_context=dt,
+            prompt_override=prompt,
+            system_prompt_override=(
+                "You are a strict JSON risk assistant. "
+                "Output only the protection plan JSON between required markers."
+            ),
+        )
+        plans = self._extract_protection_plan_from_ai_text(ai_res.get("response", "")) if ai_res.get("ok") else []
+        if not plans:
+            fallback_stop = float(bt_opts.get("stop_loss_pct", 8.0) or 8.0)
+            plans = [
+                {
+                    "symbol": p.get("symbol", ""),
+                    "action": "SET_STOP",
+                    "stop_pct": fallback_stop,
+                    "trailing_pct": 0.0,
+                    "confidence": 50,
+                    "reason": "Fallback protection (AI unavailable/empty).",
+                }
+                for p in pos_rows
+            ]
+
+        staged_recs: List[Dict[str, Any]] = []
+        for plan in plans:
+            symbol = str(plan.get("symbol", "")).strip().upper()
+            action = str(plan.get("action", "SET_STOP")).strip().upper()
+            if not symbol or action == "HOLD":
+                continue
+            pos = next((x for x in pos_rows if str(x.get("symbol", "")).upper() == symbol), None)
+            if not pos:
+                continue
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            last_price = float(pos.get("last_price", 0.0) or 0.0)
+            if qty <= 0 or last_price <= 0:
+                continue
+            try:
+                stop_pct = max(1.0, min(20.0, float(plan.get("stop_pct", 0.0) or 0.0)))
+            except Exception:
+                stop_pct = float(bt_opts.get("stop_loss_pct", 8.0) or 8.0)
+            try:
+                trailing_pct = max(0.0, min(15.0, float(plan.get("trailing_pct", 0.0) or 0.0)))
+            except Exception:
+                trailing_pct = 0.0
+            stop_price = last_price * (1.0 - (stop_pct / 100.0))
+            limit_price = stop_price * 0.995
+            reason = str(plan.get("reason", "Protection recommendation") or "Protection recommendation").strip()
+            if trailing_pct > 0:
+                reason += f" | trailing suggested {trailing_pct:.2f}% (implemented as fixed stop for compatibility)"
+            staged_recs.append(
+                {
+                    "symbol": symbol,
+                    "asset": self._base_asset_from_symbol(symbol),
+                    "side": "SELL",
+                    "order_type": "STOP_LOSS_LIMIT",
+                    "quantity": qty,
+                    "stop_loss_price": round(stop_price, 8),
+                    "limit_price": round(limit_price, 8),
+                    "timeframe": str(pos.get("timeframe", "4h")),
+                    "confidence": str(plan.get("confidence", "") or ""),
+                    "status": "PENDING",
+                    "reason": reason,
+                    "replace_existing_stop": True,
+                    "protection_mode": action,
+                }
+            )
+        return {
+            "ok": True,
+            "staged_recs": staged_recs,
+            "positions": len(pos_rows),
+            "ai_ok": bool(ai_res.get("ok")),
+            "bt_ctx": len(bt_context),
+            "auto_submit": bool(cfg.get("auto_submit", False)),
+            "source": str(cfg.get("source", "manual")),
+        }
+
+    def _finish_protect_open_positions_ai(self, res: Dict[str, Any], task_id: Optional[int]) -> None:
+        source = str(res.get("source", "manual") or "manual")
+        if not res.get("ok"):
+            self._append_task_terminal(f"DONE Protect Open Positions ({source}, error: {res.get('error', 'unknown')})")
+            messagebox.showerror("Protection", str(res.get("error", "Failed to generate protection recommendations.")))
+            self._finish_task(task_id, task_name="Protect Open Positions")
+            return
+        staged_recs = res.get("staged_recs", []) if isinstance(res.get("staged_recs"), list) else []
+        if not staged_recs:
+            note = str(res.get("note", "No protective recommendations generated.") or "No protective recommendations generated.")
+            self._append_task_terminal(f"DONE Protect Open Positions ({source}, {note})")
+            if source == "manual":
+                messagebox.showinfo("Protection", note)
+            self._finish_task(task_id, task_name="Protect Open Positions")
+            return
+        new_ids: List[int] = []
+        for r in staged_recs:
+            if not isinstance(r, dict):
+                continue
+            self._pending_rec_seq += 1
+            rr = dict(r)
+            rr["id"] = self._pending_rec_seq
+            self.pending_recommendations.append(rr)
+            new_ids.append(int(self._pending_rec_seq))
+        self._refresh_pending_recommendations_view()
+        self._append_task_terminal(
+            f"DONE Protect Open Positions ({source}) -> staged={len(new_ids)}, positions={int(res.get('positions', 0) or 0)}, ai_ok={bool(res.get('ai_ok'))}, bt_ctx={int(res.get('bt_ctx', 0) or 0)}"
+        )
+        if bool(res.get("auto_submit", False)) and new_ids:
+            self._submit_selected_pending_orders(ids_override=new_ids, require_confirm=False)
+        elif source == "manual":
+            messagebox.showinfo(
+                "Protection Recommendations",
+                f"Staged {len(new_ids)} protective order recommendation(s).\nReview and submit from Pending Recommendations.",
+            )
+        self._finish_task(task_id, task_name="Protect Open Positions")
+
+    def _protection_monitor_tick(self) -> None:
+        if not self.protection_monitor_job:
+            return
+        self._run_protect_open_positions_ai(
+            auto_submit=bool(self.pf_protect_auto_send_var.get()),
+            source="monitor",
+        )
+        try:
+            mins = max(1, int((self.pf_protect_interval_min_var.get() or "30").strip()))
+        except Exception:
+            mins = 30
+        self.protection_monitor_job = self.root.after(mins * 60 * 1000, self._protection_monitor_tick)
+
+    def _start_protection_monitor(self) -> None:
+        self._stop_protection_monitor()
+        try:
+            mins = max(1, int((self.pf_protect_interval_min_var.get() or "30").strip()))
+        except Exception:
+            mins = 30
+            self.pf_protect_interval_min_var.set("30")
+        self._append_task_terminal(
+            f"Started protection monitor ({mins} min interval, auto_send={bool(self.pf_protect_auto_send_var.get())})."
+        )
+        self.protection_monitor_job = self.root.after(1000, self._protection_monitor_tick)
+
+    def _stop_protection_monitor(self) -> None:
+        if self.protection_monitor_job:
+            try:
+                self.root.after_cancel(self.protection_monitor_job)
+            except Exception:
+                pass
+            self.protection_monitor_job = None
+            self._append_task_terminal("Stopped protection monitor.")
+
+    def _is_portfolio_tab_selected(self) -> bool:
+        try:
+            cur = self.nb.select()
+            return bool(cur) and (self.nb.tab(cur, "text") == "Portfolio & Ledger")
+        except Exception:
+            return False
+
+    def _refresh_portfolio_suite(self) -> None:
+        # Keep local views fresh instantly.
+        self._refresh_ledger_view()
+        # Network-backed views.
+        self._refresh_portfolio()
+        try:
+            self.root.after(120, self._refresh_open_orders)
+        except Exception:
+            pass
+
+    def _start_portfolio_auto_refresh(self) -> None:
+        self._stop_portfolio_auto_refresh()
+        if not hasattr(self, "pf_auto_refresh_var") or not bool(self.pf_auto_refresh_var.get()):
+            return
+        self.portfolio_auto_refresh_running = True
+        self._schedule_portfolio_auto_refresh_tick(initial=True)
+
+    def _stop_portfolio_auto_refresh(self) -> None:
+        self.portfolio_auto_refresh_running = False
+        if self.portfolio_auto_refresh_job:
+            try:
+                self.root.after_cancel(self.portfolio_auto_refresh_job)
+            except Exception:
+                pass
+            self.portfolio_auto_refresh_job = None
+
+    def _schedule_portfolio_auto_refresh_tick(self, initial: bool = False) -> None:
+        if not self.portfolio_auto_refresh_running:
+            return
+        if not self._is_portfolio_tab_selected():
+            self._stop_portfolio_auto_refresh()
+            return
+        try:
+            secs = max(10, int((self.pf_auto_refresh_secs_var.get() or "45").strip()))
+        except Exception:
+            secs = 45
+        if initial:
+            self._append_task_terminal(f"Portfolio auto-refresh started ({secs}s).")
+        self._refresh_portfolio_suite()
+        self.portfolio_auto_refresh_job = self.root.after(
+            secs * 1000,
+            lambda: self._schedule_portfolio_auto_refresh_tick(initial=False),
+        )
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        if self._is_portfolio_tab_selected():
+            self._refresh_portfolio_suite()
+            if hasattr(self, "pf_auto_refresh_var") and bool(self.pf_auto_refresh_var.get()):
+                self._start_portfolio_auto_refresh()
+        else:
+            self._stop_portfolio_auto_refresh()
+
     def _review_open_positions_mtf(self) -> None:
         profile = self.pf_binance_profile_var.get().strip() or None
         if not profile:
             messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
             return
+        task_name = "Open Position Review (MTF)"
+        if self._queue_if_busy(task_name, self._start_review_open_positions_mtf):
+            return
+        self._start_review_open_positions_mtf()
+
+    def _start_review_open_positions_mtf(self) -> None:
+        profile = self.pf_binance_profile_var.get().strip() or None
+        if not profile:
+            messagebox.showinfo("Open Position Review", "Select a Binance profile first.")
+            return
+        task_name = "Open Position Review (MTF)"
+        task_id = self._set_busy(True, task_name)
         self._append_task_terminal("START Open Position Review (4h/8h/12h/1d)")
-        out = self.bridge.analyze_open_positions_multi_tf(
-            profile_name=profile,
-            timeframes=["4h", "8h", "12h", "1d"],
-            display_currency=self.display_currency_var.get().strip() or "USD",
-        )
+        display_ccy = self.display_currency_var.get().strip() or "USD"
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                res = bridge.analyze_open_positions_multi_tf(
+                    profile_name=profile,
+                    timeframes=["4h", "8h", "12h", "1d"],
+                    display_currency=display_ccy,
+                )
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            self.root.after(0, lambda: self._finish_review_open_positions_mtf(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_review_open_positions_mtf(self, out: Dict[str, Any], task_id: Optional[int]) -> None:
+        task_name = "Open Position Review (MTF)"
         if not out.get("ok"):
             self._append_task_terminal(f"DONE Open Position Review (error: {out.get('error', 'unknown')})")
             messagebox.showerror("Open Position Review", str(out.get("error", "Failed to analyze open positions.")))
+            self._finish_task(task_id, task_name=task_name)
             return
         rows = out.get("rows", []) or []
         if not rows:
             note = str(out.get("note", "") or "No open positions to analyze.")
             self._append_task_terminal(f"DONE Open Position Review ({note})")
             messagebox.showinfo("Open Position Review", note)
+            self._finish_task(task_id, task_name=task_name)
             return
         lines = []
         lines.append("OPEN POSITION MTF REVIEW")
@@ -3412,6 +4636,7 @@ class StrataGuiApp:
         self._append_task_terminal(blob)
         self._append_task_terminal(f"DONE Open Position Review ({len(rows)} positions)")
         messagebox.showinfo("Open Position Review", f"Reviewed {len(rows)} open position(s).\nSee Task Terminal for detailed breakdown.")
+        self._finish_task(task_id, task_name=task_name)
 
     def _cancel_selected_open_orders(self) -> None:
         if not hasattr(self, "open_orders_tree"):
@@ -3637,13 +4862,148 @@ class StrataGuiApp:
             signal_entries = []
         if not isinstance(execution_entries, list):
             execution_entries = []
+        visible_execution_entries = [e for e in execution_entries if not bool((e or {}).get("is_placeholder", False))]
+        hidden_placeholders = max(0, len(execution_entries) - len(visible_execution_entries))
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
+        profile_name = self.pf_binance_profile_var.get().strip() or None
+        if hasattr(self, "display_currency_var"):
+            try:
+                display_ccy = (self.display_currency_var.get().strip() or "USD").upper()
+            except Exception:
+                display_ccy = str(self.state.get("display_currency", "USD") or "USD").strip().upper()
+        else:
+            display_ccy = str(self.state.get("display_currency", "USD") or "USD").strip().upper()
+        usd_like = {"USD", "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI"}
+        try:
+            fx_usd_to_disp = float(self.bridge.mod.get_usd_to_currency_rate(display_ccy))
+            if fx_usd_to_disp <= 0:
+                fx_usd_to_disp = 1.0
+        except Exception:
+            fx_usd_to_disp = 1.0
+
+        unrealized_quote: Dict[str, float] = {}
+        unrealized_display: Dict[str, float] = {}
+        op_rows: List[Dict[str, Any]] = []
+        protective_orders_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        if profile_name:
+            try:
+                oout = self.bridge.list_open_binance_orders(profile_name=profile_name, symbol="")
+                if oout.get("ok"):
+                    for o in (oout.get("orders", []) or []):
+                        if not isinstance(o, dict):
+                            continue
+                        sym = str(o.get("symbol", "") or "").strip().upper()
+                        side = str(o.get("side", "") or "").strip().upper()
+                        otype = str(o.get("type", "") or "").strip().upper()
+                        # Treat sell-side stop / trailing / take-profit orders as protective overlays.
+                        is_protective = side == "SELL" and (
+                            ("STOP" in otype)
+                            or ("TAKE_PROFIT" in otype)
+                            or ("TRAILING" in otype)
+                        )
+                        if not sym or not is_protective:
+                            continue
+                        protective_orders_by_symbol.setdefault(sym, []).append(o)
+            except Exception:
+                protective_orders_by_symbol = {}
+
+        if isinstance(open_positions, dict):
+            for _, pos in open_positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                row = dict(pos)
+                asset = str(row.get("asset", "") or "").strip().upper()
+                quote_ccy = str(row.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+                symbol = str(row.get("symbol", "") or "").strip().upper()
+                if (not symbol) and asset and quote_ccy:
+                    symbol = f"{asset}{quote_ccy}"
+                try:
+                    entry_px = float(row.get("entry_price", 0.0) or 0.0)
+                except Exception:
+                    entry_px = 0.0
+                try:
+                    qty = float(row.get("qty", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                last_px = 0.0
+                if symbol and profile_name:
+                    try:
+                        lpx = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile_name)
+                        if lpx.get("ok"):
+                            last_px = float(lpx.get("price", 0.0) or 0.0)
+                    except Exception:
+                        last_px = 0.0
+                upnl_q = 0.0
+                upnl_pct = 0.0
+                if entry_px > 0 and qty > 0 and last_px > 0:
+                    upnl_q = (last_px - entry_px) * qty
+                    upnl_pct = ((last_px - entry_px) / entry_px) * 100.0
+                upnl_d = 0.0
+                if abs(upnl_q) > 0:
+                    if quote_ccy in usd_like:
+                        upnl_d = upnl_q * fx_usd_to_disp
+                    elif quote_ccy == display_ccy:
+                        upnl_d = upnl_q
+                    else:
+                        upnl_d = 0.0
+                if abs(upnl_q) > 0:
+                    unrealized_quote[quote_ccy] = unrealized_quote.get(quote_ccy, 0.0) + upnl_q
+                if abs(upnl_d) > 0:
+                    unrealized_display[display_ccy] = unrealized_display.get(display_ccy, 0.0) + upnl_d
+
+                # Protection status:
+                # - PROTECTED: has at least one protective open order
+                # - STALE_PROTECTED: protective order exists but latest update/time > 24h old
+                # - UNPROTECTED: no protective open order detected
+                prot_state = "UNPROTECTED"
+                prot_detail = ""
+                now_utc = pd.Timestamp.now(tz="UTC")
+                prot_orders = protective_orders_by_symbol.get(symbol, [])
+                if prot_orders:
+                    newest_ts = None
+                    otypes: List[str] = []
+                    for po in prot_orders:
+                        otypes.append(str(po.get("type", "") or "").strip().upper())
+                        try:
+                            t_ms = int(po.get("updateTime", 0) or po.get("time", 0) or 0)
+                        except Exception:
+                            t_ms = 0
+                        if t_ms > 0:
+                            ts = pd.to_datetime(t_ms, unit="ms", utc=True, errors="coerce")
+                            if pd.notna(ts):
+                                if newest_ts is None or ts > newest_ts:
+                                    newest_ts = ts
+                    if newest_ts is not None:
+                        age_h = (now_utc - newest_ts).total_seconds() / 3600.0
+                        prot_state = "STALE_PROTECTED" if age_h > 24.0 else "PROTECTED"
+                        prot_detail = f"{','.join(sorted(set(otypes)))} @ {newest_ts.strftime('%Y-%m-%d %H:%MZ')}"
+                    else:
+                        prot_state = "PROTECTED"
+                        prot_detail = ",".join(sorted(set(otypes)))
+
+                row["symbol"] = symbol
+                row["quote_currency"] = quote_ccy
+                row["last_price"] = round(last_px, 8) if last_px > 0 else ""
+                row["unreal_pnl_quote"] = round(upnl_q, 8)
+                row["unreal_pnl_pct"] = round(upnl_pct, 4)
+                row["unreal_pnl_display"] = round(upnl_d, 8)
+                row["protection_status"] = prot_state
+                row["protection_detail"] = prot_detail
+                op_rows.append(row)
 
         if hasattr(self, "pf_open_positions_text"):
             self.pf_open_positions_text.delete("1.0", tk.END)
-            if isinstance(open_positions, dict) and open_positions:
-                op_df = pd.DataFrame(list(open_positions.values()))
+            if op_rows:
+                op_df = pd.DataFrame(op_rows)
+                op_df = self._humanize_df_timestamps(op_df, ["entry_ts"])
+                preferred = [
+                    "entry_id", "entry_ts", "symbol", "asset", "timeframe", "qty", "entry_price",
+                    "last_price", "unreal_pnl_pct", "unreal_pnl_quote", "unreal_pnl_display",
+                    "quote_currency", "display_currency", "protection_status", "protection_detail", "panel",
+                ]
+                cols = [c for c in preferred if c in op_df.columns] + [c for c in op_df.columns if c not in preferred]
+                op_df = op_df[cols]
                 self.pf_open_positions_text.insert("1.0", op_df.to_string(index=False))
             else:
                 self.pf_open_positions_text.insert("1.0", "No open positions tracked.")
@@ -3654,12 +5014,14 @@ class StrataGuiApp:
             lines = []
             lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
             lines.append(f"Signal Journal: {len(signal_entries)}")
-            lines.append(f"Execution Ledger: {len(execution_entries)}")
+            lines.append(f"Execution Ledger: {len(visible_execution_entries)}")
+            if hidden_placeholders > 0:
+                lines.append(f"Execution placeholders hidden: {hidden_placeholders}")
             lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
             # Realized PnL summary in quote/display currencies (execution rows only).
             realized_quote: Dict[str, float] = {}
             realized_display: Dict[str, float] = {}
-            for e in execution_entries:
+            for e in visible_execution_entries:
                 if not isinstance(e, dict):
                     continue
                 try:
@@ -3674,7 +5036,7 @@ class StrataGuiApp:
                 except Exception:
                     pdv = 0.0
                 if abs(pdv) > 0:
-                    dc = str(e.get("display_currency", self.display_currency_var.get() or "USD") or "USD").strip().upper()
+                    dc = str(e.get("display_currency", display_ccy) or display_ccy).strip().upper()
                     realized_display[dc] = realized_display.get(dc, 0.0) + pdv
             if realized_quote:
                 qtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_quote.items())])
@@ -3682,10 +5044,27 @@ class StrataGuiApp:
             if realized_display:
                 dtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(realized_display.items())])
                 lines.append(f"Realized PnL (Display): {dtxt}")
+            if unrealized_quote:
+                uqtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(unrealized_quote.items())])
+                lines.append(f"Unrealized PnL (Quote): {uqtxt}")
+            if unrealized_display:
+                udtxt = ", ".join([f"{k} {v:+,.4f}" for k, v in sorted(unrealized_display.items())])
+                lines.append(f"Unrealized PnL (Display): {udtxt}")
             lines.append("")
             if isinstance(entries, list) and entries:
-                df = pd.DataFrame(entries[-200:])
-                lines.append(df.to_string(index=False))
+                display_entries = []
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    if bool(e.get("is_execution", False)) and bool(e.get("is_placeholder", False)):
+                        continue
+                    display_entries.append(e)
+                if display_entries:
+                    df = pd.DataFrame(display_entries[-200:])
+                    df = self._humanize_df_timestamps(df, ["ts", "entry_ts", "exit_ts"])
+                    lines.append(df.to_string(index=False))
+                else:
+                    lines.append("No non-placeholder ledger entries yet.")
             else:
                 lines.append("No ledger entries yet.")
             self.pf_ledger_text.insert("1.0", "\n".join(lines))
@@ -3695,6 +5074,7 @@ class StrataGuiApp:
             self.pf_signal_text.delete("1.0", tk.END)
             if signal_entries:
                 sig_df = pd.DataFrame(signal_entries[-200:])
+                sig_df = self._humanize_df_timestamps(sig_df, ["ts", "entry_ts", "exit_ts"])
                 self.pf_signal_text.insert("1.0", sig_df.to_string(index=False))
             else:
                 self.pf_signal_text.insert("1.0", "No signal-only entries.")
@@ -3702,8 +5082,19 @@ class StrataGuiApp:
 
         if hasattr(self, "pf_execution_text"):
             self.pf_execution_text.delete("1.0", tk.END)
-            if execution_entries:
-                exe_df = pd.DataFrame(execution_entries[-200:])
+            if visible_execution_entries:
+                exe_df = pd.DataFrame(visible_execution_entries[-200:])
+                exe_df = self._humanize_df_timestamps(exe_df, ["ts", "entry_ts", "exit_ts"])
+                for col in ["pnl_pct", "pnl_quote", "pnl_display"]:
+                    if col not in exe_df.columns:
+                        exe_df[col] = ""
+                preferred = [
+                    "id", "ts", "market", "timeframe", "panel", "asset", "action",
+                    "price", "qty", "pnl_pct", "pnl_quote", "pnl_display",
+                    "quote_currency", "display_currency", "note", "is_execution",
+                ]
+                cols = [c for c in preferred if c in exe_df.columns] + [c for c in exe_df.columns if c not in preferred]
+                exe_df = exe_df[cols]
                 self.pf_execution_text.insert("1.0", exe_df.to_string(index=False))
             else:
                 self.pf_execution_text.insert("1.0", "No execution entries.")
@@ -4125,6 +5516,10 @@ class StrataGuiApp:
         self.state["display_currency"] = self.display_currency_var.get().strip() or "USD"
         self.state["primary_quote_asset"] = self._primary_quote_asset()
         self.state["lock_primary_quote"] = self._is_primary_quote_locked()
+        if isinstance(getattr(self, "agent_context", None), dict):
+            self.state["agent_context"] = dict(self.agent_context)
+        if hasattr(self, "agent_ai_fallback_var"):
+            self.state["agent_ai_fallback_enabled"] = bool(self.agent_ai_fallback_var.get())
         if hasattr(self, "agent_guard_enabled_var"):
             self.state["agent_guard_enabled"] = bool(self.agent_guard_enabled_var.get())
         if hasattr(self, "agent_guard_require_stop_var"):
@@ -4150,6 +5545,15 @@ class StrataGuiApp:
                 )
             except Exception:
                 self.state["agent_guard_max_exposure_pct"] = 40.0
+        if hasattr(self, "pf_auto_refresh_var"):
+            self.state["portfolio_auto_refresh_enabled"] = bool(self.pf_auto_refresh_var.get())
+        if hasattr(self, "pf_auto_refresh_secs_var"):
+            try:
+                self.state["portfolio_auto_refresh_seconds"] = max(
+                    10, int((self.pf_auto_refresh_secs_var.get() or "45").strip())
+                )
+            except Exception:
+                self.state["portfolio_auto_refresh_seconds"] = 45
         self.state["auto_refresh_seconds"] = int(self.refresh_secs_var.get().strip() or "120")
         mode_var = getattr(self, "parallel_mode_var", None)
         jobs_var = getattr(self, "parallel_jobs_var", None)
@@ -4170,6 +5574,8 @@ def run_gui() -> None:
 
     def _shutdown():
         app._stop_pipeline_scheduler()
+        app._stop_protection_monitor()
+        app._stop_portfolio_auto_refresh()
         app._close_task_monitor()
         if app.task_tab_job:
             try:

@@ -1,33 +1,46 @@
-﻿## Release & Branch Strategy (Best Practice)
+## What STRATA Means
+
+STRATA stands for **Signal, Timing, Risk, Allocation, Trade Automation**.
+
+It reflects the platform workflow:
+
+- **Signal**: identify opportunities from live/backtest analytics
+- **Timing**: align entries/exits to timeframe and regime
+- **Risk**: enforce stops, exposure limits, and guardrails
+- **Allocation**: size positions using balance, confidence, and constraints
+- **Trade Automation**: stage, approve, execute, reconcile, and monitor
+
+## Architecture Docs
+
+- HLD Diagram: [HLD_Diagram.svg](./HLD_Diagram.svg)
+- High-Level Design: `docs/HLD.md`
+- Detailed Design: `docs/DETAILED_DESIGN.md`
+
+![STRATA HLD](./HLD_Diagram.svg)
+
+## Release & Branch Strategy (Best Practice)
 
 Use separate long-lived branches for release channels:
 
-- **`main`** -> stable production-ready channel
-- **`nightly`** -> fast-moving integration channel for newest changes
-- **`gui-nightly`** -> fast-moving GUI integration channel
-- **`gui-stable`** -> GUI-stable promotion channel
+- **`main`** -> stable production-ready STRATA channel (GUI-first)
+- **`ai-nightly`** -> active development/nightly channel for latest AI/GUI capabilities
+- **`archive/*`** -> historical snapshots of previous branch eras (read-only by convention)
 
 Recommended workflow:
 
 1. Develop features on short-lived feature branches.
-2. Merge feature branches into `nightly` first for CLI/core work.
-3. Merge GUI-focused work into `gui-nightly`, then promote to `gui-stable`.
-4. Promote tested non-GUI changes from `nightly` into `main` on cadence.
+2. Merge feature branches into `ai-nightly`.
+3. Promote tested `ai-nightly` builds into `main` via fast-forward merge.
+4. Tag milestone releases on `main` (for example `v0.9.0-gui-primary`).
 
-### Core Sync Guardrail (`gui-nightly` -> `nightly`)
+### Promotion Guardrail (`ai-nightly` -> `main`)
 
-When changing core strategy/runtime behavior in `gui-nightly`, sync only required core edits into `nightly` (not GUI-only files).
-
-Core-sync helper:
+Promote with a clean, fast-forward merge to keep release history easy to audit:
 
 ```bash
-python scripts/sync_core_to_nightly.py --base nightly
-```
-
-Optional patch generation for minimal sync:
-
-```bash
-python scripts/sync_core_to_nightly.py --base nightly --create-patch --patch-path experiments/reports/core_sync.patch
+git switch main
+git merge --ff-only ai-nightly
+git push origin main
 ```
 
 Detailed policy: `docs/BRANCH_SYNC.md`
@@ -73,7 +86,7 @@ Nightly channel (`nightly` branch target):
 python nightly/BTC-beta.py
 ```
 
-GUI (gui-nightly branch):
+GUI (ai-nightly branch):
 
 ```bash
 python scripts/run_gui.py
@@ -138,6 +151,22 @@ GUI AI configuration:
   - supports intents such as:
     - "find best buys top 10 crypto on 4h"
     - "buy btc 10% capital stop loss 5%"
+    - "buy 10 usdt of btc with stop loss 5%"
+    - "buy btc with 30% of my usdt"
+    - "with my current usdt, look for signals and allocate buy strategy"
+    - "do a comprehensive search for top 5 coins ... expand search until found"
+    - "open detailed view" (jumps to Portfolio & Ledger tab)
+    - "run every 30 minutes" / "pause scheduler" / "stop scheduler" / "agent status"
+    - "exclude TRX DOGE" / "clear exclusions"
+    - "execute staged"
+    - "show pnl" / "pnl today" / "pnl last 10 trades"
+  - agent now emits a deterministic plan card before staging/execution so parsed intent is transparent.
+  - optional `AI fallback` in Agent Console:
+    - deterministic parser runs first
+    - ambiguous commands are sent to the active AI profile to produce strict structured intent JSON
+    - all resulting actions still pass normal STRATA validation/guardrails before execution
+  - agent context memory persists across runs (timeframe, top-N, quote, stop %, exclusions).
+  - `Execute Last Staged` button in Agent Console accelerates review->size->submit workflow.
 
 Quote lock + local-currency ledger:
 
@@ -167,6 +196,17 @@ GUI Portfolio & Ledger:
 - New `Portfolio & Ledger` tab:
   - Binance account portfolio snapshot (balances + estimated USD value)
   - `Reconcile Fills` action to backfill missing execution rows/open positions from Binance trade history
+  - `Protect Open Positions (AI+BT)` action:
+    - analyzes current open positions
+    - includes targeted backtest context for each open symbol/timeframe
+    - requests AI protection plan (`SET_STOP` / `SET_TRAILING` / `HOLD`)
+    - stages protective `STOP_LOSS_LIMIT` sell orders for review/submit
+    - trailing recommendations currently map to fixed-stop execution for compatibility (annotated in reason)
+  - Protection monitor controls:
+    - configurable interval (`Protect every (min)`)
+    - `Start/Stop Protect Monitor`
+    - optional `Auto-send protection` to submit newly staged protective orders without confirmation prompts
+  - Protection generation now runs as a background task to avoid GUI freeze during heavy AI/backtest processing.
   - `Review Open Positions (MTF)` action:
     - evaluates open-position assets across `4h/8h/12h/1d`
     - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)
@@ -400,4 +440,5 @@ Ollama behavior:
 - Nightly will try to call local Ollama directly.
 - If unreachable, it attempts to start `ollama serve` automatically.
 - If model is missing, it attempts auto-pull (`OLLAMA_AUTO_PULL=1` by default).
+
 
