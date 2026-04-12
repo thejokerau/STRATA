@@ -605,13 +605,12 @@ class StrataGuiApp:
 
         cols = ttk.Frame(body)
         cols.pack(fill="both", expand=False, pady=(0, 8))
+        cols.configure(height=220)
+        cols.pack_propagate(False)
         left = ttk.LabelFrame(cols, text="Current Portfolio (Binance)", padding=6)
         right = ttk.LabelFrame(cols, text="Open Positions (Ledger)", padding=6)
-        cols_split = self._create_paned(cols, orient="horizontal")
-        cols_split.configure(height=220)
-        cols_split.pack(fill="both", expand=True)
-        cols_split.add(left, weight=1)
-        cols_split.add(right, weight=1)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right.pack(side="left", fill="both", expand=True)
 
         pf_portfolio_frame, self.pf_portfolio_text = self._create_scrolled_text(left, wrap="none", height=8)
         pf_portfolio_frame.pack(fill="both", expand=True)
