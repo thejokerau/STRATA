@@ -4001,7 +4001,7 @@ class StrataGuiApp:
             lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
-                    "timeframe": str(rec.get("timeframe", "1d")),
+                    "timeframe": "spot",
                     "panel": "ai_trade_queue",
                     "asset": self._base_asset_from_symbol(symbol),
                     "action": side,
@@ -4011,6 +4011,9 @@ class StrataGuiApp:
                     "display_currency": self.display_currency_var.get().strip() or "USD",
                     "note": f"Submitted to Binance ({symbol})",
                     "is_execution": True,
+                    "is_placeholder": True,
+                    "exchange_symbol": symbol,
+                    "exchange_order_id": int((out.get("data", {}) or {}).get("orderId", 0) or 0),
                 },
                 cooldown_minutes=cooldown,
                 # Execution events must be recorded even if a recent signal exists.
@@ -4748,6 +4751,8 @@ class StrataGuiApp:
             signal_entries = []
         if not isinstance(execution_entries, list):
             execution_entries = []
+        visible_execution_entries = [e for e in execution_entries if not bool((e or {}).get("is_placeholder", False))]
+        hidden_placeholders = max(0, len(execution_entries) - len(visible_execution_entries))
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         guard = ledger.get("activity_guard", {}) if isinstance(ledger, dict) else {}
         profile_name = self.pf_binance_profile_var.get().strip() or None
@@ -4897,12 +4902,14 @@ class StrataGuiApp:
             lines = []
             lines.append(f"Entries: {len(entries) if isinstance(entries, list) else 0}")
             lines.append(f"Signal Journal: {len(signal_entries)}")
-            lines.append(f"Execution Ledger: {len(execution_entries)}")
+            lines.append(f"Execution Ledger: {len(visible_execution_entries)}")
+            if hidden_placeholders > 0:
+                lines.append(f"Execution placeholders hidden: {hidden_placeholders}")
             lines.append(f"Guard Keys: {len(guard) if isinstance(guard, dict) else 0}")
             # Realized PnL summary in quote/display currencies (execution rows only).
             realized_quote: Dict[str, float] = {}
             realized_display: Dict[str, float] = {}
-            for e in execution_entries:
+            for e in visible_execution_entries:
                 if not isinstance(e, dict):
                     continue
                 try:
@@ -4933,8 +4940,18 @@ class StrataGuiApp:
                 lines.append(f"Unrealized PnL (Display): {udtxt}")
             lines.append("")
             if isinstance(entries, list) and entries:
-                df = pd.DataFrame(entries[-200:])
-                lines.append(df.to_string(index=False))
+                display_entries = []
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    if bool(e.get("is_execution", False)) and bool(e.get("is_placeholder", False)):
+                        continue
+                    display_entries.append(e)
+                if display_entries:
+                    df = pd.DataFrame(display_entries[-200:])
+                    lines.append(df.to_string(index=False))
+                else:
+                    lines.append("No non-placeholder ledger entries yet.")
             else:
                 lines.append("No ledger entries yet.")
             self.pf_ledger_text.insert("1.0", "\n".join(lines))
@@ -4951,8 +4968,8 @@ class StrataGuiApp:
 
         if hasattr(self, "pf_execution_text"):
             self.pf_execution_text.delete("1.0", tk.END)
-            if execution_entries:
-                exe_df = pd.DataFrame(execution_entries[-200:])
+            if visible_execution_entries:
+                exe_df = pd.DataFrame(visible_execution_entries[-200:])
                 for col in ["pnl_pct", "pnl_quote", "pnl_display"]:
                     if col not in exe_df.columns:
                         exe_df[col] = ""

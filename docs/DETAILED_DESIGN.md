@@ -165,6 +165,13 @@ Unrealized PnL:
 - computed at refresh from open positions using latest market prices.
 - shown in open-positions view and summary lines.
 
+Reconcile/placeholder behavior:
+
+- submit-time market execution rows may be logged as placeholders (`is_placeholder=true`) when exact fill price is not yet known.
+- fill reconciliation now upserts those placeholders (matching `exchange_order_id`) with real trade price/qty/time.
+- execution ledger views hide placeholders by default so users see reconciled executions first.
+- close-out PnL includes a fallback link to the latest valid BUY execution price when a direct open-position entry price is missing/zero.
+
 ## 8. Concurrency Model
 
 - Single/parallel task limits controlled by settings.

@@ -1459,29 +1459,81 @@ class EngineBridge:
                 trade_key = str(ev.get("trade_key", "") or "").strip()
                 if not trade_key or trade_key in existing_trade_keys:
                     continue
-                entry_id = len(entries) + 1
-                rec = {
-                    "id": entry_id,
-                    "ts": ev.get("ts", ""),
-                    "market": "crypto",
-                    "timeframe": "spot",
-                    "panel": "binance_reconcile",
-                    "asset": str(ev.get("asset", "")).upper(),
-                    "action": str(ev.get("side", "")).upper(),
-                    "price": float(ev.get("price", 0.0) or 0.0),
-                    "qty": float(ev.get("qty", 0.0) or 0.0),
-                    "score": "",
-                    "note": f"Reconciled Binance fill ({ev.get('symbol', '')})",
-                    "is_execution": True,
-                    "quote_currency": str(ev.get("quote", "USD")).upper(),
-                    "display_currency": dcur,
-                    "exchange_symbol": str(ev.get("symbol", "")).upper(),
-                    "exchange_trade_id": trade_key,
-                    "exchange_order_id": int(ev.get("order_id", 0) or 0),
-                }
-                entries.append(rec)
+                matched_idx: Optional[int] = None
+                target_order_id = int(ev.get("order_id", 0) or 0)
+                for idx in range(len(entries) - 1, -1, -1):
+                    e = entries[idx]
+                    if not isinstance(e, dict):
+                        continue
+                    if not bool(e.get("is_execution", False)):
+                        continue
+                    if str(e.get("action", "")).upper() != str(ev.get("side", "")).upper():
+                        continue
+                    if int(e.get("exchange_order_id", 0) or 0) != target_order_id:
+                        continue
+                    if str(e.get("exchange_symbol", "")).strip().upper() not in ("", str(ev.get("symbol", "")).upper()):
+                        continue
+                    is_placeholder = bool(e.get("is_placeholder", False))
+                    try:
+                        cur_px = float(e.get("price", 0.0) or 0.0)
+                    except Exception:
+                        cur_px = 0.0
+                    if is_placeholder or cur_px <= 0:
+                        matched_idx = idx
+                        break
+
+                if matched_idx is not None:
+                    rec = dict(entries[matched_idx]) if isinstance(entries[matched_idx], dict) else {}
+                    entry_id = int(rec.get("id", 0) or 0) or (matched_idx + 1)
+                    rec.update(
+                        {
+                            "id": entry_id,
+                            "ts": ev.get("ts", ""),
+                            "market": "crypto",
+                            "timeframe": "spot",
+                            "panel": "binance_reconcile",
+                            "asset": str(ev.get("asset", "")).upper(),
+                            "action": str(ev.get("side", "")).upper(),
+                            "price": float(ev.get("price", 0.0) or 0.0),
+                            "qty": float(ev.get("qty", 0.0) or 0.0),
+                            "score": "",
+                            "note": f"Reconciled Binance fill ({ev.get('symbol', '')})",
+                            "is_execution": True,
+                            "quote_currency": str(ev.get("quote", "USD")).upper(),
+                            "display_currency": dcur,
+                            "exchange_symbol": str(ev.get("symbol", "")).upper(),
+                            "exchange_trade_id": trade_key,
+                            "exchange_order_id": int(ev.get("order_id", 0) or 0),
+                            "is_placeholder": False,
+                        }
+                    )
+                    entries[matched_idx] = rec
+                else:
+                    entry_id = len(entries) + 1
+                    rec = {
+                        "id": entry_id,
+                        "ts": ev.get("ts", ""),
+                        "market": "crypto",
+                        "timeframe": "spot",
+                        "panel": "binance_reconcile",
+                        "asset": str(ev.get("asset", "")).upper(),
+                        "action": str(ev.get("side", "")).upper(),
+                        "price": float(ev.get("price", 0.0) or 0.0),
+                        "qty": float(ev.get("qty", 0.0) or 0.0),
+                        "score": "",
+                        "note": f"Reconciled Binance fill ({ev.get('symbol', '')})",
+                        "is_execution": True,
+                        "quote_currency": str(ev.get("quote", "USD")).upper(),
+                        "display_currency": dcur,
+                        "exchange_symbol": str(ev.get("symbol", "")).upper(),
+                        "exchange_trade_id": trade_key,
+                        "exchange_order_id": int(ev.get("order_id", 0) or 0),
+                        "is_placeholder": False,
+                    }
+                    entries.append(rec)
+                    added += 1
+
                 existing_trade_keys.add(trade_key)
-                added += 1
 
                 guard_key = f"crypto|spot|{rec['asset']}|{rec['action']}"
                 activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
@@ -1508,6 +1560,27 @@ class EngineBridge:
                             entry_price = float(open_pos.get("entry_price", 0.0) or 0.0)
                         except Exception:
                             entry_price = 0.0
+                        if entry_price <= 0:
+                            # Fallback: best-effort link to most recent BUY execution with non-zero price.
+                            for prev in reversed(entries):
+                                if not isinstance(prev, dict):
+                                    continue
+                                if int(prev.get("id", 0) or 0) == int(entry_id):
+                                    continue
+                                if not bool(prev.get("is_execution", False)):
+                                    continue
+                                if str(prev.get("action", "")).upper() != "BUY":
+                                    continue
+                                if str(prev.get("asset", "")).upper() != str(rec.get("asset", "")).upper():
+                                    continue
+                                try:
+                                    prev_px = float(prev.get("price", 0.0) or 0.0)
+                                except Exception:
+                                    prev_px = 0.0
+                                if prev_px > 0:
+                                    entry_price = prev_px
+                                    rec["closed_entry_id"] = int(prev.get("id", rec.get("closed_entry_id", 0)) or 0)
+                                    break
                         if entry_price > 0 and rec["price"] > 0:
                             rec["pnl_pct"] = round(((rec["price"] - entry_price) / entry_price) * 100.0, 4)
                             pnl_quote = (rec["price"] - entry_price) * max(0.0, float(rec["qty"]))
@@ -1727,6 +1800,10 @@ class EngineBridge:
                 "quote_currency": quote_currency,
                 "display_currency": display_currency,
             }
+            # Optional passthrough metadata for reconciliation/traceability.
+            for extra_key in ("exchange_symbol", "exchange_trade_id", "exchange_order_id", "is_placeholder"):
+                if extra_key in event:
+                    rec[extra_key] = event.get(extra_key)
             entries.append(rec)
             if action != "HOLD" or guard_hold_signals:
                 activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
@@ -1753,6 +1830,25 @@ class EngineBridge:
                         entry_price = float(open_pos.get("entry_price", 0.0) or 0.0)
                     except Exception:
                         entry_price = 0.0
+                    if entry_price <= 0:
+                        # Fallback: try to link to most recent BUY execution with non-zero price.
+                        for prev in reversed(entries[:-1]):
+                            if not isinstance(prev, dict):
+                                continue
+                            if not bool(prev.get("is_execution", False)):
+                                continue
+                            if str(prev.get("action", "")).upper() != "BUY":
+                                continue
+                            if str(prev.get("asset", "")).upper() != asset:
+                                continue
+                            try:
+                                prev_px = float(prev.get("price", 0.0) or 0.0)
+                            except Exception:
+                                prev_px = 0.0
+                            if prev_px > 0:
+                                entry_price = prev_px
+                                rec["closed_entry_id"] = int(prev.get("id", rec.get("closed_entry_id", 0)) or 0)
+                                break
                     if entry_price > 0 and price > 0:
                         rec["pnl_pct"] = round(((price - entry_price) / entry_price) * 100.0, 4)
                         pnl_quote = (price - entry_price) * max(0.0, qty)
