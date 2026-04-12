@@ -870,6 +870,7 @@ class StrataGuiApp:
         self.pg_auto_refresh_secs_var = tk.StringVar(value="45")
         self.pg_canvas_height_var = tk.StringVar(value="520")
         self.pg_row_height_var = tk.StringVar(value="58")
+        self.pg_output_height_var = tk.StringVar(value="180")
         self.pg_summary_var = tk.StringVar(value="No data loaded yet.")
         self.pg_rows: List[Dict[str, Any]] = []
 
@@ -888,6 +889,10 @@ class StrataGuiApp:
         ttk.Button(top, text="Apply Size", command=self._update_position_graph_sizing).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Graph -", command=lambda: self._bump_position_graph_height(-120)).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Graph +", command=lambda: self._bump_position_graph_height(120)).pack(side="left", padx=(4, 0))
+        ttk.Label(top, text="Output H").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pg_output_height_var, width=6).pack(side="left", padx=4)
+        ttk.Button(top, text="Output -", command=lambda: self._bump_position_graph_output_height(-80)).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Output +", command=lambda: self._bump_position_graph_output_height(80)).pack(side="left", padx=(4, 0))
 
         summary = ttk.Label(body, textvariable=self.pg_summary_var, anchor="w")
         summary.pack(fill="x", pady=(0, 6))
@@ -906,6 +911,18 @@ class StrataGuiApp:
         graph_frame.rowconfigure(0, weight=1)
         graph_frame.columnconfigure(0, weight=1)
         self.pg_canvas.bind("<Configure>", lambda _e: self._draw_position_graph())
+
+        out_wrap = ttk.Frame(body)
+        out_wrap.pack(fill="both", expand=False, pady=(8, 0))
+        self.pg_output_frame_wrap = out_wrap
+        self.pg_output_frame_wrap.pack_propagate(False)
+        pg_out_frame, self.pg_output_text = self._create_scrolled_text(out_wrap, wrap="none", height=8)
+        pg_out_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pg_output_text)
+        out_btns = ttk.Frame(body)
+        out_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(out_btns, text="Copy Output", command=lambda: self._copy_text_widget(self.pg_output_text, "Position graph output")).pack(side="left")
+        ttk.Button(out_btns, text="Clear Output", command=lambda: self.pg_output_text.delete("1.0", tk.END)).pack(side="left", padx=6)
 
         self._sync_position_graph_profile()
         self._update_position_graph_sizing()
@@ -929,6 +946,17 @@ class StrataGuiApp:
                 pass
         self.pg_canvas_height_var.set(str(h))
         self.pg_row_height_var.set(str(rh))
+        try:
+            oh = max(80, min(1200, int((self.pg_output_height_var.get() or "180").strip())))
+        except Exception:
+            oh = 180
+            self.pg_output_height_var.set("180")
+        if hasattr(self, "pg_output_frame_wrap"):
+            try:
+                self.pg_output_frame_wrap.configure(height=oh)
+            except Exception:
+                pass
+        self.pg_output_height_var.set(str(oh))
         self._draw_position_graph()
 
     def _bump_position_graph_height(self, delta: int) -> None:
@@ -937,6 +965,14 @@ class StrataGuiApp:
         except Exception:
             cur = 520
         self.pg_canvas_height_var.set(str(max(260, min(2400, cur + int(delta)))))
+        self._update_position_graph_sizing()
+
+    def _bump_position_graph_output_height(self, delta: int) -> None:
+        try:
+            cur = int((self.pg_output_height_var.get() or "180").strip())
+        except Exception:
+            cur = 180
+        self.pg_output_height_var.set(str(max(80, min(1200, cur + int(delta)))))
         self._update_position_graph_sizing()
 
     def _sync_position_graph_profile(self) -> None:
@@ -1135,6 +1171,7 @@ class StrataGuiApp:
                         tp_price = cand
 
             pnl_pct = ((current - entry) / entry * 100.0) if (entry > 0 and current > 0) else 0.0
+            pnl_quote = ((current - entry) * qty) if (entry > 0 and current > 0 and qty > 0) else 0.0
             protected = (stop_price > 0) or (tp_price > 0)
             protection_state = "PROTECTED" if (stop_price > 0 and tp_price > 0) else ("PARTIAL" if protected else "UNPROTECTED")
             rows.append(
@@ -1148,6 +1185,8 @@ class StrataGuiApp:
                     "stop": stop_price,
                     "tp": tp_price,
                     "pnl_pct": pnl_pct,
+                    "pnl_quote": pnl_quote,
+                    "quote_currency": quote,
                     "protection_state": protection_state,
                 }
             )
@@ -1172,6 +1211,7 @@ class StrataGuiApp:
             f"Open positions: {n} | Protected: {protected} | Partial: {partial} | Unprotected: {unprotected}"
         )
         self._draw_position_graph()
+        self._render_position_graph_output()
         self._append_task_terminal(f"DONE {task_name} ({n} position(s))")
         self._finish_task(task_id, task_name=task_name)
 
@@ -1220,6 +1260,8 @@ class StrataGuiApp:
             stp = float(row.get("stop", 0.0) or 0.0)
             tp = float(row.get("tp", 0.0) or 0.0)
             pnl = float(row.get("pnl_pct", 0.0) or 0.0)
+            pnl_quote = float(row.get("pnl_quote", 0.0) or 0.0)
+            quote = str(row.get("quote_currency", "") or "")
             protection_state = str(row.get("protection_state", "") or "")
 
             vals = [v for v in [entry, cur, stp, tp] if v > 0]
@@ -1239,12 +1281,16 @@ class StrataGuiApp:
             y_mid = y + 24
             c.create_line(left_col, y_mid, left_col + graph_w, y_mid, fill="#3a4350", width=1)
             c.create_text(16, y + 7, text=f"{symbol} [{tf}]  qty={qty:.6f}", fill="#e6eaef", anchor="nw", font=("Consolas", 9, "bold"))
-            c.create_text(16, y + 26, text=f"PnL {pnl:+.2f}%", fill=("#39d98a" if pnl >= 0 else "#ff6b6b"), anchor="nw", font=("Consolas", 9))
+            buy_txt = (f"Buy @ {entry:.6g}" if entry > 0 else "Buy @ n/a")
+            pnl_txt = f"PnL {pnl:+.2f}% / {pnl_quote:+.4f} {quote}".strip()
+            c.create_text(16, y + 24, text=f"{buy_txt} | {pnl_txt}", fill=("#39d98a" if pnl >= 0 else "#ff6b6b"), anchor="nw", font=("Consolas", 9))
 
             x_entry = xmap(entry)
             x_cur = xmap(cur)
             c.create_oval(x_entry - 4, y_mid - 4, x_entry + 4, y_mid + 4, fill="#67b7ff", outline="")
             c.create_oval(x_cur - 4, y_mid - 4, x_cur + 4, y_mid + 4, fill="#ffffff", outline="#9aa4af")
+            if entry > 0:
+                c.create_text(x_entry + 6, y_mid - 22, text=f"Buy {entry:.6g}", fill="#8bc5ff", anchor="nw", font=("Consolas", 8))
             c.create_text(x_cur + 6, y_mid - 12, text=f"{cur:.6g}", fill="#dbe3ec", anchor="nw", font=("Consolas", 8))
 
             if stp > 0:
@@ -1260,6 +1306,41 @@ class StrataGuiApp:
             c.create_text(left_col + graph_w + 12, y + 18, text=protection_state, fill=state_color, anchor="w", font=("Segoe UI", 9, "bold"))
 
         c.configure(scrollregion=(0, 0, w + 220, total_h))
+
+    def _render_position_graph_output(self) -> None:
+        if not hasattr(self, "pg_output_text"):
+            return
+        rows = self.pg_rows if isinstance(getattr(self, "pg_rows", []), list) else []
+        self.pg_output_text.delete("1.0", tk.END)
+        if not rows:
+            self.pg_output_text.insert("1.0", "No open positions available.\n")
+            return
+        view_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            view_rows.append(
+                {
+                    "symbol": str(r.get("symbol", "") or ""),
+                    "tf": str(r.get("timeframe", "") or ""),
+                    "qty": round(float(r.get("qty", 0.0) or 0.0), 8),
+                    "buy_price": round(float(r.get("entry", 0.0) or 0.0), 8),
+                    "current": round(float(r.get("current", 0.0) or 0.0), 8),
+                    "stop": round(float(r.get("stop", 0.0) or 0.0), 8),
+                    "tp": round(float(r.get("tp", 0.0) or 0.0), 8),
+                    "pnl_pct": round(float(r.get("pnl_pct", 0.0) or 0.0), 4),
+                    "pnl_quote": round(float(r.get("pnl_quote", 0.0) or 0.0), 6),
+                    "quote": str(r.get("quote_currency", "") or ""),
+                    "state": str(r.get("protection_state", "") or ""),
+                }
+            )
+        try:
+            df = pd.DataFrame(view_rows)
+            self.pg_output_text.insert("1.0", df.to_string(index=False) + "\n")
+        except Exception:
+            for v in view_rows:
+                self.pg_output_text.insert("end", str(v) + "\n")
+        self._apply_color_tags(self.pg_output_text)
 
     def _is_position_graph_tab_selected(self) -> bool:
         try:
