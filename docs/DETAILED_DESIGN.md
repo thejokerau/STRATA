@@ -93,13 +93,13 @@ Submit path (`_submit_selected_pending_orders`) performs:
 3. Binance validation and normalization,
 4. optional min-notional adjustment retry,
 5. order submission,
-6. optional protective stop placement on BUY,
+6. optional protective stop/take-profit placement on BUY,
 7. ledger execution logging.
 
-For `STOP_LOSS_LIMIT` pending orders:
+For `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` pending orders:
 
-- requires `stop_loss_price`
-- uses `limit_price` when provided; otherwise derives from stop
+- requires trigger price (`stop_loss_price` for stop, `take_profit_price` for take-profit)
+- uses `limit_price` when provided; otherwise derives from trigger
 - can cancel existing open protective stop orders before replacement
 
 ## 6. Protection Workflow Design
@@ -119,11 +119,15 @@ Supported AI actions:
 
 - `SET_STOP`
 - `SET_TRAILING`
+- `SET_TAKE_PROFIT`
+- `SET_BOTH`
 - `HOLD`
 
 Current execution mapping:
 
 - `SET_TRAILING` is mapped to fixed stop recommendation with explicit annotation.
+- `SET_TAKE_PROFIT` creates `TAKE_PROFIT_LIMIT` protective orders.
+- `SET_BOTH` stages both stop-loss and take-profit protective orders.
 
 ## 6.2 Background Execution Model
 

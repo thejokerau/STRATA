@@ -532,7 +532,7 @@ class StrataGuiApp:
         pending_frame.pack(fill="x", expand=False, padx=8, pady=(0, 8))
         pending_tree_frame, self.pending_tree = self._create_scrolled_tree(
             pending_frame,
-            columns=("id", "symbol", "side", "type", "qty", "stop", "tf", "conf", "status", "reason"),
+            columns=("id", "symbol", "side", "type", "qty", "stop", "tp", "tf", "conf", "status", "reason"),
             show="headings",
             height=6,
             selectmode="extended",
@@ -544,6 +544,7 @@ class StrataGuiApp:
             ("type", 70),
             ("qty", 80),
             ("stop", 90),
+            ("tp", 90),
             ("tf", 50),
             ("conf", 60),
             ("status", 90),
@@ -557,7 +558,13 @@ class StrataGuiApp:
         ttk.Label(pending_btns_row1, text="Set qty").pack(side="left")
         ttk.Entry(pending_btns_row1, textvariable=self.pf_pending_qty_var, width=10).pack(side="left", padx=4)
         ttk.Label(pending_btns_row1, text="type").pack(side="left")
-        ttk.Combobox(pending_btns_row1, textvariable=self.pf_pending_type_var, values=["MARKET", "LIMIT", "STOP_LOSS_LIMIT"], width=14, state="readonly").pack(side="left", padx=4)
+        ttk.Combobox(
+            pending_btns_row1,
+            textvariable=self.pf_pending_type_var,
+            values=["MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"],
+            width=16,
+            state="readonly",
+        ).pack(side="left", padx=4)
         ttk.Button(pending_btns_row1, text="Apply to Selected", command=self._apply_pending_edit_to_selected).pack(side="left", padx=6)
         ttk.Label(pending_btns_row1, text="Auto BUY %").pack(side="left", padx=(10, 0))
         ttk.Entry(pending_btns_row1, textvariable=self.pf_auto_buy_pct_var, width=6).pack(side="left", padx=4)
@@ -2510,6 +2517,11 @@ class StrataGuiApp:
                     except Exception:
                         px = 0.0
                     sl = px * (1.0 - (stop_pct / 100.0)) if (px > 0 and stop_pct > 0) else 0.0
+                    try:
+                        tp_pct_scan = float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0
+                    except Exception:
+                        tp_pct_scan = 20.0
+                    tp = px * (1.0 + (max(0.0, tp_pct_scan) / 100.0)) if (px > 0 and tp_pct_scan > 0) else 0.0
                     score_raw = str(r.get("Raw Score", "") or r.get("Score", "")).strip()
                     conf = ""
                     m_sc = re.search(r"(-?\d+)\s*/\s*5", score_raw)
@@ -2529,6 +2541,7 @@ class StrataGuiApp:
                             "order_type": "MARKET",
                             "quantity": 0.0,
                             "stop_loss_price": (round(sl, 8) if sl > 0 else 0.0),
+                            "take_profit_price": (round(tp, 8) if tp > 0 else 0.0),
                             "timeframe": tf,
                             "confidence": conf,
                             "status": "PENDING",
@@ -2613,6 +2626,7 @@ class StrataGuiApp:
                 "order_type": "MARKET",
                 "quantity": nq,
                 "stop_loss_price": round(sl, 8) if sl > 0 else 0.0,
+                "take_profit_price": (round(px * (1.0 + ((float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0) / 100.0)), 8) if px > 0 else 0.0),
                 "timeframe": tf,
                 "confidence": "",
                 "status": "PENDING",
@@ -3215,6 +3229,7 @@ class StrataGuiApp:
                     "order_type": "MARKET",
                     "quantity": 0.0,
                     "stop_loss_price": 0.0,
+                    "take_profit_price": 0.0,
                     "timeframe": (self.timeframe_var.get().strip() or "1d"),
                     "confidence": conf,
                     "status": "PENDING",
@@ -3299,7 +3314,7 @@ class StrataGuiApp:
             seen.add(key)
 
             order_type = str(tr.get("order_type", "MARKET") or "MARKET").strip().upper()
-            if order_type not in ("MARKET", "LIMIT"):
+            if order_type not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 order_type = "MARKET"
             timeframe = str(tr.get("timeframe", "") or "").strip().lower() or (self.timeframe_var.get().strip() or "1d")
             confidence = str(tr.get("confidence", "") or "").strip()
@@ -3326,6 +3341,27 @@ class StrataGuiApp:
                         stop_loss = float(mm.group(1))
                     except Exception:
                         stop_loss = 0.0
+            take_profit = 0.0
+            for tk in ("take_profit_price", "tp_price"):
+                try:
+                    tv = float(tr.get(tk, 0.0) or 0.0)
+                except Exception:
+                    tv = 0.0
+                if tv > 0:
+                    take_profit = tv
+                    break
+            if take_profit <= 0:
+                try:
+                    tp_pct = float(tr.get("take_profit_pct", 0.0) or 0.0)
+                except Exception:
+                    tp_pct = 0.0
+                if tp_pct > 0:
+                    try:
+                        ref_price = float(tr.get("entry_price", 0.0) or tr.get("price", 0.0) or 0.0)
+                    except Exception:
+                        ref_price = 0.0
+                    if ref_price > 0:
+                        take_profit = ref_price * (1.0 + (tp_pct / 100.0))
 
             self._pending_rec_seq += 1
             recs.append(
@@ -3342,6 +3378,7 @@ class StrataGuiApp:
                     "reason": (reason or "Structured trade-plan recommendation")[:300],
                     "invalidation": invalidation,
                     "stop_loss_price": (stop_loss if stop_loss > 0 else 0.0),
+                    "take_profit_price": (take_profit if take_profit > 0 else 0.0),
                 }
             )
         return recs
@@ -3358,6 +3395,7 @@ class StrataGuiApp:
                 messagebox.showinfo("AI Recommendations", "No BUY/SELL recommendations were detected in AI output.")
             return 0
         recs, skipped_sell = self._filter_sells_without_holdings(recs)
+        recs = self._apply_bt_risk_defaults_to_recommendations(recs)
         self.pending_recommendations.extend(recs)
         self._refresh_pending_recommendations_view()
         self._append_task_terminal(
@@ -3483,12 +3521,73 @@ class StrataGuiApp:
                     r.get("order_type", "MARKET"),
                     r.get("quantity", 0),
                     r.get("stop_loss_price", ""),
+                    r.get("take_profit_price", ""),
                     r.get("timeframe", ""),
                     r.get("confidence", ""),
                     r.get("status", "PENDING"),
                     r.get("reason", ""),
                 ),
             )
+
+    def _apply_bt_risk_defaults_to_recommendations(self, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not isinstance(recs, list) or not recs:
+            return recs
+        try:
+            sl_pct = float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0
+        except Exception:
+            sl_pct = 8.0
+        try:
+            tp_pct = float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0
+        except Exception:
+            tp_pct = 20.0
+        sl_pct = max(0.0, min(50.0, float(sl_pct)))
+        tp_pct = max(0.0, min(200.0, float(tp_pct)))
+        if sl_pct <= 0 and tp_pct <= 0:
+            return recs
+
+        profile = self.pf_binance_profile_var.get().strip() if hasattr(self, "pf_binance_profile_var") else ""
+        profile_name = profile or None
+        price_cache: Dict[str, float] = {}
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            side = str(r.get("side", "")).strip().upper()
+            if side != "BUY":
+                r.setdefault("stop_loss_price", float(r.get("stop_loss_price", 0.0) or 0.0))
+                r.setdefault("take_profit_price", float(r.get("take_profit_price", 0.0) or 0.0))
+                continue
+            try:
+                sl = float(r.get("stop_loss_price", 0.0) or 0.0)
+            except Exception:
+                sl = 0.0
+            try:
+                tp = float(r.get("take_profit_price", 0.0) or 0.0)
+            except Exception:
+                tp = 0.0
+            if sl > 0 and tp > 0:
+                continue
+            symbol = str(r.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            if symbol in price_cache:
+                px = float(price_cache[symbol])
+            else:
+                px = 0.0
+                if profile_name:
+                    po = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile_name)
+                    if po.get("ok"):
+                        try:
+                            px = float(po.get("price", 0.0) or 0.0)
+                        except Exception:
+                            px = 0.0
+                price_cache[symbol] = px
+            if px <= 0:
+                continue
+            if sl <= 0 and sl_pct > 0:
+                r["stop_loss_price"] = round(px * (1.0 - (sl_pct / 100.0)), 8)
+            if tp <= 0 and tp_pct > 0:
+                r["take_profit_price"] = round(px * (1.0 + (tp_pct / 100.0)), 8)
+        return recs
 
     def _selected_pending_ids(self) -> List[int]:
         if not hasattr(self, "pending_tree"):
@@ -3880,9 +3979,12 @@ class StrataGuiApp:
             self._vlog(f"Submitting order: symbol={symbol} side={side} type={order_type} qty={qty}")
             price_arg = None
             stop_arg = None
-            if order_type == "STOP_LOSS_LIMIT":
+            if order_type in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 try:
-                    stop_arg = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                    if order_type == "STOP_LOSS_LIMIT":
+                        stop_arg = float(rec.get("stop_loss_price", 0.0) or 0.0)
+                    else:
+                        stop_arg = float(rec.get("take_profit_price", 0.0) or 0.0)
                 except Exception:
                     stop_arg = 0.0
                 try:
@@ -3891,13 +3993,19 @@ class StrataGuiApp:
                     price_arg = 0.0
                 if stop_arg <= 0:
                     rec["status"] = "BLOCKED"
-                    rec["reason"] = "STOP_LOSS_LIMIT requires stop_loss_price > 0."
+                    if order_type == "STOP_LOSS_LIMIT":
+                        rec["reason"] = "STOP_LOSS_LIMIT requires stop_loss_price > 0."
+                    else:
+                        rec["reason"] = "TAKE_PROFIT_LIMIT requires take_profit_price > 0."
                     blocked += 1
                     continue
                 if not price_arg or price_arg <= 0:
-                    price_arg = float(stop_arg) * 0.995
+                    if order_type == "STOP_LOSS_LIMIT":
+                        price_arg = float(stop_arg) * 0.995
+                    else:
+                        price_arg = float(stop_arg) * 0.999
 
-                if side == "SELL":
+                if side == "SELL" and order_type == "STOP_LOSS_LIMIT":
                     # Tighten-only guard: never move a protective stop backwards for long positions.
                     # If an existing protective stop is higher, block this update.
                     oo = self.bridge.list_open_binance_orders(profile_name=profile, symbol=symbol)
@@ -3985,6 +4093,8 @@ class StrataGuiApp:
                             order_type=order_type,
                             quantity=adj_qty,
                             profile_name=profile,
+                            price=price_arg,
+                            stop_price=stop_arg,
                         )
                         if out2.get("ok"):
                             out = out2
@@ -4066,6 +4176,27 @@ class StrataGuiApp:
                     else:
                         rec["reason"] = (str(rec.get("reason", "") or "") + f" | stop set failed: {stop_out.get('error', 'unknown')}").strip(" |")
                         self._vlog(f"Protective stop failed: {symbol} err={stop_out.get('error', 'unknown')}")
+                try:
+                    tp = float(rec.get("take_profit_price", 0.0) or 0.0)
+                except Exception:
+                    tp = 0.0
+                if tp > 0:
+                    tp_limit = tp * 0.999
+                    tp_out = self.bridge.submit_binance_order(
+                        symbol=symbol,
+                        side="SELL",
+                        order_type="TAKE_PROFIT_LIMIT",
+                        quantity=float(out.get("normalized_quantity", qty) or qty),
+                        profile_name=profile,
+                        price=tp_limit,
+                        stop_price=tp,
+                    )
+                    if tp_out.get("ok"):
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | take-profit set @{tp:.8f}").strip(" |")
+                        self._vlog(f"Take-profit placed: {symbol} trigger={tp:.8f} limit={tp_limit:.8f}")
+                    else:
+                        rec["reason"] = (str(rec.get("reason", "") or "") + f" | take-profit set failed: {tp_out.get('error', 'unknown')}").strip(" |")
+                        self._vlog(f"Take-profit failed: {symbol} err={tp_out.get('error', 'unknown')}")
             lg = self.bridge.record_signal_event(
                 {
                     "market": "crypto",
@@ -4229,9 +4360,10 @@ class StrataGuiApp:
             "positions": position_rows,
             "targeted_backtests": bt_context,
             "constraints": {
-                "allowed_actions": ["SET_STOP", "SET_TRAILING", "HOLD"],
+                "allowed_actions": ["SET_STOP", "SET_TRAILING", "SET_TAKE_PROFIT", "SET_BOTH", "HOLD"],
                 "stop_pct_bounds": [1.0, 20.0],
                 "trailing_pct_bounds": [0.5, 15.0],
+                "take_profit_pct_bounds": [1.0, 100.0],
             },
         }
         return (
@@ -4243,9 +4375,10 @@ class StrataGuiApp:
             "  \"protections\": [\n"
             "    {\n"
             "      \"symbol\": \"BTCUSDT\",\n"
-            "      \"action\": \"SET_STOP|SET_TRAILING|HOLD\",\n"
+            "      \"action\": \"SET_STOP|SET_TRAILING|SET_TAKE_PROFIT|SET_BOTH|HOLD\",\n"
             "      \"stop_pct\": 5.0,\n"
             "      \"trailing_pct\": 2.0,\n"
+            "      \"take_profit_pct\": 12.0,\n"
             "      \"confidence\": 75,\n"
             "      \"reason\": \"short reason\"\n"
             "    }\n"
@@ -4399,6 +4532,7 @@ class StrataGuiApp:
                     "action": "SET_STOP",
                     "stop_pct": fallback_stop,
                     "trailing_pct": 0.0,
+                    "take_profit_pct": float(bt_opts.get("take_profit_pct", 20.0) or 20.0),
                     "confidence": 50,
                     "reason": "Fallback protection (AI unavailable/empty).",
                 }
@@ -4426,28 +4560,60 @@ class StrataGuiApp:
                 trailing_pct = max(0.0, min(15.0, float(plan.get("trailing_pct", 0.0) or 0.0)))
             except Exception:
                 trailing_pct = 0.0
+            try:
+                take_profit_pct = max(0.0, min(100.0, float(plan.get("take_profit_pct", 0.0) or 0.0)))
+            except Exception:
+                take_profit_pct = 0.0
+            if take_profit_pct <= 0:
+                try:
+                    take_profit_pct = max(0.0, min(100.0, float(bt_opts.get("take_profit_pct", 20.0) or 20.0)))
+                except Exception:
+                    take_profit_pct = 20.0
             stop_price = last_price * (1.0 - (stop_pct / 100.0))
             limit_price = stop_price * 0.995
             reason = str(plan.get("reason", "Protection recommendation") or "Protection recommendation").strip()
             if trailing_pct > 0:
                 reason += f" | trailing suggested {trailing_pct:.2f}% (implemented as fixed stop for compatibility)"
-            staged_recs.append(
-                {
-                    "symbol": symbol,
-                    "asset": self._base_asset_from_symbol(symbol),
-                    "side": "SELL",
-                    "order_type": "STOP_LOSS_LIMIT",
-                    "quantity": qty,
-                    "stop_loss_price": round(stop_price, 8),
-                    "limit_price": round(limit_price, 8),
-                    "timeframe": str(pos.get("timeframe", "4h")),
-                    "confidence": str(plan.get("confidence", "") or ""),
-                    "status": "PENDING",
-                    "reason": reason,
-                    "replace_existing_stop": True,
-                    "protection_mode": action,
-                }
-            )
+            if action in ("SET_STOP", "SET_TRAILING", "SET_BOTH"):
+                staged_recs.append(
+                    {
+                        "symbol": symbol,
+                        "asset": self._base_asset_from_symbol(symbol),
+                        "side": "SELL",
+                        "order_type": "STOP_LOSS_LIMIT",
+                        "quantity": qty,
+                        "stop_loss_price": round(stop_price, 8),
+                        "take_profit_price": 0.0,
+                        "limit_price": round(limit_price, 8),
+                        "timeframe": str(pos.get("timeframe", "4h")),
+                        "confidence": str(plan.get("confidence", "") or ""),
+                        "status": "PENDING",
+                        "reason": reason,
+                        "replace_existing_stop": True,
+                        "protection_mode": action,
+                    }
+                )
+            if action in ("SET_TAKE_PROFIT", "SET_BOTH"):
+                tp_price = last_price * (1.0 + (take_profit_pct / 100.0))
+                tp_limit = tp_price * 0.999
+                staged_recs.append(
+                    {
+                        "symbol": symbol,
+                        "asset": self._base_asset_from_symbol(symbol),
+                        "side": "SELL",
+                        "order_type": "TAKE_PROFIT_LIMIT",
+                        "quantity": qty,
+                        "stop_loss_price": 0.0,
+                        "take_profit_price": round(tp_price, 8),
+                        "limit_price": round(tp_limit, 8),
+                        "timeframe": str(pos.get("timeframe", "4h")),
+                        "confidence": str(plan.get("confidence", "") or ""),
+                        "status": "PENDING",
+                        "reason": (reason + f" | take-profit {take_profit_pct:.2f}%").strip(),
+                        "replace_existing_take_profit": True,
+                        "protection_mode": action,
+                    }
+                )
         return {
             "ok": True,
             "staged_recs": staged_recs,

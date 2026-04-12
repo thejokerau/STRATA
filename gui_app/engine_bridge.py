@@ -601,8 +601,8 @@ class EngineBridge:
         t = str(order_type).strip().upper()
         if not sym or s not in ("BUY", "SELL"):
             return {"ok": False, "error": "Valid symbol and side (BUY/SELL) are required."}
-        if t not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT"):
-            return {"ok": False, "error": "order_type must be MARKET, LIMIT, or STOP_LOSS_LIMIT."}
+        if t not in ("MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
+            return {"ok": False, "error": "order_type must be MARKET, LIMIT, STOP_LOSS_LIMIT, or TAKE_PROFIT_LIMIT."}
 
         qty = self._to_decimal(quantity)
         if qty <= Decimal("0"):
@@ -661,7 +661,7 @@ class EngineBridge:
 
         norm_price: Optional[Decimal] = None
         norm_stop: Optional[Decimal] = None
-        if t in ("LIMIT", "STOP_LOSS_LIMIT"):
+        if t in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
             p = self._to_decimal(price or 0)
             if p <= Decimal("0"):
                 return {"ok": False, "error": f"{t} orders require positive price."}
@@ -673,10 +673,10 @@ class EngineBridge:
                 return {"ok": False, "error": f"Price {norm_price} below minPrice {min_p}."}
             if max_p > Decimal("0") and norm_price > max_p:
                 return {"ok": False, "error": f"Price {norm_price} above maxPrice {max_p}."}
-            if t == "STOP_LOSS_LIMIT":
+            if t in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 sp = self._to_decimal(stop_price or 0)
                 if sp <= Decimal("0"):
-                    return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                    return {"ok": False, "error": f"{t} orders require positive stop_price."}
                 norm_stop = self._round_to_step(sp, tick) if tick > Decimal("0") else sp
                 if min_p > Decimal("0") and norm_stop < min_p:
                     return {"ok": False, "error": f"Stop price {norm_stop} below minPrice {min_p}."}
@@ -1103,7 +1103,7 @@ class EngineBridge:
                 "type": t,
                 "quantity": f"{qty:.8f}".rstrip("0").rstrip("."),
             }
-            if t in ("LIMIT", "STOP_LOSS_LIMIT"):
+            if t in ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                 try:
                     px = float(px_norm if px_norm is not None else (price or 0.0))
                 except Exception:
@@ -1112,13 +1112,13 @@ class EngineBridge:
                     return {"ok": False, "error": f"{t} orders require positive price."}
                 params["price"] = f"{px:.8f}".rstrip("0").rstrip(".")
                 params["timeInForce"] = str(time_in_force or "GTC").upper()
-                if t == "STOP_LOSS_LIMIT":
+                if t in ("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
                     try:
                         sp = float(sp_norm if sp_norm is not None else (stop_price or 0.0))
                     except Exception:
                         sp = 0.0
                     if sp <= 0:
-                        return {"ok": False, "error": "STOP_LOSS_LIMIT orders require positive stop_price."}
+                        return {"ok": False, "error": f"{t} orders require positive stop_price."}
                     params["stopPrice"] = f"{sp:.8f}".rstrip("0").rstrip(".")
             out = self._signed_binance_request(
                 "POST",
