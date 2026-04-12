@@ -1,4 +1,16 @@
-﻿## Release & Branch Strategy (Best Practice)
+## What STRATA Means
+
+STRATA stands for **Signal, Timing, Risk, Allocation, Trade Automation**.
+
+It reflects the platform workflow:
+
+- **Signal**: identify opportunities from live/backtest analytics
+- **Timing**: align entries/exits to timeframe and regime
+- **Risk**: enforce stops, exposure limits, and guardrails
+- **Allocation**: size positions using balance, confidence, and constraints
+- **Trade Automation**: stage, approve, execute, reconcile, and monitor
+
+## Release & Branch Strategy (Best Practice)
 
 Use separate long-lived branches for release channels:
 
@@ -416,4 +428,5 @@ Ollama behavior:
 - Nightly will try to call local Ollama directly.
 - If unreachable, it attempts to start `ollama serve` automatically.
 - If model is missing, it attempts auto-pull (`OLLAMA_AUTO_PULL=1` by default).
+
 
