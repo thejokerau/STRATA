@@ -358,11 +358,10 @@ class StrataGuiApp:
         ttk.Button(bt_btns, text="Copy Trades", command=lambda: self._copy_text_widget(self.bt_trades, "Backtest trades")).pack(side="left", padx=6)
 
     def _build_ai_tab(self) -> None:
-        split = self._create_paned(self.ai_tab, orient="vertical")
-        top = ttk.Frame(split, padding=8)
-        body = ttk.Frame(split, padding=8)
-        split.add(top, weight=1)
-        split.add(body, weight=3)
+        top = ttk.Frame(self.ai_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.ai_tab, padding=8)
+        body.pack(fill="both", expand=True)
 
         self.ai_source = tk.StringVar(value="live")
         self.ai_datetime = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -407,7 +406,7 @@ class StrataGuiApp:
         ttk.Button(top, text="Start Pipeline Scheduler", command=self._start_pipeline_scheduler).pack(side="left", padx=4)
         ttk.Button(top, text="Stop Scheduler", command=self._stop_pipeline_scheduler).pack(side="left", padx=4)
 
-        ai_input_frame, self.ai_input = self._create_scrolled_text(body, height=10, wrap="none")
+        ai_input_frame, self.ai_input = self._create_scrolled_text(body, height=8, wrap="none")
         ai_input_frame.pack(fill="x")
         ai_file_row = ttk.Frame(body)
         ai_file_row.pack(fill="x", pady=(6, 0))
@@ -415,7 +414,7 @@ class StrataGuiApp:
         ttk.Entry(ai_file_row, textvariable=self.ai_backtest_path, width=90).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(ai_file_row, text="Browse...", command=self._browse_ai_backtest_file).pack(side="left")
         ttk.Label(body, text="Custom prompt (used when Prompt=custom_prompt)").pack(anchor="w", pady=(8, 0))
-        ai_custom_frame, self.ai_custom_prompt = self._create_scrolled_text(body, height=8, wrap="none")
+        ai_custom_frame, self.ai_custom_prompt = self._create_scrolled_text(body, height=6, wrap="none")
         ai_custom_frame.pack(fill="x")
         follow_row = ttk.Frame(body)
         follow_row.pack(fill="x", pady=(8, 0))
@@ -689,11 +688,10 @@ class StrataGuiApp:
         rs_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_task_tab(self) -> None:
-        split = self._create_paned(self.task_tab, orient="vertical")
-        top = ttk.Frame(split, padding=8)
-        body = ttk.Frame(split, padding=8)
-        split.add(top, weight=1)
-        split.add(body, weight=4)
+        top = ttk.Frame(self.task_tab, padding=8)
+        top.pack(fill="x")
+        body = ttk.Frame(self.task_tab, padding=8)
+        body.pack(fill="both", expand=True)
 
         ttk.Button(top, text="Refresh", command=self._refresh_task_tab).pack(side="left")
         self.btn_pause_queue = ttk.Button(top, text="Pause Queue", command=self._toggle_queue_pause)
@@ -703,32 +701,30 @@ class StrataGuiApp:
         ttk.Button(top, text="Move Down", command=lambda: self._reprioritize_queue(1)).pack(side="left")
 
         cols = ttk.Frame(body)
-        cols.pack(fill="both", expand=True)
+        cols.pack(fill="x", expand=False)
+        cols.configure(height=180)
+        cols.pack_propagate(False)
         left = ttk.LabelFrame(cols, text="Running", padding=6)
         right = ttk.LabelFrame(cols, text="Queued", padding=6)
-        cols_split = self._create_paned(cols, orient="horizontal")
-        cols_split.pack(fill="both", expand=True)
-        cols_split.add(left, weight=1)
-        cols_split.add(right, weight=1)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right.pack(side="left", fill="both", expand=True)
 
         self.running_list = tk.Listbox(left, height=12)
         self.running_list.pack(fill="both", expand=True)
         self.queued_list = tk.Listbox(right, height=12)
         self.queued_list.pack(fill="both", expand=True)
 
-        logs_split = self._create_paned(body, orient="vertical")
-        logs_split.pack(fill="both", expand=True, pady=(8, 0))
-        task_out_frame, self.task_tab_output = self._create_scrolled_text(logs_split, height=4, wrap="none")
-        logs_split.add(task_out_frame, weight=1)
+        task_out_frame, self.task_tab_output = self._create_scrolled_text(body, height=4, wrap="none")
+        task_out_frame.pack(fill="x", pady=(8, 0))
         task_term_frame, self.task_terminal = self._create_scrolled_text(
-            logs_split,
+            body,
             height=12,
             wrap="none",
             bg="#101315",
             fg="#9CF5C6",
             insertbackground="#9CF5C6",
         )
-        logs_split.add(task_term_frame, weight=3)
+        task_term_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.task_terminal.insert("1.0", "STRATA Task Terminal\n")
         term_btns = ttk.Frame(body)
         term_btns.pack(fill="x", pady=(6, 0))
