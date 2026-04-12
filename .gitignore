@@ -10,6 +10,13 @@
 **/experiments/grok/
 .ctmt/
 
+# Explicit generated JSON artifact ignores (defensive)
+**/experiments/runs/*.json
+**/experiments/reports/*.json
+**/experiments/live_snapshots/*.json
+**/experiments/backtest_snapshots/*.json
+**/experiments/grok/*.json
+
 # Python build/runtime artifacts
 **/__pycache__/
 *.pyc
