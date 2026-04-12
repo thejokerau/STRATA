@@ -201,6 +201,11 @@ GUI Portfolio & Ledger:
     - requests AI protection plan (`SET_STOP` / `SET_TRAILING` / `HOLD`)
     - stages protective `STOP_LOSS_LIMIT` sell orders for review/submit
     - trailing recommendations currently map to fixed-stop execution for compatibility (annotated in reason)
+  - Protection monitor controls:
+    - configurable interval (`Protect every (min)`)
+    - `Start/Stop Protect Monitor`
+    - optional `Auto-send protection` to submit newly staged protective orders without confirmation prompts
+  - Protection generation now runs as a background task to avoid GUI freeze during heavy AI/backtest processing.
   - `Review Open Positions (MTF)` action:
     - evaluates open-position assets across `4h/8h/12h/1d`
     - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)

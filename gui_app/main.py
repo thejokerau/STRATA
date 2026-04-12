@@ -106,6 +106,7 @@ class StrataGuiApp:
         self.pending_recommendations: List[Dict[str, Any]] = []
         self._pending_rec_seq = 0
         self.pipeline_job: Optional[str] = None
+        self.protection_monitor_job: Optional[str] = None
         self.agent_last_staged_ids: List[int] = []
         self.agent_context: Dict[str, Any] = dict(self.state.get("agent_context", {})) if isinstance(self.state.get("agent_context", {}), dict) else {}
         self.agent_context.setdefault("timeframe", "4h")
@@ -487,6 +488,8 @@ class StrataGuiApp:
         self.pf_auto_buy_pct_var = tk.StringVar(value="10")
         self.pf_auto_sell_pct_var = tk.StringVar(value="100")
         self.pf_auto_confidence_var = tk.BooleanVar(value=True)
+        self.pf_protect_interval_min_var = tk.StringVar(value="30")
+        self.pf_protect_auto_send_var = tk.BooleanVar(value=False)
 
         ttk.Label(top, text="Binance Profile").pack(side="left")
         self.pf_binance_profile_combo = ttk.Combobox(top, textvariable=self.pf_binance_profile_var, values=[], width=22, state="readonly")
@@ -499,7 +502,12 @@ class StrataGuiApp:
         ttk.Button(top, text="Refresh Portfolio", command=self._refresh_portfolio).pack(side="left")
         ttk.Button(top, text="Reconcile Fills", command=self._reconcile_binance_fills).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Review Open Positions (MTF)", command=self._review_open_positions_mtf).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Protect Open Positions (AI+BT)", command=self._protect_open_positions_ai).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Protect Open Positions (AI+BT)", command=self._run_protect_open_positions_ai).pack(side="left", padx=(6, 0))
+        ttk.Label(top, text="Protect every (min)").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pf_protect_interval_min_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="Auto-send protection", variable=self.pf_protect_auto_send_var).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Start Protect Monitor", command=self._start_protection_monitor).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Stop Protect Monitor", command=self._stop_protection_monitor).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="Signal Cooldown (min)").pack(side="left", padx=(12, 0))
         ttk.Entry(top, textvariable=self.pf_cooldown_min_var, width=8).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Track HOLD signals", variable=self.pf_track_hold_var).pack(side="left", padx=(8, 0))
@@ -3697,8 +3705,8 @@ class StrataGuiApp:
             f"SELL sizing: {sell_pct:.1f}% of available base balance",
         )
 
-    def _submit_selected_pending_orders(self) -> None:
-        ids = self._selected_pending_ids()
+    def _submit_selected_pending_orders(self, ids_override: Optional[List[int]] = None, require_confirm: bool = True) -> None:
+        ids = list(ids_override) if isinstance(ids_override, list) and ids_override else self._selected_pending_ids()
         if not ids:
             messagebox.showinfo("Pending Orders", "Select one or more rows to submit.")
             return
@@ -3710,9 +3718,10 @@ class StrataGuiApp:
         if not profile:
             messagebox.showinfo("Pending Orders", "Select a Binance profile first.")
             return
-        ok = messagebox.askyesno("Submit Orders", f"Submit {len(ids)} selected order(s) to Binance?")
-        if not ok:
-            return
+        if require_confirm:
+            ok = messagebox.askyesno("Submit Orders", f"Submit {len(ids)} selected order(s) to Binance?")
+            if not ok:
+                return
         try:
             cooldown = max(1, int((self.pf_cooldown_min_var.get() or "240").strip()))
         except Exception:
@@ -4073,22 +4082,74 @@ class StrataGuiApp:
             + json.dumps(payload, indent=2)
         )
 
-    def _protect_open_positions_ai(self) -> None:
+    def _run_protect_open_positions_ai(self, auto_submit: bool = False, source: str = "manual") -> None:
+        task_name = "Protect Open Positions"
+        starter = lambda: self._start_protect_open_positions_ai(auto_submit=auto_submit, source=source)
+        if self._queue_if_busy(task_name, starter):
+            return
+        starter()
+
+    def _start_protect_open_positions_ai(self, auto_submit: bool = False, source: str = "manual") -> None:
         profile = self.pf_binance_profile_var.get().strip() or None
         if not profile:
             messagebox.showinfo("Protection", "Select a Binance profile first.")
             return
-        out = self.bridge.get_trade_ledger()
+        task_name = "Protect Open Positions"
+        task_id = self._set_busy(True, task_name)
+        self._append_task_terminal(f"START Protect Open Positions ({source})")
+        cfg = {
+            "profile": profile,
+            "display_currency": self.display_currency_var.get().strip() or "USD",
+            "bt": {
+                "months": int(self.bt_months.get()) if hasattr(self, "bt_months") else 12,
+                "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()) if hasattr(self, "bt_country") else "2",
+                "initial_capital": float(self.bt_initial.get()) if hasattr(self, "bt_initial") else 10000.0,
+                "stop_loss_pct": float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0,
+                "take_profit_pct": float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0,
+                "max_hold_days": int(self.bt_max_hold_days.get()) if hasattr(self, "bt_max_hold_days") else 45,
+                "min_hold_bars": int(self.bt_min_hold_bars.get()) if hasattr(self, "bt_min_hold_bars") else 2,
+                "cooldown_bars": int(self.bt_cooldown_bars.get()) if hasattr(self, "bt_cooldown_bars") else 1,
+                "same_asset_cooldown_bars": int(self.bt_same_asset_cooldown.get()) if hasattr(self, "bt_same_asset_cooldown") else 3,
+                "max_consecutive_same_asset_entries": int(self.bt_max_same_asset_entries.get()) if hasattr(self, "bt_max_same_asset_entries") else 3,
+                "fee_pct": float(self.bt_fee_pct.get()) if hasattr(self, "bt_fee_pct") else 0.10,
+                "slippage_pct": float(self.bt_slippage_pct.get()) if hasattr(self, "bt_slippage_pct") else 0.05,
+                "position_size": max(0.01, min(1.0, (float(self.bt_position_size_pct.get()) if hasattr(self, "bt_position_size_pct") else 30.0) / 100.0)),
+                "atr_multiplier": float(self.bt_atr_mult.get()) if hasattr(self, "bt_atr_mult") else 2.2,
+                "adx_threshold": float(self.bt_adx_threshold.get()) if hasattr(self, "bt_adx_threshold") else 25.0,
+                "cmf_threshold": float(self.bt_cmf_threshold.get()) if hasattr(self, "bt_cmf_threshold") else 0.02,
+                "obv_slope_threshold": float(self.bt_obv_threshold.get()) if hasattr(self, "bt_obv_threshold") else 0.0,
+                "max_drawdown_limit_pct": float(self.bt_max_dd_target_pct.get()) if hasattr(self, "bt_max_dd_target_pct") else 35.0,
+                "max_exposure_pct": max(0.01, min(1.0, (float(self.bt_max_exposure_pct.get()) if hasattr(self, "bt_max_exposure_pct") else 40.0) / 100.0)),
+                "cache_workers": int(self.bt_cache_workers.get()) if hasattr(self, "bt_cache_workers") else 4,
+                "buy_threshold": int(self.bt_buy_threshold.get()) if hasattr(self, "bt_buy_threshold") else 2,
+                "sell_threshold": int(self.bt_sell_threshold.get()) if hasattr(self, "bt_sell_threshold") else -2,
+            },
+            "auto_submit": bool(auto_submit),
+            "source": source,
+        }
+
+        def worker():
+            bridge = self._bridge_for_task()
+            try:
+                res = self._compute_protection_recommendations(bridge, cfg)
+            except Exception as exc:
+                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "source": source}
+            self.root.after(0, lambda: self._finish_protect_open_positions_ai(res, task_id))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _compute_protection_recommendations(self, bridge: EngineBridge, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        profile = str(cfg.get("profile", "")).strip() or None
+        out = bridge.get_trade_ledger()
         if not out.get("ok"):
-            messagebox.showerror("Protection", str(out.get("error", "Failed to load ledger.")))
-            return
+            return {"ok": False, "error": str(out.get("error", "Failed to load ledger."))}
         ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
         if not isinstance(open_positions, dict) or not open_positions:
-            messagebox.showinfo("Protection", "No open positions in ledger.")
-            return
+            return {"ok": True, "staged_recs": [], "positions": 0, "ai_ok": False, "bt_ctx": 0, "note": "No open positions in ledger."}
 
-        display_ccy = self.display_currency_var.get().strip() or "USD"
+        display_ccy = str(cfg.get("display_currency", "USD") or "USD")
+        bt_opts = cfg.get("bt", {}) if isinstance(cfg.get("bt"), dict) else {}
         pos_rows: List[Dict[str, Any]] = []
         bt_context: Dict[str, Dict[str, Any]] = {}
         for _, pos in open_positions.items():
@@ -4099,7 +4160,7 @@ class StrataGuiApp:
                 continue
             quote = str(pos.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
             symbol = str(pos.get("symbol", "")).strip().upper() or f"{asset}{quote}"
-            timeframe = str(pos.get("timeframe", self.bt_tf.get() if hasattr(self, "bt_tf") else "4h") or "4h").strip().lower()
+            timeframe = str(pos.get("timeframe", "4h") or "4h").strip().lower()
             try:
                 qty = float(pos.get("qty", 0.0) or 0.0)
             except Exception:
@@ -4110,7 +4171,7 @@ class StrataGuiApp:
                 entry_price = 0.0
             if qty <= 0:
                 continue
-            lp = self.bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
+            lp = bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
             last_price = float(lp.get("price", 0.0) or 0.0) if lp.get("ok") else 0.0
             pnl_pct = ((last_price - entry_price) / entry_price * 100.0) if (entry_price > 0 and last_price > 0) else 0.0
             pos_rows.append(
@@ -4124,50 +4185,29 @@ class StrataGuiApp:
                     "pnl_pct": round(pnl_pct, 4),
                 }
             )
-            # Include targeted backtest context for this symbol.
             try:
-                bt_cfg = {
-                    "market": "crypto",
-                    "timeframe": timeframe if timeframe in ("1d", "4h", "8h", "12h") else "4h",
-                    "months": int(self.bt_months.get()) if hasattr(self, "bt_months") else 12,
-                    "top_n": 1,
-                    "quote_currency": quote,
-                    "country": parse_country_code(self.bt_country.get(), self.bt_country_manual.get()) if hasattr(self, "bt_country") else "2",
-                    "initial_capital": float(self.bt_initial.get()) if hasattr(self, "bt_initial") else 10000.0,
-                    "stop_loss_pct": float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0,
-                    "take_profit_pct": float(self.bt_take_profit.get()) if hasattr(self, "bt_take_profit") else 20.0,
-                    "max_hold_days": int(self.bt_max_hold_days.get()) if hasattr(self, "bt_max_hold_days") else 45,
-                    "min_hold_bars": int(self.bt_min_hold_bars.get()) if hasattr(self, "bt_min_hold_bars") else 2,
-                    "cooldown_bars": int(self.bt_cooldown_bars.get()) if hasattr(self, "bt_cooldown_bars") else 1,
-                    "same_asset_cooldown_bars": int(self.bt_same_asset_cooldown.get()) if hasattr(self, "bt_same_asset_cooldown") else 3,
-                    "max_consecutive_same_asset_entries": int(self.bt_max_same_asset_entries.get()) if hasattr(self, "bt_max_same_asset_entries") else 3,
-                    "fee_pct": float(self.bt_fee_pct.get()) if hasattr(self, "bt_fee_pct") else 0.10,
-                    "slippage_pct": float(self.bt_slippage_pct.get()) if hasattr(self, "bt_slippage_pct") else 0.05,
-                    "position_size": max(0.01, min(1.0, (float(self.bt_position_size_pct.get()) if hasattr(self, "bt_position_size_pct") else 30.0) / 100.0)),
-                    "atr_multiplier": float(self.bt_atr_mult.get()) if hasattr(self, "bt_atr_mult") else 2.2,
-                    "adx_threshold": float(self.bt_adx_threshold.get()) if hasattr(self, "bt_adx_threshold") else 25.0,
-                    "cmf_threshold": float(self.bt_cmf_threshold.get()) if hasattr(self, "bt_cmf_threshold") else 0.02,
-                    "obv_slope_threshold": float(self.bt_obv_threshold.get()) if hasattr(self, "bt_obv_threshold") else 0.0,
-                    "max_drawdown_limit_pct": float(self.bt_max_dd_target_pct.get()) if hasattr(self, "bt_max_dd_target_pct") else 35.0,
-                    "max_exposure_pct": max(0.01, min(1.0, (float(self.bt_max_exposure_pct.get()) if hasattr(self, "bt_max_exposure_pct") else 40.0) / 100.0)),
-                    "cache_workers": int(self.bt_cache_workers.get()) if hasattr(self, "bt_cache_workers") else 4,
-                    "buy_threshold": int(self.bt_buy_threshold.get()) if hasattr(self, "bt_buy_threshold") else 2,
-                    "sell_threshold": int(self.bt_sell_threshold.get()) if hasattr(self, "bt_sell_threshold") else -2,
-                    "display_currency": display_ccy,
-                    "tickers": [f"{asset}-USD" if quote == "USD" else f"{asset}-{quote}"],
-                }
-                bt = self.bridge.run_backtest(bt_cfg)
+                bt_cfg = dict(bt_opts)
+                bt_cfg.update(
+                    {
+                        "market": "crypto",
+                        "timeframe": timeframe if timeframe in ("1d", "4h", "8h", "12h") else "4h",
+                        "top_n": 1,
+                        "quote_currency": quote,
+                        "display_currency": display_ccy,
+                        "tickers": [f"{asset}-USD" if quote == "USD" else f"{asset}-{quote}"],
+                    }
+                )
+                bt = bridge.run_backtest(bt_cfg)
                 bt_context[symbol] = {"ok": bool(bt.get("ok")), "summary_text": str(bt.get("summary_text", "") or "")[:3500]}
             except Exception as exc:
                 bt_context[symbol] = {"ok": False, "summary_text": f"Backtest context error: {type(exc).__name__}"}
 
         if not pos_rows:
-            messagebox.showinfo("Protection", "No valid open positions found.")
-            return
+            return {"ok": True, "staged_recs": [], "positions": 0, "ai_ok": False, "bt_ctx": 0, "note": "No valid open positions found."}
 
         prompt = self._build_protection_ai_prompt(pos_rows, bt_context)
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ai_res = self.bridge.run_ai_analysis(
+        ai_res = bridge.run_ai_analysis(
             dashboard_text=json.dumps({"positions": pos_rows}),
             datetime_context=dt,
             prompt_override=prompt,
@@ -4178,7 +4218,7 @@ class StrataGuiApp:
         )
         plans = self._extract_protection_plan_from_ai_text(ai_res.get("response", "")) if ai_res.get("ok") else []
         if not plans:
-            fallback_stop = float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0
+            fallback_stop = float(bt_opts.get("stop_loss_pct", 8.0) or 8.0)
             plans = [
                 {
                     "symbol": p.get("symbol", ""),
@@ -4191,7 +4231,7 @@ class StrataGuiApp:
                 for p in pos_rows
             ]
 
-        staged = 0
+        staged_recs: List[Dict[str, Any]] = []
         for plan in plans:
             symbol = str(plan.get("symbol", "")).strip().upper()
             action = str(plan.get("action", "SET_STOP")).strip().upper()
@@ -4207,7 +4247,7 @@ class StrataGuiApp:
             try:
                 stop_pct = max(1.0, min(20.0, float(plan.get("stop_pct", 0.0) or 0.0)))
             except Exception:
-                stop_pct = float(self.bt_stop_loss.get()) if hasattr(self, "bt_stop_loss") else 8.0
+                stop_pct = float(bt_opts.get("stop_loss_pct", 8.0) or 8.0)
             try:
                 trailing_pct = max(0.0, min(15.0, float(plan.get("trailing_pct", 0.0) or 0.0)))
             except Exception:
@@ -4217,10 +4257,8 @@ class StrataGuiApp:
             reason = str(plan.get("reason", "Protection recommendation") or "Protection recommendation").strip()
             if trailing_pct > 0:
                 reason += f" | trailing suggested {trailing_pct:.2f}% (implemented as fixed stop for compatibility)"
-            self._pending_rec_seq += 1
-            self.pending_recommendations.append(
+            staged_recs.append(
                 {
-                    "id": self._pending_rec_seq,
                     "symbol": symbol,
                     "asset": self._base_asset_from_symbol(symbol),
                     "side": "SELL",
@@ -4233,18 +4271,89 @@ class StrataGuiApp:
                     "status": "PENDING",
                     "reason": reason,
                     "replace_existing_stop": True,
+                    "protection_mode": action,
                 }
             )
-            staged += 1
+        return {
+            "ok": True,
+            "staged_recs": staged_recs,
+            "positions": len(pos_rows),
+            "ai_ok": bool(ai_res.get("ok")),
+            "bt_ctx": len(bt_context),
+            "auto_submit": bool(cfg.get("auto_submit", False)),
+            "source": str(cfg.get("source", "manual")),
+        }
 
+    def _finish_protect_open_positions_ai(self, res: Dict[str, Any], task_id: Optional[int]) -> None:
+        source = str(res.get("source", "manual") or "manual")
+        if not res.get("ok"):
+            self._append_task_terminal(f"DONE Protect Open Positions ({source}, error: {res.get('error', 'unknown')})")
+            messagebox.showerror("Protection", str(res.get("error", "Failed to generate protection recommendations.")))
+            self._finish_task(task_id, task_name="Protect Open Positions")
+            return
+        staged_recs = res.get("staged_recs", []) if isinstance(res.get("staged_recs"), list) else []
+        if not staged_recs:
+            note = str(res.get("note", "No protective recommendations generated.") or "No protective recommendations generated.")
+            self._append_task_terminal(f"DONE Protect Open Positions ({source}, {note})")
+            if source == "manual":
+                messagebox.showinfo("Protection", note)
+            self._finish_task(task_id, task_name="Protect Open Positions")
+            return
+        new_ids: List[int] = []
+        for r in staged_recs:
+            if not isinstance(r, dict):
+                continue
+            self._pending_rec_seq += 1
+            rr = dict(r)
+            rr["id"] = self._pending_rec_seq
+            self.pending_recommendations.append(rr)
+            new_ids.append(int(self._pending_rec_seq))
         self._refresh_pending_recommendations_view()
         self._append_task_terminal(
-            f"Protect positions -> staged={staged}, positions={len(pos_rows)}, ai_ok={bool(ai_res.get('ok'))}, bt_ctx={len(bt_context)}"
+            f"DONE Protect Open Positions ({source}) -> staged={len(new_ids)}, positions={int(res.get('positions', 0) or 0)}, ai_ok={bool(res.get('ai_ok'))}, bt_ctx={int(res.get('bt_ctx', 0) or 0)}"
         )
-        messagebox.showinfo(
-            "Protection Recommendations",
-            f"Staged {staged} protective order recommendation(s).\nReview and submit from Pending Recommendations.",
+        if bool(res.get("auto_submit", False)) and new_ids:
+            self._submit_selected_pending_orders(ids_override=new_ids, require_confirm=False)
+        elif source == "manual":
+            messagebox.showinfo(
+                "Protection Recommendations",
+                f"Staged {len(new_ids)} protective order recommendation(s).\nReview and submit from Pending Recommendations.",
+            )
+        self._finish_task(task_id, task_name="Protect Open Positions")
+
+    def _protection_monitor_tick(self) -> None:
+        if not self.protection_monitor_job:
+            return
+        self._run_protect_open_positions_ai(
+            auto_submit=bool(self.pf_protect_auto_send_var.get()),
+            source="monitor",
         )
+        try:
+            mins = max(1, int((self.pf_protect_interval_min_var.get() or "30").strip()))
+        except Exception:
+            mins = 30
+        self.protection_monitor_job = self.root.after(mins * 60 * 1000, self._protection_monitor_tick)
+
+    def _start_protection_monitor(self) -> None:
+        self._stop_protection_monitor()
+        try:
+            mins = max(1, int((self.pf_protect_interval_min_var.get() or "30").strip()))
+        except Exception:
+            mins = 30
+            self.pf_protect_interval_min_var.set("30")
+        self._append_task_terminal(
+            f"Started protection monitor ({mins} min interval, auto_send={bool(self.pf_protect_auto_send_var.get())})."
+        )
+        self.protection_monitor_job = self.root.after(1000, self._protection_monitor_tick)
+
+    def _stop_protection_monitor(self) -> None:
+        if self.protection_monitor_job:
+            try:
+                self.root.after_cancel(self.protection_monitor_job)
+            except Exception:
+                pass
+            self.protection_monitor_job = None
+            self._append_task_terminal("Stopped protection monitor.")
 
     def _review_open_positions_mtf(self) -> None:
         profile = self.pf_binance_profile_var.get().strip() or None
@@ -5137,6 +5246,7 @@ def run_gui() -> None:
 
     def _shutdown():
         app._stop_pipeline_scheduler()
+        app._stop_protection_monitor()
         app._close_task_monitor()
         if app.task_tab_job:
             try:
