@@ -612,6 +612,7 @@ class StrataGuiApp:
         ttk.Entry(order_top, textvariable=self.pf_open_symbol_filter_var, width=14).pack(side="left", padx=4)
         ttk.Button(order_top, text="Refresh Open Orders", command=self._refresh_open_orders).pack(side="left")
         ttk.Button(order_top, text="Cancel Selected", command=self._cancel_selected_open_orders).pack(side="left", padx=6)
+        ttk.Button(order_top, text="Copy All Rows", command=lambda: self._copy_tree_all(self.open_orders_tree, "Open orders")).pack(side="left", padx=6)
         open_orders_frame, self.open_orders_tree = self._create_scrolled_tree(
             orders,
             columns=("symbol", "orderId", "side", "type", "status", "price", "origQty", "executedQty"),
@@ -949,8 +950,8 @@ class StrataGuiApp:
             return {"ok": False, "error": str(out.get("error", "Failed to load ledger.")), "rows": []}
         ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
-        if not isinstance(open_positions, dict) or not open_positions:
-            return {"ok": True, "rows": [], "count": 0}
+        if not isinstance(open_positions, dict):
+            open_positions = {}
 
         ords = bridge.list_open_binance_orders(profile_name=profile)
         open_orders = ords.get("orders", []) if isinstance(ords, dict) and ords.get("ok") else []
@@ -963,8 +964,92 @@ class StrataGuiApp:
                 continue
             by_symbol.setdefault(sym, []).append(o)
 
-        rows: List[Dict[str, Any]] = []
+        # Build a merged position map so graph still works when ledger is behind:
+        # 1) ledger open positions
+        # 2) symbols from open protective SELL orders
+        # 3) Binance balances fallback
+        merged_pos: Dict[str, Dict[str, Any]] = {}
         for _, pos in open_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            asset = str(pos.get("asset", "")).strip().upper()
+            if not asset:
+                continue
+            quote = str(pos.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+            symbol = str(pos.get("symbol", "")).strip().upper() or f"{asset}{quote}"
+            try:
+                qty = float(pos.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            try:
+                entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            merged_pos[symbol] = {
+                "asset": asset,
+                "symbol": symbol,
+                "timeframe": str(pos.get("timeframe", "spot") or "spot").strip(),
+                "qty": max(0.0, qty),
+                "entry_price": max(0.0, entry_price),
+                "quote_currency": quote,
+            }
+
+        for sym, olist in by_symbol.items():
+            if sym in merged_pos:
+                continue
+            qty_max = 0.0
+            for o in olist:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("side", "")).strip().upper() != "SELL":
+                    continue
+                try:
+                    oq = float(o.get("origQty", 0.0) or 0.0)
+                except Exception:
+                    oq = 0.0
+                if oq > qty_max:
+                    qty_max = oq
+            if qty_max <= 0:
+                continue
+            merged_pos[sym] = {
+                "asset": self._base_asset_from_symbol(sym),
+                "symbol": sym,
+                "timeframe": "spot",
+                "qty": qty_max,
+                "entry_price": 0.0,
+                "quote_currency": self._quote_asset_from_symbol(sym),
+            }
+
+        pf = bridge.fetch_binance_portfolio(profile_name=profile)
+        balances = pf.get("balances", []) if isinstance(pf, dict) and pf.get("ok") else []
+        quote_pref = self._primary_quote_asset() if self._is_primary_quote_locked() else (self.pf_quote_var.get().strip().upper() or "USDT")
+        stables = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD"}
+        for b in balances if isinstance(balances, list) else []:
+            if not isinstance(b, dict):
+                continue
+            asset = str(b.get("asset", "")).strip().upper()
+            if not asset or asset in stables:
+                continue
+            try:
+                total = float(b.get("total", 0.0) or 0.0)
+            except Exception:
+                total = 0.0
+            if total <= 0:
+                continue
+            sym = f"{asset}{quote_pref}"
+            if sym in merged_pos:
+                continue
+            merged_pos[sym] = {
+                "asset": asset,
+                "symbol": sym,
+                "timeframe": "spot",
+                "qty": total,
+                "entry_price": 0.0,
+                "quote_currency": quote_pref,
+            }
+
+        rows: List[Dict[str, Any]] = []
+        for _, pos in merged_pos.items():
             if not isinstance(pos, dict):
                 continue
             asset = str(pos.get("asset", "")).strip().upper()
@@ -1263,6 +1348,7 @@ class StrataGuiApp:
     def _install_tree_bindings(self, tree: ttk.Treeview) -> None:
         menu = tk.Menu(tree, tearoff=0)
         menu.add_command(label="Copy Selected Rows", command=lambda: self._copy_tree_selection(tree, "Tree rows"))
+        menu.add_command(label="Copy All Rows", command=lambda: self._copy_tree_all(tree, "Tree rows"))
 
         def _popup(event):
             try:
@@ -1294,6 +1380,21 @@ class StrataGuiApp:
             rows.append("\t".join([str(v) for v in vals]))
         if not rows:
             self._append_task_terminal(f"{label}: no selected rows to copy.")
+            return
+        head = "\t".join([str(c) for c in cols]) if cols else ""
+        payload = (head + "\n" if head else "") + "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(payload)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
+
+    def _copy_tree_all(self, tree: ttk.Treeview, label: str = "Rows") -> None:
+        rows = []
+        cols = list(tree["columns"]) if "columns" in tree.keys() else []
+        for iid in tree.get_children():
+            vals = tree.item(iid, "values")
+            rows.append("\t".join([str(v) for v in vals]))
+        if not rows:
+            self._append_task_terminal(f"{label}: no rows to copy.")
             return
         head = "\t".join([str(c) for c in cols]) if cols else ""
         payload = (head + "\n" if head else "") + "\n".join(rows)
