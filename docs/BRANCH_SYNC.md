@@ -1,47 +1,46 @@
-# Branch Sync Policy (GUI Nightly -> Nightly)
+# Branch Strategy and Promotion Policy (AI-Nightly -> Main)
 
-When work is done on `gui-nightly`, only required core-script edits must be propagated into `nightly`.
+## Current Branch Model
 
-## Core Script Scope
+- `main`: stable, primary STRATA product branch.
+- `ai-nightly`: active development branch for newest GUI/AI/risk/automation work.
+- `archive/*`: historical snapshot branches from prior workflows (read-only by convention).
 
-Required core sync scope is currently:
+## Primary Promotion Flow
 
-- `nightly/BTC-beta.py`
-
-GUI-only files (for example `gui_app/*`) should not be copied into `nightly` unless explicitly intended.
-
-## Quick Check
-
-From `gui-nightly`, run:
+Use fast-forward promotion from `ai-nightly` to `main` after smoke testing:
 
 ```bash
-python scripts/sync_core_to_nightly.py --base nightly
+git switch main
+git merge --ff-only ai-nightly
+git push origin main
 ```
 
-If there are required edits, the script lists the exact core paths to sync and returns a non-zero code.
+This keeps release history linear and easy to support.
 
-## Patch-Assisted Sync
+## Archive Workflow (Legacy Branch Cleanup)
 
-To generate a minimal patch for required core changes:
+When retiring old long-lived branches:
+
+1. Create archive branch at the old branch tip (for traceability).
+2. Push archive branch to origin.
+3. Delete old branch (local and optionally remote).
+
+Example:
 
 ```bash
-python scripts/sync_core_to_nightly.py --base nightly --create-patch --patch-path experiments/reports/core_sync.patch
+git branch archive/gui-nightly-2026Q2 gui-nightly
+git push origin archive/gui-nightly-2026Q2
+git branch -D gui-nightly
+git push origin --delete gui-nightly
 ```
 
-Then apply on `nightly`:
-
-```bash
-git switch nightly
-git apply experiments/reports/core_sync.patch
-git add nightly/BTC-beta.py
-git commit -m "sync: required core script edits from gui-nightly"
-git switch gui-nightly
-```
+Repeat for any branch being retired (for example `gui-stable`).
 
 ## Documentation Rule
 
-Any required core-script sync should include documentation updates in the same change set where relevant:
+Any branch-strategy or promotion-model change should update:
 
-- `README.md` (user-facing behavior/commands)
-- `PROJECT_HANDOFF.md` (completed work, risks, next tasks)
+- `README.md` (user-facing branch/run guidance)
+- `docs/BRANCH_SYNC.md` (operational source of truth)
 

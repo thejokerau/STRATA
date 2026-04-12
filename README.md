@@ -22,32 +22,25 @@ It reflects the platform workflow:
 
 Use separate long-lived branches for release channels:
 
-- **`main`** -> stable production-ready channel
-- **`nightly`** -> fast-moving integration channel for newest changes
-- **`gui-nightly`** -> fast-moving GUI integration channel
-- **`gui-stable`** -> GUI-stable promotion channel
+- **`main`** -> stable production-ready STRATA channel (GUI-first)
+- **`ai-nightly`** -> active development/nightly channel for latest AI/GUI capabilities
+- **`archive/*`** -> historical snapshots of previous branch eras (read-only by convention)
 
 Recommended workflow:
 
 1. Develop features on short-lived feature branches.
-2. Merge feature branches into `nightly` first for CLI/core work.
-3. Merge GUI-focused work into `gui-nightly`, then promote to `gui-stable`.
-4. Promote tested non-GUI changes from `nightly` into `main` on cadence.
+2. Merge feature branches into `ai-nightly`.
+3. Promote tested `ai-nightly` builds into `main` via fast-forward merge.
+4. Tag milestone releases on `main` (for example `v0.9.0-gui-primary`).
 
-### Core Sync Guardrail (`gui-nightly` -> `nightly`)
+### Promotion Guardrail (`ai-nightly` -> `main`)
 
-When changing core strategy/runtime behavior in `gui-nightly`, sync only required core edits into `nightly` (not GUI-only files).
-
-Core-sync helper:
+Promote with a clean, fast-forward merge to keep release history easy to audit:
 
 ```bash
-python scripts/sync_core_to_nightly.py --base nightly
-```
-
-Optional patch generation for minimal sync:
-
-```bash
-python scripts/sync_core_to_nightly.py --base nightly --create-patch --patch-path experiments/reports/core_sync.patch
+git switch main
+git merge --ff-only ai-nightly
+git push origin main
 ```
 
 Detailed policy: `docs/BRANCH_SYNC.md`
@@ -93,7 +86,7 @@ Nightly channel (`nightly` branch target):
 python nightly/BTC-beta.py
 ```
 
-GUI (gui-nightly branch):
+GUI (ai-nightly branch):
 
 ```bash
 python scripts/run_gui.py
