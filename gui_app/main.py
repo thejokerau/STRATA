@@ -612,6 +612,7 @@ class StrataGuiApp:
         ttk.Entry(order_top, textvariable=self.pf_open_symbol_filter_var, width=14).pack(side="left", padx=4)
         ttk.Button(order_top, text="Refresh Open Orders", command=self._refresh_open_orders).pack(side="left")
         ttk.Button(order_top, text="Cancel Selected", command=self._cancel_selected_open_orders).pack(side="left", padx=6)
+        ttk.Button(order_top, text="Copy All Rows", command=lambda: self._copy_tree_all(self.open_orders_tree, "Open orders")).pack(side="left", padx=6)
         open_orders_frame, self.open_orders_tree = self._create_scrolled_tree(
             orders,
             columns=("symbol", "orderId", "side", "type", "status", "price", "origQty", "executedQty"),
@@ -867,6 +868,9 @@ class StrataGuiApp:
         self.pg_profile_var = tk.StringVar(value="")
         self.pg_auto_refresh_var = tk.BooleanVar(value=True)
         self.pg_auto_refresh_secs_var = tk.StringVar(value="45")
+        self.pg_canvas_height_var = tk.StringVar(value="520")
+        self.pg_row_height_var = tk.StringVar(value="58")
+        self.pg_output_height_var = tk.StringVar(value="180")
         self.pg_summary_var = tk.StringVar(value="No data loaded yet.")
         self.pg_rows: List[Dict[str, Any]] = []
 
@@ -878,12 +882,25 @@ class StrataGuiApp:
         ttk.Label(top, text="Auto refresh (s)").pack(side="left", padx=(10, 0))
         ttk.Entry(top, textvariable=self.pg_auto_refresh_secs_var, width=6).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="While on this tab", variable=self.pg_auto_refresh_var).pack(side="left", padx=(4, 0))
+        ttk.Label(top, text="Canvas H").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pg_canvas_height_var, width=6).pack(side="left", padx=4)
+        ttk.Label(top, text="Row H").pack(side="left", padx=(6, 0))
+        ttk.Entry(top, textvariable=self.pg_row_height_var, width=5).pack(side="left", padx=4)
+        ttk.Button(top, text="Apply Size", command=self._update_position_graph_sizing).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Graph -", command=lambda: self._bump_position_graph_height(-120)).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Graph +", command=lambda: self._bump_position_graph_height(120)).pack(side="left", padx=(4, 0))
+        ttk.Label(top, text="Output H").pack(side="left", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.pg_output_height_var, width=6).pack(side="left", padx=4)
+        ttk.Button(top, text="Output -", command=lambda: self._bump_position_graph_output_height(-80)).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Output +", command=lambda: self._bump_position_graph_output_height(80)).pack(side="left", padx=(4, 0))
 
         summary = ttk.Label(body, textvariable=self.pg_summary_var, anchor="w")
         summary.pack(fill="x", pady=(0, 6))
 
         graph_frame = ttk.Frame(body)
         graph_frame.pack(fill="both", expand=True)
+        self.pg_graph_frame = graph_frame
+        self.pg_graph_frame.pack_propagate(False)
         self.pg_canvas = tk.Canvas(graph_frame, bg="#0f1115", highlightthickness=0)
         self.pg_canvas.grid(row=0, column=0, sticky="nsew")
         self.pg_ybar = ttk.Scrollbar(graph_frame, orient="vertical", command=self.pg_canvas.yview)
@@ -895,8 +912,68 @@ class StrataGuiApp:
         graph_frame.columnconfigure(0, weight=1)
         self.pg_canvas.bind("<Configure>", lambda _e: self._draw_position_graph())
 
+        out_wrap = ttk.Frame(body)
+        out_wrap.pack(fill="both", expand=False, pady=(8, 0))
+        self.pg_output_frame_wrap = out_wrap
+        self.pg_output_frame_wrap.pack_propagate(False)
+        pg_out_frame, self.pg_output_text = self._create_scrolled_text(out_wrap, wrap="none", height=8)
+        pg_out_frame.pack(fill="both", expand=True)
+        self._configure_dashboard_tags(self.pg_output_text)
+        out_btns = ttk.Frame(body)
+        out_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(out_btns, text="Copy Output", command=lambda: self._copy_text_widget(self.pg_output_text, "Position graph output")).pack(side="left")
+        ttk.Button(out_btns, text="Clear Output", command=lambda: self.pg_output_text.delete("1.0", tk.END)).pack(side="left", padx=6)
+
         self._sync_position_graph_profile()
+        self._update_position_graph_sizing()
         self._draw_position_graph()
+
+    def _update_position_graph_sizing(self) -> None:
+        try:
+            h = max(260, min(2400, int((self.pg_canvas_height_var.get() or "520").strip())))
+        except Exception:
+            h = 520
+            self.pg_canvas_height_var.set("520")
+        try:
+            rh = max(36, min(220, int((self.pg_row_height_var.get() or "58").strip())))
+        except Exception:
+            rh = 58
+            self.pg_row_height_var.set("58")
+        if hasattr(self, "pg_graph_frame"):
+            try:
+                self.pg_graph_frame.configure(height=h)
+            except Exception:
+                pass
+        self.pg_canvas_height_var.set(str(h))
+        self.pg_row_height_var.set(str(rh))
+        try:
+            oh = max(80, min(1200, int((self.pg_output_height_var.get() or "180").strip())))
+        except Exception:
+            oh = 180
+            self.pg_output_height_var.set("180")
+        if hasattr(self, "pg_output_frame_wrap"):
+            try:
+                self.pg_output_frame_wrap.configure(height=oh)
+            except Exception:
+                pass
+        self.pg_output_height_var.set(str(oh))
+        self._draw_position_graph()
+
+    def _bump_position_graph_height(self, delta: int) -> None:
+        try:
+            cur = int((self.pg_canvas_height_var.get() or "520").strip())
+        except Exception:
+            cur = 520
+        self.pg_canvas_height_var.set(str(max(260, min(2400, cur + int(delta)))))
+        self._update_position_graph_sizing()
+
+    def _bump_position_graph_output_height(self, delta: int) -> None:
+        try:
+            cur = int((self.pg_output_height_var.get() or "180").strip())
+        except Exception:
+            cur = 180
+        self.pg_output_height_var.set(str(max(80, min(1200, cur + int(delta)))))
+        self._update_position_graph_sizing()
 
     def _sync_position_graph_profile(self) -> None:
         try:
@@ -948,9 +1025,10 @@ class StrataGuiApp:
         if not out.get("ok"):
             return {"ok": False, "error": str(out.get("error", "Failed to load ledger.")), "rows": []}
         ledger = out.get("ledger", {}) if isinstance(out.get("ledger"), dict) else {}
+        entries = ledger.get("entries", []) if isinstance(ledger, dict) else []
         open_positions = ledger.get("open_positions", {}) if isinstance(ledger, dict) else {}
-        if not isinstance(open_positions, dict) or not open_positions:
-            return {"ok": True, "rows": [], "count": 0}
+        if not isinstance(open_positions, dict):
+            open_positions = {}
 
         ords = bridge.list_open_binance_orders(profile_name=profile)
         open_orders = ords.get("orders", []) if isinstance(ords, dict) and ords.get("ok") else []
@@ -963,8 +1041,172 @@ class StrataGuiApp:
                 continue
             by_symbol.setdefault(sym, []).append(o)
 
-        rows: List[Dict[str, Any]] = []
+        # Build estimated cost-basis per symbol from execution ledger history using FIFO lots.
+        lot_book: Dict[str, List[Dict[str, float]]] = {}
+        exec_rows: List[Dict[str, Any]] = []
+        if isinstance(entries, list):
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if not bool(e.get("is_execution", False)):
+                    continue
+                # Only consume confirmed executions for cost basis.
+                # Some ai_trade_queue rows are "submitted" intents (not actual fills) and
+                # must not reduce lots.
+                panel = str(e.get("panel", "") or "").strip().lower()
+                ex_trade_id = str(e.get("exchange_trade_id", "") or "").strip()
+                note = str(e.get("note", "") or "").strip().lower()
+                is_confirmed_fill = bool(
+                    panel == "binance_reconcile"
+                    or ex_trade_id
+                    or ("reconciled binance fill" in note)
+                )
+                if not is_confirmed_fill:
+                    continue
+                action = str(e.get("action", "")).strip().upper()
+                if action not in ("BUY", "SELL"):
+                    continue
+                try:
+                    qty = float(e.get("qty", 0.0) or 0.0)
+                    px = float(e.get("price", 0.0) or 0.0)
+                except Exception:
+                    qty, px = 0.0, 0.0
+                if qty <= 0 or px <= 0:
+                    continue
+                sym = str(e.get("exchange_symbol", "")).strip().upper()
+                if not sym:
+                    asset = str(e.get("asset", "")).strip().upper()
+                    q = str(e.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+                    if not asset:
+                        continue
+                    sym = f"{asset}{q}"
+                t_raw = e.get("ts", "")
+                try:
+                    t_ord = float(pd.Timestamp(pd.to_datetime(str(t_raw), utc=True, errors="coerce")).value)
+                except Exception:
+                    t_ord = float(e.get("id", 0) or 0)
+                exec_rows.append({"symbol": sym, "action": action, "qty": qty, "price": px, "ord": t_ord})
+        exec_rows.sort(key=lambda r: (float(r.get("ord", 0.0) or 0.0), str(r.get("symbol", ""))))
+        for r in exec_rows:
+            sym = str(r.get("symbol", ""))
+            action = str(r.get("action", ""))
+            qty = float(r.get("qty", 0.0) or 0.0)
+            px = float(r.get("price", 0.0) or 0.0)
+            lots = lot_book.setdefault(sym, [])
+            if action == "BUY":
+                lots.append({"qty": qty, "price": px})
+                continue
+            # SELL -> consume FIFO lots.
+            rem = qty
+            i = 0
+            while rem > 1e-12 and i < len(lots):
+                lq = float(lots[i].get("qty", 0.0) or 0.0)
+                if lq <= rem + 1e-12:
+                    rem -= lq
+                    lots[i]["qty"] = 0.0
+                    i += 1
+                else:
+                    lots[i]["qty"] = max(0.0, lq - rem)
+                    rem = 0.0
+            lot_book[sym] = [x for x in lots if float(x.get("qty", 0.0) or 0.0) > 1e-12]
+
+        cost_basis_by_symbol: Dict[str, float] = {}
+        for sym, lots in lot_book.items():
+            if not isinstance(lots, list) or not lots:
+                continue
+            tqty = sum(float(x.get("qty", 0.0) or 0.0) for x in lots)
+            if tqty <= 1e-12:
+                continue
+            notional = sum((float(x.get("qty", 0.0) or 0.0) * float(x.get("price", 0.0) or 0.0)) for x in lots)
+            if notional > 0:
+                cost_basis_by_symbol[sym] = notional / tqty
+
+        # Build a merged position map so graph still works when ledger is behind:
+        # 1) ledger open positions
+        # 2) symbols from open protective SELL orders
+        # 3) Binance balances fallback
+        merged_pos: Dict[str, Dict[str, Any]] = {}
         for _, pos in open_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            asset = str(pos.get("asset", "")).strip().upper()
+            if not asset:
+                continue
+            quote = str(pos.get("quote_currency", self._effective_crypto_quote("USDT")) or self._effective_crypto_quote("USDT")).strip().upper()
+            symbol = str(pos.get("symbol", "")).strip().upper() or f"{asset}{quote}"
+            try:
+                qty = float(pos.get("qty", 0.0) or 0.0)
+            except Exception:
+                qty = 0.0
+            try:
+                entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            merged_pos[symbol] = {
+                "asset": asset,
+                "symbol": symbol,
+                "timeframe": str(pos.get("timeframe", "spot") or "spot").strip(),
+                "qty": max(0.0, qty),
+                "entry_price": max(0.0, entry_price),
+                "quote_currency": quote,
+            }
+
+        for sym, olist in by_symbol.items():
+            if sym in merged_pos:
+                continue
+            qty_max = 0.0
+            for o in olist:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("side", "")).strip().upper() != "SELL":
+                    continue
+                try:
+                    oq = float(o.get("origQty", 0.0) or 0.0)
+                except Exception:
+                    oq = 0.0
+                if oq > qty_max:
+                    qty_max = oq
+            if qty_max <= 0:
+                continue
+            merged_pos[sym] = {
+                "asset": self._base_asset_from_symbol(sym),
+                "symbol": sym,
+                "timeframe": "spot",
+                "qty": qty_max,
+                "entry_price": 0.0,
+                "quote_currency": self._quote_asset_from_symbol(sym),
+            }
+
+        pf = bridge.fetch_binance_portfolio(profile_name=profile)
+        balances = pf.get("balances", []) if isinstance(pf, dict) and pf.get("ok") else []
+        quote_pref = self._primary_quote_asset() if self._is_primary_quote_locked() else (self.pf_quote_var.get().strip().upper() or "USDT")
+        stables = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD"}
+        for b in balances if isinstance(balances, list) else []:
+            if not isinstance(b, dict):
+                continue
+            asset = str(b.get("asset", "")).strip().upper()
+            if not asset or asset in stables:
+                continue
+            try:
+                total = float(b.get("total", 0.0) or 0.0)
+            except Exception:
+                total = 0.0
+            if total <= 0:
+                continue
+            sym = f"{asset}{quote_pref}"
+            if sym in merged_pos:
+                continue
+            merged_pos[sym] = {
+                "asset": asset,
+                "symbol": sym,
+                "timeframe": "spot",
+                "qty": total,
+                "entry_price": 0.0,
+                "quote_currency": quote_pref,
+            }
+
+        rows: List[Dict[str, Any]] = []
+        for _, pos in merged_pos.items():
             if not isinstance(pos, dict):
                 continue
             asset = str(pos.get("asset", "")).strip().upper()
@@ -983,6 +1225,8 @@ class StrataGuiApp:
                 entry = float(pos.get("entry_price", 0.0) or 0.0)
             except Exception:
                 entry = 0.0
+            if entry <= 0:
+                entry = float(cost_basis_by_symbol.get(symbol, 0.0) or 0.0)
             lp = bridge.get_binance_last_price(symbol=symbol, profile_name=profile)
             current = float(lp.get("price", 0.0) or 0.0) if lp.get("ok") else 0.0
 
@@ -1010,6 +1254,7 @@ class StrataGuiApp:
                         tp_price = cand
 
             pnl_pct = ((current - entry) / entry * 100.0) if (entry > 0 and current > 0) else 0.0
+            pnl_quote = ((current - entry) * qty) if (entry > 0 and current > 0 and qty > 0) else 0.0
             protected = (stop_price > 0) or (tp_price > 0)
             protection_state = "PROTECTED" if (stop_price > 0 and tp_price > 0) else ("PARTIAL" if protected else "UNPROTECTED")
             rows.append(
@@ -1023,6 +1268,8 @@ class StrataGuiApp:
                     "stop": stop_price,
                     "tp": tp_price,
                     "pnl_pct": pnl_pct,
+                    "pnl_quote": pnl_quote,
+                    "quote_currency": quote,
                     "protection_state": protection_state,
                 }
             )
@@ -1047,6 +1294,7 @@ class StrataGuiApp:
             f"Open positions: {n} | Protected: {protected} | Partial: {partial} | Unprotected: {unprotected}"
         )
         self._draw_position_graph()
+        self._render_position_graph_output()
         self._append_task_terminal(f"DONE {task_name} ({n} position(s))")
         self._finish_task(task_id, task_name=task_name)
 
@@ -1056,6 +1304,10 @@ class StrataGuiApp:
         c = self.pg_canvas
         c.delete("all")
         rows = self.pg_rows if isinstance(getattr(self, "pg_rows", []), list) else []
+        try:
+            row_h = max(36, min(220, int((self.pg_row_height_var.get() or "58").strip())))
+        except Exception:
+            row_h = 58
         if not rows:
             c.create_text(20, 20, text="No open positions to graph.", fill="#d5d8dc", anchor="nw", font=("Segoe UI", 10, "bold"))
             c.configure(scrollregion=(0, 0, max(c.winfo_width(), 800), 120))
@@ -1065,7 +1317,6 @@ class StrataGuiApp:
         left_col = 260
         right_pad = 120
         graph_w = max(420, w - left_col - right_pad)
-        row_h = 58
         top = 50
         total_h = top + (len(rows) * row_h) + 70
 
@@ -1092,6 +1343,8 @@ class StrataGuiApp:
             stp = float(row.get("stop", 0.0) or 0.0)
             tp = float(row.get("tp", 0.0) or 0.0)
             pnl = float(row.get("pnl_pct", 0.0) or 0.0)
+            pnl_quote = float(row.get("pnl_quote", 0.0) or 0.0)
+            quote = str(row.get("quote_currency", "") or "")
             protection_state = str(row.get("protection_state", "") or "")
 
             vals = [v for v in [entry, cur, stp, tp] if v > 0]
@@ -1111,12 +1364,16 @@ class StrataGuiApp:
             y_mid = y + 24
             c.create_line(left_col, y_mid, left_col + graph_w, y_mid, fill="#3a4350", width=1)
             c.create_text(16, y + 7, text=f"{symbol} [{tf}]  qty={qty:.6f}", fill="#e6eaef", anchor="nw", font=("Consolas", 9, "bold"))
-            c.create_text(16, y + 26, text=f"PnL {pnl:+.2f}%", fill=("#39d98a" if pnl >= 0 else "#ff6b6b"), anchor="nw", font=("Consolas", 9))
+            buy_txt = (f"Buy @ {entry:.6g}" if entry > 0 else "Buy @ n/a")
+            pnl_txt = f"PnL {pnl:+.2f}% / {pnl_quote:+.4f} {quote}".strip()
+            c.create_text(16, y + 24, text=f"{buy_txt} | {pnl_txt}", fill=("#39d98a" if pnl >= 0 else "#ff6b6b"), anchor="nw", font=("Consolas", 9))
 
             x_entry = xmap(entry)
             x_cur = xmap(cur)
             c.create_oval(x_entry - 4, y_mid - 4, x_entry + 4, y_mid + 4, fill="#67b7ff", outline="")
             c.create_oval(x_cur - 4, y_mid - 4, x_cur + 4, y_mid + 4, fill="#ffffff", outline="#9aa4af")
+            if entry > 0:
+                c.create_text(x_entry + 6, y_mid - 22, text=f"Buy {entry:.6g}", fill="#8bc5ff", anchor="nw", font=("Consolas", 8))
             c.create_text(x_cur + 6, y_mid - 12, text=f"{cur:.6g}", fill="#dbe3ec", anchor="nw", font=("Consolas", 8))
 
             if stp > 0:
@@ -1132,6 +1389,41 @@ class StrataGuiApp:
             c.create_text(left_col + graph_w + 12, y + 18, text=protection_state, fill=state_color, anchor="w", font=("Segoe UI", 9, "bold"))
 
         c.configure(scrollregion=(0, 0, w + 220, total_h))
+
+    def _render_position_graph_output(self) -> None:
+        if not hasattr(self, "pg_output_text"):
+            return
+        rows = self.pg_rows if isinstance(getattr(self, "pg_rows", []), list) else []
+        self.pg_output_text.delete("1.0", tk.END)
+        if not rows:
+            self.pg_output_text.insert("1.0", "No open positions available.\n")
+            return
+        view_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            view_rows.append(
+                {
+                    "symbol": str(r.get("symbol", "") or ""),
+                    "tf": str(r.get("timeframe", "") or ""),
+                    "qty": round(float(r.get("qty", 0.0) or 0.0), 8),
+                    "buy_price": round(float(r.get("entry", 0.0) or 0.0), 8),
+                    "current": round(float(r.get("current", 0.0) or 0.0), 8),
+                    "stop": round(float(r.get("stop", 0.0) or 0.0), 8),
+                    "tp": round(float(r.get("tp", 0.0) or 0.0), 8),
+                    "pnl_pct": round(float(r.get("pnl_pct", 0.0) or 0.0), 4),
+                    "pnl_quote": round(float(r.get("pnl_quote", 0.0) or 0.0), 6),
+                    "quote": str(r.get("quote_currency", "") or ""),
+                    "state": str(r.get("protection_state", "") or ""),
+                }
+            )
+        try:
+            df = pd.DataFrame(view_rows)
+            self.pg_output_text.insert("1.0", df.to_string(index=False) + "\n")
+        except Exception:
+            for v in view_rows:
+                self.pg_output_text.insert("end", str(v) + "\n")
+        self._apply_color_tags(self.pg_output_text)
 
     def _is_position_graph_tab_selected(self) -> bool:
         try:
@@ -1263,6 +1555,7 @@ class StrataGuiApp:
     def _install_tree_bindings(self, tree: ttk.Treeview) -> None:
         menu = tk.Menu(tree, tearoff=0)
         menu.add_command(label="Copy Selected Rows", command=lambda: self._copy_tree_selection(tree, "Tree rows"))
+        menu.add_command(label="Copy All Rows", command=lambda: self._copy_tree_all(tree, "Tree rows"))
 
         def _popup(event):
             try:
@@ -1294,6 +1587,21 @@ class StrataGuiApp:
             rows.append("\t".join([str(v) for v in vals]))
         if not rows:
             self._append_task_terminal(f"{label}: no selected rows to copy.")
+            return
+        head = "\t".join([str(c) for c in cols]) if cols else ""
+        payload = (head + "\n" if head else "") + "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(payload)
+        self._append_task_terminal(f"Copied {label} to clipboard ({len(rows)} row(s)).")
+
+    def _copy_tree_all(self, tree: ttk.Treeview, label: str = "Rows") -> None:
+        rows = []
+        cols = list(tree["columns"]) if "columns" in tree.keys() else []
+        for iid in tree.get_children():
+            vals = tree.item(iid, "values")
+            rows.append("\t".join([str(v) for v in vals]))
+        if not rows:
+            self._append_task_terminal(f"{label}: no rows to copy.")
             return
         head = "\t".join([str(c) for c in cols]) if cols else ""
         payload = (head + "\n" if head else "") + "\n".join(rows)
