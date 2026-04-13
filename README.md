@@ -258,6 +258,11 @@ GUI Portfolio & Ledger:
     - `Start/Stop Protect Monitor`
     - optional `Auto-send protection` to submit newly staged protective orders without confirmation prompts
   - Protection generation now runs as a background task to avoid GUI freeze during heavy AI/backtest processing.
+  - `Unified Cycle (Manage + Discover)` action:
+    - step 1: manage current holdings (`Protect Open Positions (Live > BT > AI)`)
+    - step 2: discover and stage new opportunities (`Live > BT > AI > Stage`)
+    - optional auto-submit toggle for newly discovered entries
+    - keeps outputs synchronized into Live/Backtest/AI cached panes
   - `Review Open Positions (MTF)` action:
     - evaluates open-position assets across `4h/8h/12h/1d`
     - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)

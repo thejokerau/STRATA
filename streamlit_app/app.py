@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
 import os
@@ -223,6 +223,128 @@ def _run_full_pipeline_sync(live_cfg: Dict[str, Any], bt_cfg: Dict[str, Any], dt
     }
 
 
+def _run_unified_cycle_sync(
+    profile: str,
+    live_profile_name: str = "",
+    auto_send_protect: bool = False,
+    auto_submit_new: bool = False,
+    dt_context: str = "",
+) -> Dict[str, Any]:
+    # 1) Manage existing positions.
+    protect_out = _protect_open_positions_live_bt_ai(
+        profile=profile,
+        auto_submit=bool(auto_send_protect),
+        live_profile_name=live_profile_name,
+    )
+    if not protect_out.get("ok"):
+        return {"ok": False, "stage": "protect", "error": str(protect_out.get("error", "Protection failed"))}
+
+    # 2) Discover new opportunities (Live -> BT -> AI -> Stage).
+    live_cfg = _build_live_cfg_from_state_or_profile(profile_name=live_profile_name)
+    bt_cfg = {
+        "market": str(st.session_state.get("bt_market", "crypto")),
+        "timeframe": str(st.session_state.get("bt_tf", "1d")),
+        "top_n": int(st.session_state.get("bt_topn", 20)),
+        "months": int(st.session_state.get("bt_months", 12)),
+        "country": "2",
+        "quote_currency": str(st.session_state.get("live_quote", "USDT")),
+        "display_currency": "USD",
+        "initial_capital": 10000.0,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "max_hold_days": 45,
+        "min_hold_bars": 2,
+        "cooldown_bars": 1,
+        "same_asset_cooldown_bars": 3,
+        "max_consecutive_same_asset_entries": 3,
+        "fee_pct": 0.1,
+        "slippage_pct": 0.05,
+        "position_size": 0.30,
+        "atr_multiplier": 2.2,
+        "adx_threshold": 25.0,
+        "cmf_threshold": 0.02,
+        "obv_slope_threshold": 0.0,
+        "buy_threshold": 2,
+        "sell_threshold": -2,
+        "cache_workers": 4,
+        "max_drawdown_limit_pct": 35.0,
+        "max_exposure_pct": 0.4,
+        "auto_tune": False,
+        "optuna_trials": 10,
+        "optuna_jobs": 2,
+    }
+    pipe_out = _run_full_pipeline_sync(live_cfg=live_cfg, bt_cfg=bt_cfg, dt_context=(dt_context or datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    if not pipe_out.get("ok"):
+        return {
+            "ok": False,
+            "stage": "pipeline",
+            "error": str(pipe_out.get("error", "Pipeline failed")),
+            "protect": protect_out,
+        }
+
+    live_block = str(pipe_out.get("live_block", "") or "")
+    bt_summary = str(pipe_out.get("bt_summary", "") or "")
+    bt_trades = str(pipe_out.get("bt_trades", "") or "")
+    ai_response = str(pipe_out.get("ai_response", "") or "")
+
+    # Keep shared visible outputs in sync.
+    st.session_state.live_runs.append(
+        {"name": _build_live_cfg_from_state_or_profile(profile_name=live_profile_name).get("name", "unified-live"), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "text": live_block}
+    )
+    st.session_state.live_runs = st.session_state.live_runs[-20:]
+    st.session_state.last_live_text = live_block
+    st.session_state.last_backtest_summary = bt_summary
+    st.session_state.last_backtest_trades = bt_trades
+    st.session_state.pending_ai_source_text = "\n\n".join([live_block, bt_summary, bt_trades]).strip()
+    st.session_state.ai_response = ai_response
+
+    # Stage recommendations as "new opportunities".
+    default_tf = str(st.session_state.get("bt_tf", "4h"))
+    recs = _extract_trade_recs(ai_response, default_tf=default_tf)
+    recs = _apply_signal_controls(
+        recs=recs,
+        profile=str(st.session_state.get("sig_exec_profile", profile) or profile),
+        quote_asset=str(st.session_state.get("sig_quote", "USDT") or "USDT"),
+        order_type_policy=str(st.session_state.get("sig_order_type", "as_ai") or "as_ai"),
+        autosize_mode=str(st.session_state.get("sig_autosize", "none") or "none"),
+        fixed_quote_notional=float(st.session_state.get("sig_fixed_notional", 0.0) or 0.0),
+        pct_quote_balance=float(st.session_state.get("sig_pct_balance", 0.0) or 0.0),
+        apply_protection=bool(st.session_state.get("sig_add_protect", False)),
+        stop_loss_pct=float(st.session_state.get("sig_sl_pct", 0.0) or 0.0),
+        take_profit_pct=float(st.session_state.get("sig_tp_pct", 0.0) or 0.0),
+    )
+    staged = 0
+    submitted = 0
+    failed = 0
+    if recs:
+        seq0 = int(st.session_state.pending_rec_seq or 0)
+        staged = _append_pending(recs, source="unified_new_opportunity")
+        if auto_submit_new and staged > 0:
+            new_ids = set(range(seq0 + 1, seq0 + staged + 1))
+            for rec in st.session_state.pending_recs:
+                if int(rec.get("id", -1)) not in new_ids:
+                    continue
+                out_sub = _submit_with_recovery(profile, rec, enable_recovery=bool(st.session_state.get("auto_retry_locked_sell", True)))
+                rec["status"] = "SUBMITTED" if out_sub.get("ok") else "FAILED"
+                rec["reason"] = str(rec.get("reason", "")) + (
+                    f" | {out_sub.get('recovery_note', 'submitted')}" if out_sub.get("ok") else f" | {out_sub.get('error', 'submit failed')}"
+                )
+                if out_sub.get("ok"):
+                    submitted += 1
+                else:
+                    failed += 1
+
+    return {
+        "ok": True,
+        "mode": "unified_manage_and_discover",
+        "protect_staged": int(protect_out.get("staged", 0) or 0),
+        "protect_submitted": int(protect_out.get("submitted", 0) or 0),
+        "new_staged": int(staged),
+        "new_submitted": int(submitted),
+        "new_failed": int(failed),
+    }
+
+
 def _init_state() -> None:
     defaults = {
         "task_logs": [],
@@ -230,6 +352,7 @@ def _init_state() -> None:
         "pending_recs": [],
         "pending_rec_seq": 0,
         "ai_source_text": "",
+        "pending_ai_source_text": "",
         "ai_response": "",
         "ai_prompt_preview": "",
         "last_live_text": "",
@@ -249,12 +372,14 @@ def _init_state() -> None:
         "bg_jobs": {},
         "bg_live_running_id": "",
         "bg_pipeline_running_id": "",
+        "bg_unified_running_id": "",
         "pf_last_loaded_epoch": 0.0,
         "pf_last_review_epoch": 0.0,
         "global_prefetch_enabled": True,
         "global_prefetch_sec": 60,
         "auto_retry_locked_sell": True,
-        "graph_auto_refresh": True,
+        "graph_auto_refresh": False,
+        "task_monitor_auto_refresh": False,
         "bg_max_workers": int(EXECUTOR_WORKERS),
         "bg_prefetch_running_id": "",
     }
@@ -784,9 +909,18 @@ def _dataframe_column_config(df: pd.DataFrame) -> Dict[str, Any]:
     return cfg
 
 
-def _show_df(df: pd.DataFrame, *, use_container_width: bool = True, hide_index: bool = True, height: Optional[int] = None) -> None:
+def _show_df(
+    df: pd.DataFrame,
+    *,
+    use_container_width: bool = True,
+    hide_index: bool = True,
+    height: Optional[int] = None,
+    width: Optional[str] = None,
+) -> None:
+    if not width:
+        width = "stretch" if bool(use_container_width) else "content"
     kwargs: Dict[str, Any] = {
-        "use_container_width": use_container_width,
+        "width": width,
         "hide_index": hide_index,
     }
     if height is not None:
@@ -1312,7 +1446,7 @@ def _render_position_graph_visuals(df: pd.DataFrame) -> None:
             height=320,
             margin=dict(l=20, r=20, t=50, b=20),
         )
-        st.plotly_chart(fig_pnl, use_container_width=True)
+        st.plotly_chart(fig_pnl, width="stretch")
 
     # Protection state donut
     if "state" in dff.columns:
@@ -1327,7 +1461,7 @@ def _render_position_graph_visuals(df: pd.DataFrame) -> None:
             ]
         )
         fig_state.update_layout(title="Protection Coverage", height=320, margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig_state, use_container_width=True)
+        st.plotly_chart(fig_state, width="stretch")
 
     # Relative ladder chart (% move from baseline) avoids mixed-price-scale distortion.
     if all(c in dff.columns for c in ["symbol", "buy_price", "current", "stop", "tp"]):
@@ -1384,7 +1518,7 @@ def _render_position_graph_visuals(df: pd.DataFrame) -> None:
         )
         fig.add_vline(x=0.0, line_width=1, line_dash="dash", line_color="#94a3b8")
         fig.update_yaxes(categoryorder="array", categoryarray=ycats)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 def _compute_pnl_breakdown(last_graph_df: pd.DataFrame, ledger_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -1899,6 +2033,12 @@ with tab_backtest:
 
 with tab_ai:
     st.subheader("AI Analysis")
+    _pending_ai_src = str(st.session_state.get("pending_ai_source_text", "") or "").strip()
+    if _pending_ai_src:
+        st.session_state.ai_source_text = _pending_ai_src
+        # This assignment is safe here because the widget is instantiated later in this block.
+        st.session_state.ai_source_text_area = _pending_ai_src
+        st.session_state.pending_ai_source_text = ""
     ai_names, ai_active = _load_ai_profiles()
     ai_cols = st.columns([2, 1, 1, 1])
     ai_profile = _safe_select_option("AI profile", ai_names, preferred=ai_active)
@@ -1907,6 +2047,7 @@ with tab_ai:
         sc1, sc2, sc3, sc4 = st.columns(4)
         bn_names_sig = _load_binance_profiles()
         signal_profile = _safe_select_option("Execution profile", bn_names_sig, preferred=(bn_names_sig[0] if bn_names_sig else ""))
+        st.session_state["sig_exec_profile"] = str(signal_profile or "")
         signal_quote = sc2.selectbox("Quote token", ["USDT", "USDC", "FDUSD", "BUSD", "USTC", "USD"], index=0, key="sig_quote")
         signal_order_type = sc3.selectbox(
             "Order type override",
@@ -2257,7 +2398,7 @@ with tab_portfolio:
     do_led = c3.button("Refresh Ledger")
     do_rec = c4.button("Reconcile Fills", disabled=not bool(profile))
     do_review = c5.button("Review Open Positions (MTF)", disabled=not bool(profile))
-    pcols = st.columns(4)
+    pcols = st.columns(5)
     auto_send_protect = pcols[0].checkbox(
         "Auto-submit protection orders to Binance",
         value=False,
@@ -2265,7 +2406,13 @@ with tab_portfolio:
     )
     do_protect = pcols[1].button("Protect Open Positions (AI+BT)", disabled=not bool(profile))
     do_protect_pipeline = pcols[2].button("Protect Open Positions (Live > BT > AI)", disabled=not bool(profile))
-    do_prune = pcols[3].button("Prune Signal History")
+    auto_submit_unified_new = pcols[3].checkbox(
+        "Unified cycle auto-submit new entries",
+        value=False,
+        help="When Unified Cycle runs, auto-submit newly discovered opportunity trades.",
+    )
+    do_unified = pcols[4].button("Unified Cycle (Manage + Discover)", disabled=not bool(profile))
+    do_prune = st.button("Prune Signal History")
     live_profiles_for_protect = _load_live_profiles()
     live_profile_names_for_protect = sorted(live_profiles_for_protect.keys()) if isinstance(live_profiles_for_protect, dict) else []
     protect_live_profile_pick = st.selectbox(
@@ -2289,7 +2436,7 @@ with tab_portfolio:
             df = pd.DataFrame(out.get("balances", []) or [])
             st.session_state.last_portfolio_df = df
             if not df.empty:
-                _show_df(df, use_container_width=True, hide_index=True)
+                _show_df(df, width="stretch", hide_index=True)
 
     if do_oo and profile:
         out = _run_task("Open Orders Refresh", lambda: bridge.list_open_binance_orders(profile_name=profile))
@@ -2300,7 +2447,7 @@ with tab_portfolio:
             df = pd.DataFrame(out.get("orders", []) or [])
             st.session_state.last_open_orders_df = df
             if not df.empty:
-                _show_df(df, use_container_width=True, hide_index=True)
+                _show_df(df, width="stretch", hide_index=True)
             else:
                 st.info("No open orders.")
 
@@ -2315,7 +2462,7 @@ with tab_portfolio:
             if entries:
                 df = pd.DataFrame(entries)
                 st.session_state.last_ledger_df = df
-                _show_df(df, use_container_width=True, hide_index=True)
+                _show_df(df, width="stretch", hide_index=True)
     if do_rec and profile:
         syms = _portfolio_symbols_for_profile(profile=profile, quote_pref=str(st.session_state.get("live_quote", "USDT")))
         if not syms:
@@ -2342,7 +2489,7 @@ with tab_portfolio:
         if out.get("ok"):
             rdf = pd.DataFrame(out.get("rows", []) or [])
             st.session_state.last_review_df = rdf
-            _show_df(rdf, use_container_width=True, hide_index=True)
+            _show_df(rdf, width="stretch", hide_index=True)
         else:
             st.error(out.get("error", "Review failed"))
     if do_protect and profile:
@@ -2364,6 +2511,26 @@ with tab_portfolio:
             st.success(f"Protection ({mode_txt}) staged={int(out.get('staged', 0) or 0)}, submitted={int(out.get('submitted', 0) or 0)}")
         else:
             st.error(out.get("error", "Protect failed"))
+    if do_unified and profile:
+        picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
+        out = _run_task(
+            "Unified Cycle (Manage+Discover)",
+            lambda p=profile, lp=picked_lp, asp=bool(auto_send_protect), asn=bool(auto_submit_unified_new): _run_unified_cycle_sync(
+                profile=p,
+                live_profile_name=lp,
+                auto_send_protect=asp,
+                auto_submit_new=asn,
+                dt_context=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        if out.get("ok"):
+            st.success(
+                "Unified complete: "
+                f"protect(staged={int(out.get('protect_staged', 0) or 0)}, submitted={int(out.get('protect_submitted', 0) or 0)}), "
+                f"new(staged={int(out.get('new_staged', 0) or 0)}, submitted={int(out.get('new_submitted', 0) or 0)}, failed={int(out.get('new_failed', 0) or 0)})"
+            )
+        else:
+            st.error(f"Unified Cycle failed at {out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}")
     if do_prune:
         out = _run_task("Prune Signal History", lambda: bridge.prune_signal_only_history(keep_last_signals=0))
         if out.get("ok"):
@@ -2377,7 +2544,7 @@ with tab_portfolio:
     st.markdown("### Pending Recommendations")
     pdf = _pending_df()
     if not pdf.empty:
-        _show_df(pdf, use_container_width=True, hide_index=True)
+        _show_df(pdf, width="stretch", hide_index=True)
         all_ids = [int(x) for x in pdf["id"].tolist()]
         selected = st.multiselect("Select pending IDs", options=all_ids, default=st.session_state.selected_pending_ids)
         st.session_state.selected_pending_ids = selected
@@ -2416,20 +2583,20 @@ with tab_portfolio:
     with cv1:
         st.caption("Portfolio (cached)")
         if isinstance(st.session_state.last_portfolio_df, pd.DataFrame) and not st.session_state.last_portfolio_df.empty:
-            _show_df(st.session_state.last_portfolio_df, use_container_width=True, height=220, hide_index=True)
+            _show_df(st.session_state.last_portfolio_df, width="stretch", height=220, hide_index=True)
     with cv2:
         st.caption("Open Orders (cached)")
         if isinstance(st.session_state.last_open_orders_df, pd.DataFrame) and not st.session_state.last_open_orders_df.empty:
-            _show_df(st.session_state.last_open_orders_df, use_container_width=True, height=220, hide_index=True)
+            _show_df(st.session_state.last_open_orders_df, width="stretch", height=220, hide_index=True)
     with cv3:
         st.caption("Open Position Review (cached)")
         if isinstance(st.session_state.last_review_df, pd.DataFrame) and not st.session_state.last_review_df.empty:
-            _show_df(st.session_state.last_review_df, use_container_width=True, height=220, hide_index=True)
+            _show_df(st.session_state.last_review_df, width="stretch", height=220, hide_index=True)
     st.caption("Ledger (cached)")
     if isinstance(st.session_state.last_ledger_df, pd.DataFrame) and not st.session_state.last_ledger_df.empty:
-        _show_df(st.session_state.last_ledger_df, use_container_width=True, height=260, hide_index=True)
+        _show_df(st.session_state.last_ledger_df, width="stretch", height=260, hide_index=True)
 
-    st.markdown("### FIFO Open→Close PnL Tracker")
+    st.markdown("### FIFO Open-to-Close PnL Tracker")
     fifo_profile = profile or _active_or_first_binance_profile()
     fifo = _fifo_open_close_journal(st.session_state.last_ledger_df, profile_name=str(fifo_profile or ""))
     fs = fifo.get("summary", {}) if isinstance(fifo.get("summary"), dict) else {}
@@ -2439,16 +2606,16 @@ with tab_portfolio:
     f1.metric("Closed matches (FIFO)", f"{int(fs.get('closed_rows', 0) or 0)}")
     f2.metric("Open lots (FIFO)", f"{int(fs.get('open_lots', 0) or 0)}")
     f3.metric("Realized PnL (quote)", f"{float(fs.get('realized_quote', 0.0) or 0.0):,.6f}")
-    t1, t2 = st.tabs(["Closed (Open→Close)", "Open Lots"])
+    t1, t2 = st.tabs(["Closed (Open?Close)", "Open Lots"])
     with t1:
         if isinstance(fc, pd.DataFrame) and not fc.empty:
-            _show_df(fc, use_container_width=True, hide_index=True, height=320)
+            _show_df(fc, width="stretch", hide_index=True, height=320)
             st.download_button("Export FIFO Closed CSV", data=fc.to_csv(index=False), file_name="fifo_closed_pnl.csv", mime="text/csv", key="fifo_closed_export")
         else:
             st.info("No closed FIFO matches yet.")
     with t2:
         if isinstance(fo, pd.DataFrame) and not fo.empty:
-            _show_df(fo, use_container_width=True, hide_index=True, height=320)
+            _show_df(fo, width="stretch", hide_index=True, height=320)
             st.download_button("Export FIFO Open Lots CSV", data=fo.to_csv(index=False), file_name="fifo_open_lots.csv", mime="text/csv", key="fifo_open_export")
         else:
             st.info("No open FIFO lots.")
@@ -2491,7 +2658,7 @@ with tab_graph:
             _refresh_graph_once()
         if isinstance(st.session_state.last_graph_df, pd.DataFrame) and not st.session_state.last_graph_df.empty:
             st.caption("Latest position graph data")
-            _show_df(st.session_state.last_graph_df, use_container_width=True, hide_index=True)
+            _show_df(st.session_state.last_graph_df, width="stretch", hide_index=True)
             _render_position_graph_visuals(st.session_state.last_graph_df)
         else:
             st.info("No cached graph data yet. Click refresh.")
@@ -2519,7 +2686,7 @@ with tab_graph:
         pb = _compute_pnl_breakdown(st.session_state.last_graph_df, led_df)
         s = pb.get("summary", pd.DataFrame())
         if isinstance(s, pd.DataFrame) and not s.empty:
-            _show_df(s, use_container_width=True, hide_index=True)
+            _show_df(s, width="stretch", hide_index=True)
             fig_sum = go.Figure()
             fig_sum.add_trace(go.Bar(name="Realized", x=s["window"], y=s["realized_quote"]))
             fig_sum.add_trace(go.Bar(name="Unrealized (current)", x=s["window"], y=s["unrealized_quote"]))
@@ -2532,34 +2699,34 @@ with tab_graph:
                 xaxis_title="Window",
                 yaxis_title="PnL (quote)",
             )
-            st.plotly_chart(fig_sum, use_container_width=True)
+            st.plotly_chart(fig_sum, width="stretch")
 
         t1, t2, t3, t4 = st.tabs(["Daily", "Weekly", "Monthly", "Yearly"])
         with t1:
             d = pb.get("daily", pd.DataFrame())
             if isinstance(d, pd.DataFrame) and not d.empty:
-                _show_df(d, use_container_width=True, hide_index=True)
+                _show_df(d, width="stretch", hide_index=True)
                 st.bar_chart(d.set_index("period")["realized_quote"])
             else:
                 st.info("No realized daily history yet.")
         with t2:
             d = pb.get("weekly", pd.DataFrame())
             if isinstance(d, pd.DataFrame) and not d.empty:
-                _show_df(d, use_container_width=True, hide_index=True)
+                _show_df(d, width="stretch", hide_index=True)
                 st.bar_chart(d.set_index("period")["realized_quote"])
             else:
                 st.info("No realized weekly history yet.")
         with t3:
             d = pb.get("monthly", pd.DataFrame())
             if isinstance(d, pd.DataFrame) and not d.empty:
-                _show_df(d, use_container_width=True, hide_index=True)
+                _show_df(d, width="stretch", hide_index=True)
                 st.bar_chart(d.set_index("period")["realized_quote"])
             else:
                 st.info("No realized monthly history yet.")
         with t4:
             d = pb.get("yearly", pd.DataFrame())
             if isinstance(d, pd.DataFrame) and not d.empty:
-                _show_df(d, use_container_width=True, hide_index=True)
+                _show_df(d, width="stretch", hide_index=True)
                 st.bar_chart(d.set_index("period")["realized_quote"])
             else:
                 st.info("No realized yearly history yet.")
@@ -2604,7 +2771,7 @@ with tab_tasks:
     if tc[1].button("Clear Task History"):
         st.session_state.task_history = []
     tc[2].write(f"Log lines: {len(st.session_state.task_logs)}")
-    auto_mon = st.checkbox("Live monitor refresh (1s)", value=True, key="task_monitor_auto_refresh")
+    auto_mon = st.checkbox("Live monitor refresh (1s)", value=bool(st.session_state.get("task_monitor_auto_refresh", False)), key="task_monitor_auto_refresh")
     mon_every = "1s" if auto_mon else None
 
     @st.fragment(run_every=mon_every)
@@ -2628,7 +2795,7 @@ with tab_tasks:
             )
         if active_rows:
             st.caption("Background jobs (exact state)")
-            _show_df(pd.DataFrame(active_rows), use_container_width=True, hide_index=True)
+            _show_df(pd.DataFrame(active_rows), width="stretch", hide_index=True)
             jid_pick = st.selectbox(
                 "Verbose job output",
                 ["(none)"] + [str(r["job_id"]) for r in active_rows],
@@ -2645,7 +2812,7 @@ with tab_tasks:
                     st.info("No verbose lines captured yet for this job.")
         st.text_area("Global Task Log", value="\n".join(st.session_state.task_logs), height=260)
         hist_df = pd.DataFrame(st.session_state.task_history) if st.session_state.task_history else pd.DataFrame(columns=["task", "sec", "ts", "ok"])
-        _show_df(hist_df, use_container_width=True, hide_index=True)
+        _show_df(hist_df, width="stretch", hide_index=True)
 
     _task_monitor_fragment()
 
