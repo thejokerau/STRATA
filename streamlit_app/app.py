@@ -1355,7 +1355,9 @@ def _position_graph_rows(profile: str, quote_pref: str = "USDT") -> pd.DataFrame
             }
 
     pf = bridge.fetch_binance_portfolio(profile_name=profile)
+    pf_ok = bool(pf.get("ok"))
     balances = pf.get("balances", []) if isinstance(pf.get("balances"), list) else []
+    portfolio_qty_by_symbol: Dict[str, float] = {}
     stables = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD"}
     for b in balances:
         if not isinstance(b, dict):
@@ -1370,12 +1372,31 @@ def _position_graph_rows(profile: str, quote_pref: str = "USDT") -> pd.DataFrame
         if total <= 0:
             continue
         sym = f"{asset}{quote_pref}"
+        portfolio_qty_by_symbol[sym] = total
         if sym not in merged:
             merged[sym] = {"symbol": sym, "tf": "spot", "qty": total, "buy_price": float(cb.get(sym, 0.0) or 0.0), "quote": quote_pref}
 
     rows: List[Dict[str, Any]] = []
     for sym, r in merged.items():
         qty = float(r.get("qty", 0.0) or 0.0)
+        # Portfolio holdings are the source of truth for current open quantity.
+        if sym in portfolio_qty_by_symbol:
+            qty = float(portfolio_qty_by_symbol.get(sym, 0.0) or 0.0)
+        else:
+            if pf_ok:
+                # When portfolio is available, treat it as source of truth.
+                # Do not surface stale ledger/order-only symbols as open positions.
+                continue
+            # Fallback only when portfolio fetch failed: infer from open SELL order quantity.
+            oq = 0.0
+            for o in by_symbol.get(sym, []):
+                if str(o.get("side", "")).strip().upper() != "SELL":
+                    continue
+                try:
+                    oq = max(oq, float(o.get("origQty", 0.0) or 0.0))
+                except Exception:
+                    pass
+            qty = max(qty, oq)
         if qty <= 0:
             continue
         lp = bridge.get_binance_last_price(symbol=sym, profile_name=profile)
