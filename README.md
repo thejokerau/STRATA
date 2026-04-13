@@ -285,6 +285,9 @@ GUI Position Graph:
   - Pending queue can now size selected rows by quote notional target (for example USDT amount) instead of raw qty
   - Pending table shows estimated quote notional and symbol min-notional for faster filter debugging
   - submit flow now retries OCO with auto-bumped qty when Binance min-notional fails (if available balance allows)
+  - BUY autosizing now enforces Binance `minNotional`:
+    - quote-notional is auto-bumped to minimum when balance allows,
+    - recommendations are dropped early when quote balance is below `minNotional`.
   - auto-sizing for selected pending trades:
     - BUY uses configurable `%` of available quote balance (for example USDT)
     - SELL uses configurable `%` of available base-asset balance

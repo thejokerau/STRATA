@@ -730,6 +730,23 @@ def _submit_pending_rec(profile: str, rec: Dict[str, Any]) -> Dict[str, Any]:
     # EngineBridge.submit_binance_order does not support quote_order_qty directly.
     # Convert quote notional to qty using latest price when qty is missing.
     if qty <= 0 and q_notional > 0:
+        filt_out = bridge.get_binance_symbol_filters(symbol=sym, profile_name=profile)
+        min_notional = float(filt_out.get("min_notional", 0.0) or 0.0) if filt_out.get("ok") else 0.0
+        if min_notional > 0 and q_notional < min_notional:
+            q_notional = float(min_notional)
+            rec["quote_notional"] = q_notional
+            rec["reason"] = str(rec.get("reason", "")) + f" | auto-bumped quote notional to minNotional {min_notional:.8f}"
+        if side == "BUY":
+            q_asset = "USDT"
+            for qa in ("USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "BNB"):
+                if sym.endswith(qa):
+                    q_asset = qa
+                    break
+            free_q = _get_quote_free_balance(profile, q_asset)
+            if free_q <= 0:
+                free_q = _get_quote_free_balance(profile, "USDT")
+            if q_notional > free_q > 0:
+                return {"ok": False, "error": f"Insufficient quote balance for {sym}: required {q_notional:.8f}, available {free_q:.8f}"}
         lp_out = bridge.get_binance_last_price(symbol=sym, profile_name=profile)
         if not lp_out.get("ok"):
             return {"ok": False, "error": f"Unable to derive quantity from quote notional for {sym}: {lp_out.get('error', 'price unavailable')}"}
@@ -1017,6 +1034,16 @@ def _apply_signal_controls(
             elif autosize_mode == "percent_quote_balance":
                 qn = max(0.0, quote_free * max(0.0, float(pct_quote_balance or 0.0)) / 100.0)
             if qn > 0:
+                if profile and sym:
+                    f = bridge.get_binance_symbol_filters(symbol=sym, profile_name=profile)
+                    min_n = float(f.get("min_notional", 0.0) or 0.0) if f.get("ok") else 0.0
+                    if min_n > 0 and qn < min_n:
+                        if quote_free >= min_n:
+                            qn = float(min_n)
+                            rr["reason"] = str(rr.get("reason", "")) + f" | bumped BUY notional to minNotional {min_n:.8f}"
+                        else:
+                            _log(f"Dropped BUY {sym}: quote balance {quote_free:.8f} below minNotional {min_n:.8f}")
+                            continue
                 rr["quote_notional"] = round(qn, 8)
                 rr["quantity"] = 0.0
                 rr["reason"] = str(rr.get("reason", "")) + f" | autosized BUY using {rr['quote_notional']} {quote}"
@@ -1026,17 +1053,23 @@ def _apply_signal_controls(
                 if float(rr.get("take_profit_price", 0.0) or 0.0) <= 0:
                     rr["take_profit_price"] = px * (1.0 + max(0.0, float(take_profit_pct or 0.0)) / 100.0)
         elif side == "SELL":
+            held_total = _get_asset_total_balance(profile, asset) if profile else 0.0
+            if profile and held_total <= 0:
+                _log(f"Dropped SELL {sym}: no holdings in profile {profile}")
+                continue
             qty = float(rr.get("quantity", 0.0) or 0.0)
             if qty <= 0 and profile:
                 if autosize_mode == "percent_quote_balance":
-                    held = _get_asset_total_balance(profile, asset)
-                    qty = held * max(0.0, float(pct_quote_balance or 0.0)) / 100.0
+                    qty = held_total * max(0.0, float(pct_quote_balance or 0.0)) / 100.0
                 elif autosize_mode == "fixed_quote_notional" and px > 0:
-                    qty = max(0.0, float(fixed_quote_notional or 0.0) / px)
+                    qty = min(held_total, max(0.0, float(fixed_quote_notional or 0.0) / px))
                 else:
-                    qty = _get_asset_total_balance(profile, asset)
+                    qty = held_total
             if qty > 0:
                 rr["quantity"] = round(qty, 8)
+            else:
+                _log(f"Dropped SELL {sym}: computed quantity is zero")
+                continue
             if apply_protection and px > 0:
                 if float(rr.get("stop_loss_price", 0.0) or 0.0) <= 0:
                     rr["stop_loss_price"] = px * (1.0 - max(0.0, float(stop_loss_pct or 0.0)) / 100.0)
@@ -1937,27 +1970,38 @@ with tab_live:
         st.info("Live Dashboard started in background. You can switch tabs while it runs.")
         st.rerun()
 
-    if live_running:
-        st.info("Live Dashboard is running in background...")
-
-    # consume completed live job result
-    live_done_id = str(st.session_state.get("bg_live_running_id", "") or "")
-    if live_done_id:
-        j = (st.session_state.bg_jobs or {}).get(live_done_id, {})
-        if isinstance(j, dict) and str(j.get("status", "")) in ("done", "failed"):
-            if str(j.get("status", "")) == "failed":
-                st.error(f"Live job failed: {j.get('error', 'unknown error')}")
-            else:
-                res = j.get("result", {}) if isinstance(j.get("result"), dict) else {}
-                for e in (res.get("errors", []) or []):
-                    st.warning(str(e))
-                runs = res.get("runs", []) if isinstance(res.get("runs"), list) else []
-                if runs:
-                    st.session_state.live_runs.extend(runs)
-                    st.session_state.live_runs = st.session_state.live_runs[-20:]
-                    st.session_state.last_live_text = str(res.get("combined_text", "") or "")
-                    st.success(f"Live run complete ({len(runs)} panel(s)).")
+    @st.fragment(run_every=("1s" if live_running else None))
+    def _live_job_fragment() -> None:
+        _poll_bg_jobs()
+        _live_id = str(st.session_state.get("bg_live_running_id", "") or "")
+        if not _live_id:
+            return
+        _j = (st.session_state.bg_jobs or {}).get(_live_id, {})
+        if not isinstance(_j, dict):
+            return
+        _status = str(_j.get("status", ""))
+        if _status == "running":
+            st.info("Live Dashboard is running in background...")
+            return
+        if _status == "failed":
+            st.error(f"Live job failed: {_j.get('error', 'unknown error')}")
             st.session_state.bg_live_running_id = ""
+            st.rerun()
+            return
+        if _status == "done":
+            _res = _j.get("result", {}) if isinstance(_j.get("result"), dict) else {}
+            for _e in (_res.get("errors", []) or []):
+                st.warning(str(_e))
+            _runs = _res.get("runs", []) if isinstance(_res.get("runs"), list) else []
+            if _runs:
+                st.session_state.live_runs.extend(_runs)
+                st.session_state.live_runs = st.session_state.live_runs[-20:]
+                st.session_state.last_live_text = str(_res.get("combined_text", "") or "")
+                st.success(f"Live run complete ({len(_runs)} panel(s)).")
+            st.session_state.bg_live_running_id = ""
+            st.rerun()
+
+    _live_job_fragment()
     if st.session_state.live_runs:
         st.markdown("### Latest Live Outputs")
         for run in reversed(st.session_state.live_runs[-6:]):
@@ -2368,29 +2412,31 @@ with tab_portfolio:
         or st.session_state.last_ledger_df.empty
     )
     should_auto_bundle = bool(profile) and bool(pf_auto_load) and (need_initial or (now_epoch - last_epoch >= float(pf_auto_refresh_sec)))
-    if pf_force_bundle:
-        out_bundle = _run_task("Portfolio Auto Bundle Refresh", lambda: _refresh_portfolio_bundle(profile, include_review=bool(pf_auto_include_review)))
-        if out_bundle.get("ok"):
-            st.success("Portfolio bundle refreshed.")
+    gp_running_id = str(st.session_state.get("bg_prefetch_running_id", "") or "")
+    gp_running = False
+    if gp_running_id:
+        _jobs = st.session_state.bg_jobs if isinstance(st.session_state.bg_jobs, dict) else {}
+        _j = _jobs.get(gp_running_id, {}) if isinstance(_jobs, dict) else {}
+        gp_running = isinstance(_j, dict) and str(_j.get("status", "")) == "running"
+
+    if pf_force_bundle and bool(profile):
+        if gp_running:
+            st.info("Portfolio refresh already running in background.")
         else:
-            st.warning(
-                "Portfolio bundle refreshed with issues: "
-                + ", ".join(
-                    [
-                        x
-                        for x in [
-                            out_bundle.get("portfolio_error", ""),
-                            out_bundle.get("orders_error", ""),
-                            out_bundle.get("ledger_error", ""),
-                            out_bundle.get("review_error", ""),
-                        ]
-                        if str(x).strip()
-                    ]
-                )
+            jid = _start_bg_job(
+                "Portfolio Auto Bundle Refresh (async)",
+                lambda p=profile, r=bool(pf_auto_include_review): _fetch_portfolio_bundle_payload(profile=p, include_review=r),
             )
-    elif should_auto_bundle:
-        _run_task("Portfolio Auto Bundle Refresh", lambda: _refresh_portfolio_bundle(profile, include_review=bool(pf_auto_include_review)))
-        st.caption("Auto-loaded portfolio, open orders, and ledger.")
+            st.session_state.bg_prefetch_running_id = jid
+            st.info("Portfolio bundle refresh started in background.")
+    elif should_auto_bundle and bool(profile):
+        if not gp_running:
+            jid = _start_bg_job(
+                "Portfolio Auto Bundle Refresh (async)",
+                lambda p=profile, r=bool(pf_auto_include_review): _fetch_portfolio_bundle_payload(profile=p, include_review=r),
+            )
+            st.session_state.bg_prefetch_running_id = jid
+            st.caption("Auto-refresh kicked off in background.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     do_pf = c1.button("Refresh Portfolio", type="primary", disabled=not bool(profile))
@@ -2626,7 +2672,7 @@ with tab_graph:
     profile = _safe_select_option("Binance profile (graph)", names, preferred=(names[0] if names else ""))
     quote_pref = st.selectbox("Quote", ["USDT", "USD", "USDC", "BUSD", "BTC", "ETH", "BNB"], index=0, key="graph_quote")
     g1, g2, g3 = st.columns([1, 1, 2])
-    graph_auto = g1.checkbox("Auto-refresh", value=bool(st.session_state.get("graph_auto_refresh", True)), key="graph_auto_refresh")
+    graph_auto = g1.checkbox("Auto-refresh", value=bool(st.session_state.get("graph_auto_refresh", False)), key="graph_auto_refresh")
     graph_interval = int(g2.number_input("Every (sec)", min_value=5, max_value=300, value=20, step=5, key="graph_interval_sec"))
     refresh_now = g3.button("Refresh Position Graph Data", type="primary", disabled=not bool(profile), key="graph_refresh_btn")
 
