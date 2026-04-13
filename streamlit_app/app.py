@@ -119,6 +119,7 @@ def _init_state() -> None:
         "ai_prompt_preview": "",
         "last_live_text": "",
         "selected_pending_ids": [],
+        "ai_source_text_area": "",
         "live_runs": [],
         "last_backtest_summary": "",
         "last_backtest_trades": "",
@@ -129,6 +130,7 @@ def _init_state() -> None:
         "last_graph_df": pd.DataFrame(),
         "last_research_text": "",
         "live_profile_name": "default",
+        "pending_live_profile_apply": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -284,6 +286,34 @@ def _load_ai_profiles() -> Tuple[List[str], str]:
     profiles = out.get("profiles", []) or []
     names = [str(p.get("name", "")).strip() for p in profiles if isinstance(p, dict) and str(p.get("name", "")).strip()]
     return sorted(names), str(out.get("active_profile", "") or "")
+
+
+def _portfolio_symbols_for_profile(profile: str, quote_pref: str = "USDT") -> List[str]:
+    out = bridge.fetch_binance_portfolio(profile_name=profile)
+    if not out.get("ok"):
+        return []
+    bals = out.get("balances", []) if isinstance(out.get("balances"), list) else []
+    stable = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD"}
+    syms: List[str] = []
+    seen = set()
+    for b in bals:
+        if not isinstance(b, dict):
+            continue
+        asset = str(b.get("asset", "")).strip().upper()
+        if not asset or asset in stable:
+            continue
+        try:
+            total = float(b.get("total", 0.0) or 0.0)
+        except Exception:
+            total = 0.0
+        if total <= 0:
+            continue
+        sym = f"{asset}{quote_pref}".upper()
+        if sym in seen:
+            continue
+        seen.add(sym)
+        syms.append(sym)
+    return syms
 
 
 def _safe_select_option(label: str, options: List[str], preferred: str = "") -> Optional[str]:
@@ -570,6 +600,135 @@ def _protect_open_positions_simple(profile: str, auto_submit: bool = False) -> D
     return {"ok": True, "staged": added, "submitted": submitted, "rows": len(rows)}
 
 
+def _protect_open_positions_live_bt_ai(profile: str, auto_submit: bool = False) -> Dict[str, Any]:
+    # Build open-position context first.
+    review = bridge.analyze_open_positions_multi_tf(
+        profile_name=profile,
+        timeframes=["4h", "8h", "12h", "1d"],
+        display_currency="USD",
+    )
+    if not review.get("ok"):
+        return {"ok": False, "error": str(review.get("error", "Open position review failed"))}
+    review_rows = review.get("rows", []) if isinstance(review.get("rows"), list) else []
+    held_symbols = set(_portfolio_symbols_for_profile(profile=profile, quote_pref="USDT"))
+
+    # Live context from current dashboard controls.
+    live_cfg = {
+        "name": f"{st.session_state.get('live_market', 'crypto')}-{st.session_state.get('live_tf', '1d')}",
+        "market": str(st.session_state.get("live_market", "crypto")),
+        "timeframe": str(st.session_state.get("live_tf", "1d")),
+        "quote_currency": str(st.session_state.get("live_quote", "USDT")),
+        "top_n": int(st.session_state.get("live_topn", 20)),
+        "country": _country_display_to_code(str(st.session_state.get("live_country_display", "United States (2)"))),
+        "display_currency": "USD",
+    }
+    live_res = bridge.run_live_panel(live_cfg)
+    live_text = ""
+    if live_res.get("ok"):
+        live_text = "\n\n".join(
+            [
+                str(live_res.get("table_text", "") or ""),
+                str(live_res.get("breakdown_text", "") or ""),
+                str(live_res.get("context_text", "") or ""),
+            ]
+        ).strip()
+
+    # Backtest context from current backtest controls.
+    bt_cfg = {
+        "market": str(st.session_state.get("bt_market", "crypto")),
+        "timeframe": str(st.session_state.get("bt_tf", "1d")),
+        "top_n": int(st.session_state.get("bt_topn", 20)),
+        "months": int(st.session_state.get("bt_months", 12)),
+        "country": "2",
+        "quote_currency": str(st.session_state.get("live_quote", "USDT")),
+        "display_currency": "USD",
+        "initial_capital": 10000.0,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "max_hold_days": 45,
+        "min_hold_bars": 2,
+        "cooldown_bars": 1,
+        "same_asset_cooldown_bars": 3,
+        "max_consecutive_same_asset_entries": 3,
+        "fee_pct": 0.1,
+        "slippage_pct": 0.05,
+        "position_size": 0.30,
+        "atr_multiplier": 2.2,
+        "adx_threshold": 25.0,
+        "cmf_threshold": 0.02,
+        "obv_slope_threshold": 0.0,
+        "buy_threshold": 2,
+        "sell_threshold": -2,
+        "cache_workers": 4,
+        "max_drawdown_limit_pct": 35.0,
+        "max_exposure_pct": 0.4,
+        "auto_tune": False,
+        "optuna_trials": 10,
+        "optuna_jobs": 2,
+    }
+    bt_res = bridge.run_backtest(bt_cfg)
+    bt_text = ""
+    if bt_res.get("ok"):
+        bt_text = "\n\n".join([str(bt_res.get("summary_text", "") or ""), str(bt_res.get("trade_text", "") or "")]).strip()
+
+    review_df = pd.DataFrame(review_rows) if review_rows else pd.DataFrame()
+    review_text = review_df.to_csv(index=False) if not review_df.empty else str(review_rows)
+    source = "\n\n".join(
+        [
+            "OPEN POSITIONS MTF REVIEW",
+            str(review_text),
+            "LIVE DASHBOARD CONTEXT",
+            str(live_text),
+            "BACKTEST CONTEXT",
+            str(bt_text),
+            "Task: return protective SELL orders for currently held symbols only.",
+        ]
+    ).strip()
+    ai_out = bridge.run_ai_analysis(source, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    if not ai_out.get("ok"):
+        # Fallback to deterministic simple protection
+        return _protect_open_positions_simple(profile=profile, auto_submit=auto_submit)
+
+    ai_resp = str(ai_out.get("response", "") or "")
+    recs = _extract_trade_recs(ai_resp, default_tf=str(st.session_state.get("bt_tf", "4h")))
+    filtered: List[Dict[str, Any]] = []
+    for r in recs:
+        sym = str(r.get("symbol", "")).strip().upper()
+        side = str(r.get("side", "")).strip().upper()
+        if side != "SELL":
+            continue
+        if held_symbols and sym not in held_symbols:
+            continue
+        filtered.append(r)
+    if not filtered:
+        return _protect_open_positions_simple(profile=profile, auto_submit=auto_submit)
+
+    incoming = {str(x.get("symbol", "")).upper() for x in filtered if isinstance(x, dict)}
+    if incoming:
+        kept = []
+        for rec in st.session_state.pending_recs:
+            sym = str(rec.get("symbol", "")).strip().upper() if isinstance(rec, dict) else ""
+            src = str(rec.get("pending_source", "")).strip().lower() if isinstance(rec, dict) else ""
+            if sym in incoming and src in ("protect_open_positions_ai_bt", "protect_open_positions_live_bt_ai"):
+                continue
+            kept.append(rec)
+        st.session_state.pending_recs = kept
+    added = _append_pending(filtered, source="protect_open_positions_live_bt_ai")
+    submitted = 0
+    if auto_submit and added > 0:
+        for rec in st.session_state.pending_recs:
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("pending_source", "")).strip().lower() != "protect_open_positions_live_bt_ai":
+                continue
+            out_sub = _submit_pending_rec(profile, rec)
+            rec["status"] = "SUBMITTED" if out_sub.get("ok") else "FAILED"
+            rec["reason"] = str(rec.get("reason", "")) + (" | submitted" if out_sub.get("ok") else f" | {out_sub.get('error', 'submit failed')}")
+            if out_sub.get("ok"):
+                submitted += 1
+    return {"ok": True, "staged": added, "submitted": submitted, "rows": len(review_rows), "mode": "live_bt_ai"}
+
+
 _init_state()
 
 tab_live, tab_backtest, tab_ai, tab_portfolio, tab_graph, tab_research, tab_tasks, tab_settings = st.tabs(
@@ -578,6 +737,17 @@ tab_live, tab_backtest, tab_ai, tab_portfolio, tab_graph, tab_research, tab_task
 
 with tab_live:
     st.subheader("Live Dashboard")
+    pending_apply = st.session_state.get("pending_live_profile_apply")
+    if isinstance(pending_apply, dict):
+        st.session_state["live_market"] = str(pending_apply.get("market", st.session_state.get("live_market", "crypto")))
+        st.session_state["live_tf"] = str(pending_apply.get("timeframe", st.session_state.get("live_tf", "1d")))
+        st.session_state["live_tf_multi"] = list(pending_apply.get("extra_timeframes", []))
+        st.session_state["live_topn"] = int(pending_apply.get("top_n", st.session_state.get("live_topn", 20)))
+        st.session_state["live_quote"] = str(pending_apply.get("quote", st.session_state.get("live_quote", "USDT")))
+        code = str(pending_apply.get("country", "2"))
+        st.session_state["live_country_display"] = f"{COUNTRY_LABELS.get(code, 'United States')} ({code})"
+        st.session_state["pending_live_profile_apply"] = None
+
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     market = c1.selectbox("Market", ["crypto", "traditional"], index=0, key="live_market")
     timeframe = c2.selectbox("Timeframe", ["1d", "4h", "8h", "12h"], index=0, key="live_tf")
@@ -618,13 +788,7 @@ with tab_live:
     if load_profile_btn and selected_profile:
         prof = lp.get(selected_profile, {})
         if isinstance(prof, dict):
-            st.session_state["live_market"] = str(prof.get("market", st.session_state.get("live_market", "crypto")))
-            st.session_state["live_tf"] = str(prof.get("timeframe", st.session_state.get("live_tf", "1d")))
-            st.session_state["live_tf_multi"] = list(prof.get("extra_timeframes", []))
-            st.session_state["live_topn"] = int(prof.get("top_n", st.session_state.get("live_topn", 20)))
-            st.session_state["live_quote"] = str(prof.get("quote", st.session_state.get("live_quote", "USDT")))
-            code = str(prof.get("country", "2"))
-            st.session_state["live_country_display"] = f"{COUNTRY_LABELS.get(code, 'United States')} ({code})"
+            st.session_state["pending_live_profile_apply"] = dict(prof)
             st.session_state.live_profile_name = selected_profile
             st.success(f"Loaded profile: {selected_profile}")
             st.rerun()
@@ -759,19 +923,182 @@ with tab_ai:
             st.success(f"Staged {n} recommendation(s).")
         else:
             st.warning("No structured trade recommendations found.")
-    dt_context = st.text_input("Datetime context", value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    src_mode = st.selectbox("Source mode", ["manual", "last_live"], index=0)
-    src_default = st.session_state.last_live_text if src_mode == "last_live" else st.session_state.ai_source_text
-    src = st.text_area("Source text (dashboard/backtest/logs)", value=src_default, height=280, placeholder="Paste dashboard text here...")
-    st.session_state.ai_source_text = src
+    dt_context = st.text_input("Datetime context", value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), key="ai_dt_context")
+    st.markdown("### Import Source")
+    import_cols = st.columns([2, 1, 1, 1])
+    source_mode = import_cols[0].selectbox(
+        "Source",
+        ["manual", "latest_live", "recent_live_combined", "last_backtest"],
+        index=0,
+        key="ai_source_mode",
+    )
+    recent_n = int(import_cols[1].number_input("Recent runs", min_value=1, max_value=20, value=3, step=1, key="ai_recent_runs"))
+    do_import = import_cols[2].button("Import to AI Input", key="ai_import_btn")
+    do_append = import_cols[3].button("Append Import", key="ai_append_btn")
+
+    imported_text = ""
+    if source_mode == "latest_live":
+        if st.session_state.live_runs:
+            imported_text = str(st.session_state.live_runs[-1].get("text", "") or "")
+        elif st.session_state.last_live_text:
+            imported_text = str(st.session_state.last_live_text or "")
+    elif source_mode == "recent_live_combined":
+        runs = st.session_state.live_runs[-recent_n:] if st.session_state.live_runs else []
+        blocks = [str(r.get("text", "") or "") for r in runs if isinstance(r, dict)]
+        imported_text = "\n\n".join([b for b in blocks if b]).strip()
+        if not imported_text and st.session_state.last_live_text:
+            imported_text = str(st.session_state.last_live_text or "")
+    elif source_mode == "last_backtest":
+        imported_text = "\n\n".join(
+            [
+                str(st.session_state.last_backtest_summary or ""),
+                str(st.session_state.last_backtest_trades or ""),
+            ]
+        ).strip()
+
+    if do_import:
+        if imported_text.strip():
+            st.session_state.ai_source_text = imported_text
+            st.session_state.ai_source_text_area = imported_text
+            st.success("Imported source into AI input.")
+        else:
+            st.warning("No source text available to import for this mode yet.")
+    if do_append:
+        if imported_text.strip():
+            existing = str(st.session_state.ai_source_text or "").strip()
+            merged = (existing + ("\n\n" if existing else "") + imported_text).strip()
+            st.session_state.ai_source_text = merged
+            st.session_state.ai_source_text_area = merged
+            st.success("Imported source appended to AI input.")
+        else:
+            st.warning("No source text available to import for this mode yet.")
+
+    st.markdown("### Full Pipeline")
+    pipe_cols = st.columns([2, 1, 1])
+    bn_names_for_pipe = _load_binance_profiles()
+    pipe_profile = _safe_select_option("Binance profile for auto-submit", bn_names_for_pipe, preferred=(bn_names_for_pipe[0] if bn_names_for_pipe else ""))
+    pipe_auto_submit = pipe_cols[1].checkbox("Auto-submit staged", value=False, key="ai_pipe_auto_submit")
+    run_pipeline = pipe_cols[2].button("Run Live > BT > AI > Stage", key="ai_pipe_run_btn", type="primary")
+    if run_pipeline:
+        # 1) Live
+        live_cfg = {
+            "name": f"{st.session_state.get('live_market', 'crypto')}-{st.session_state.get('live_tf', '1d')}",
+            "market": str(st.session_state.get("live_market", "crypto")),
+            "timeframe": str(st.session_state.get("live_tf", "1d")),
+            "quote_currency": str(st.session_state.get("live_quote", "USDT")),
+            "top_n": int(st.session_state.get("live_topn", 20)),
+            "country": _country_display_to_code(str(st.session_state.get("live_country_display", "United States (2)"))),
+            "display_currency": "USD",
+        }
+        live_res = _run_task("Pipeline Live", lambda: bridge.run_live_panel(live_cfg))
+        if not live_res.get("ok"):
+            st.error(f"Pipeline failed at Live: {live_res.get('error', 'unknown error')}")
+        else:
+            live_block = "\n\n".join(
+                [
+                    str(live_res.get("table_text", "") or ""),
+                    str(live_res.get("breakdown_text", "") or ""),
+                    str(live_res.get("context_text", "") or ""),
+                ]
+            ).strip()
+            st.session_state.live_runs.append({"name": live_cfg["name"], "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "text": live_block})
+            st.session_state.live_runs = st.session_state.live_runs[-20:]
+            st.session_state.last_live_text = live_block
+            # 2) Backtest
+            bt_cfg = {
+                "market": str(st.session_state.get("bt_market", "crypto")),
+                "timeframe": str(st.session_state.get("bt_tf", "1d")),
+                "top_n": int(st.session_state.get("bt_topn", 20)),
+                "months": int(st.session_state.get("bt_months", 12)),
+                "country": "2",
+                "quote_currency": str(st.session_state.get("live_quote", "USDT")),
+                "display_currency": "USD",
+                "initial_capital": 10000.0,
+                "stop_loss_pct": 8.0,
+                "take_profit_pct": 20.0,
+                "max_hold_days": 45,
+                "min_hold_bars": 2,
+                "cooldown_bars": 1,
+                "same_asset_cooldown_bars": 3,
+                "max_consecutive_same_asset_entries": 3,
+                "fee_pct": 0.1,
+                "slippage_pct": 0.05,
+                "position_size": 0.30,
+                "atr_multiplier": 2.2,
+                "adx_threshold": 25.0,
+                "cmf_threshold": 0.02,
+                "obv_slope_threshold": 0.0,
+                "buy_threshold": 2,
+                "sell_threshold": -2,
+                "cache_workers": 4,
+                "max_drawdown_limit_pct": 35.0,
+                "max_exposure_pct": 0.4,
+                "auto_tune": False,
+                "optuna_trials": 10,
+                "optuna_jobs": 2,
+            }
+            bt_res = _run_task("Pipeline Backtest", lambda: bridge.run_backtest(bt_cfg))
+            if not bt_res.get("ok"):
+                st.error(f"Pipeline failed at Backtest: {bt_res.get('error', 'unknown error')}")
+            else:
+                st.session_state.last_backtest_summary = str(bt_res.get("summary_text", "") or "")
+                st.session_state.last_backtest_trades = str(bt_res.get("trade_text", "") or "")
+                # 3) AI
+                pipe_source = "\n\n".join([live_block, st.session_state.last_backtest_summary, st.session_state.last_backtest_trades]).strip()
+                st.session_state.ai_source_text = pipe_source
+                st.session_state.ai_source_text_area = pipe_source
+                ai_res = _run_task("Pipeline AI", lambda: bridge.run_ai_analysis(pipe_source, dt_context))
+                if not ai_res.get("ok"):
+                    st.error(f"Pipeline failed at AI: {ai_res.get('error', 'unknown error')}")
+                else:
+                    st.session_state.ai_response = str(ai_res.get("response", "") or "")
+                    recs = _extract_trade_recs(st.session_state.ai_response, default_tf=str(st.session_state.get("bt_tf", "4h")))
+                    if recs:
+                        seq0 = int(st.session_state.pending_rec_seq or 0)
+                        n = _append_pending(recs, source="pipeline_live_bt_ai")
+                        st.success(f"Pipeline complete. Staged {n} recommendation(s).")
+                        if pipe_auto_submit:
+                            if not pipe_profile:
+                                st.warning("No Binance profile selected for auto-submit.")
+                            else:
+                                new_ids = set(range(seq0 + 1, seq0 + n + 1))
+                                ok_n = 0
+                                fail_n = 0
+                                for rec in st.session_state.pending_recs:
+                                    if int(rec.get("id", -1)) not in new_ids:
+                                        continue
+                                    out_sub = _submit_pending_rec(pipe_profile, rec)
+                                    rec["status"] = "SUBMITTED" if out_sub.get("ok") else "FAILED"
+                                    rec["reason"] = str(rec.get("reason", "")) + (
+                                        " | submitted" if out_sub.get("ok") else f" | {out_sub.get('error', 'submit failed')}"
+                                    )
+                                    if out_sub.get("ok"):
+                                        ok_n += 1
+                                    else:
+                                        fail_n += 1
+                                st.info(f"Auto-submit results: submitted={ok_n}, failed={fail_n}")
+                    else:
+                        st.warning("Pipeline AI returned no structured trade recommendations to stage.")
+
+    if not str(st.session_state.get("ai_source_text_area", "")).strip() and str(st.session_state.get("ai_source_text", "")).strip():
+        st.session_state.ai_source_text_area = str(st.session_state.ai_source_text or "")
+
+    src = st.text_area(
+        "Source text (dashboard/backtest/logs)",
+        height=320,
+        placeholder="Paste dashboard text here or use Import Source above...",
+        key="ai_source_text_area",
+    )
+    current_src = str(src or "").strip()
+    st.session_state.ai_source_text = current_src
     if st.session_state.ai_prompt_preview:
         st.text_area("Prompt Preview", value=st.session_state.ai_prompt_preview, height=200)
     if st.button("Run AI Analysis", type="primary"):
-        if not src.strip():
+        if not current_src:
             st.warning("Provide source text first.")
         else:
             with st.spinner("Calling AI provider..."):
-                res = _run_task("AI Analysis", lambda: bridge.run_ai_analysis(src, dt_context))
+                res = _run_task("AI Analysis", lambda: bridge.run_ai_analysis(current_src, dt_context))
             if not res.get("ok"):
                 st.error(res.get("error", "AI failed"))
             else:
@@ -800,8 +1127,9 @@ with tab_portfolio:
     do_review = c5.button("Review Open Positions (MTF)", disabled=not bool(profile))
     pcols = st.columns(3)
     auto_send_protect = pcols[0].checkbox("Auto-send protect", value=False)
-    do_protect = pcols[1].button("Protect Open Positions (AI+BT)", disabled=not bool(profile))
-    do_prune = pcols[2].button("Prune Signal History")
+    protect_mode = pcols[1].selectbox("Protect mode", ["ai_bt", "live_bt_ai"], index=0, key="protect_mode")
+    do_protect = pcols[2].button("Protect Open Positions (AI+BT)", disabled=not bool(profile))
+    do_prune = st.button("Prune Signal History")
 
     if do_pf and profile:
         out = _run_task("Portfolio Refresh", lambda: bridge.fetch_binance_portfolio(profile_name=profile))
@@ -841,7 +1169,19 @@ with tab_portfolio:
                 st.session_state.last_ledger_df = df
                 st.dataframe(df, use_container_width=True, hide_index=True)
     if do_rec and profile:
-        out = _run_task("Reconcile Fills", lambda: bridge.reconcile_binance_fills(profile_name=profile))
+        syms = _portfolio_symbols_for_profile(profile=profile, quote_pref=str(st.session_state.get("live_quote", "USDT")))
+        if not syms:
+            try:
+                pos_out = bridge.analyze_open_positions_multi_tf(profile_name=profile, timeframes=["4h"], display_currency="USD")
+                rows = pos_out.get("rows", []) if isinstance(pos_out.get("rows"), list) else []
+                syms = sorted({str(r.get("symbol", "")).strip().upper() for r in rows if isinstance(r, dict) and str(r.get("symbol", "")).strip()})
+            except Exception:
+                syms = []
+        if not syms:
+            st.warning("No symbols detected from portfolio/open positions; reconcile skipped.")
+            out = {"ok": False, "error": "No symbols available for reconciliation."}
+        else:
+            out = _run_task("Reconcile Fills", lambda: bridge.reconcile_binance_fills(profile_name=profile, symbols=syms))
         if out.get("ok"):
             st.success(f"Reconcile added={int(out.get('added', 0) or 0)}, dup={int(out.get('duplicates', 0) or 0)}")
         else:
@@ -858,9 +1198,16 @@ with tab_portfolio:
         else:
             st.error(out.get("error", "Review failed"))
     if do_protect and profile:
-        out = _run_task("Protect Open Positions (AI+BT)", lambda: _protect_open_positions_simple(profile, auto_submit=bool(auto_send_protect)))
+        if protect_mode == "live_bt_ai":
+            out = _run_task(
+                "Protect Open Positions (Live->BT->AI)",
+                lambda: _protect_open_positions_live_bt_ai(profile, auto_submit=bool(auto_send_protect)),
+            )
+        else:
+            out = _run_task("Protect Open Positions (AI+BT)", lambda: _protect_open_positions_simple(profile, auto_submit=bool(auto_send_protect)))
         if out.get("ok"):
-            st.success(f"Protection staged={int(out.get('staged', 0) or 0)}, submitted={int(out.get('submitted', 0) or 0)}")
+            mode_txt = str(out.get("mode", protect_mode))
+            st.success(f"Protection ({mode_txt}) staged={int(out.get('staged', 0) or 0)}, submitted={int(out.get('submitted', 0) or 0)}")
         else:
             st.error(out.get("error", "Protect failed"))
     if do_prune:
