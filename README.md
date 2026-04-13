@@ -263,6 +263,13 @@ GUI Portfolio & Ledger:
     - step 2: discover and stage new opportunities (`Live > BT > AI > Stage`)
     - optional auto-submit toggle for newly discovered entries
     - keeps outputs synchronized into Live/Backtest/AI cached panes
+  - `Unified Monitor` automation controls:
+    - start/stop scheduled Unified Cycle
+    - configurable interval in minutes
+    - single-instance guard (no overlapping runs)
+    - optional 24x7 mode (or local-hour window 06:00-23:00)
+    - last-run summary + next-run timestamp
+    - recent-run table with parsed/eligible/staged/submitted counts and explicit "no recommendations" notes
   - `Review Open Positions (MTF)` action:
     - evaluates open-position assets across `4h/8h/12h/1d`
     - logs per-timeframe actions and vote-based stance (`HOLD/ADD`, `HOLD`, `REDUCE/EXIT`)
@@ -274,6 +281,9 @@ GUI Portfolio & Ledger:
 GUI Position Graph:
 
 - New end-tab `Position Graph` provides a visual view of open positions.
+- Open-position inclusion is portfolio-authoritative when Binance portfolio fetch succeeds:
+  - assets not currently held are excluded from open-position rows,
+  - stale ledger/order-only symbols are ignored (fallback to order-derived inference only when portfolio fetch fails).
 - Per position, the graph shows:
   - entry marker
   - current price marker

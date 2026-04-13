@@ -300,7 +300,9 @@ def _run_unified_cycle_sync(
 
     # Stage recommendations as "new opportunities".
     default_tf = str(st.session_state.get("bt_tf", "4h"))
-    recs = _extract_trade_recs(ai_response, default_tf=default_tf)
+    recs_raw = _extract_trade_recs(ai_response, default_tf=default_tf)
+    recs_raw_n = len(recs_raw) if isinstance(recs_raw, list) else 0
+    recs = recs_raw
     recs = _apply_signal_controls(
         recs=recs,
         profile=str(st.session_state.get("sig_exec_profile", profile) or profile),
@@ -316,6 +318,8 @@ def _run_unified_cycle_sync(
     staged = 0
     submitted = 0
     failed = 0
+    recs_after_controls = len(recs) if isinstance(recs, list) else 0
+    no_new_reason = ""
     if recs:
         seq0 = int(st.session_state.pending_rec_seq or 0)
         staged = _append_pending(recs, source="unified_new_opportunity")
@@ -333,15 +337,31 @@ def _run_unified_cycle_sync(
                     submitted += 1
                 else:
                     failed += 1
+    else:
+        if recs_raw_n <= 0:
+            no_new_reason = "AI returned no structured recommendations."
+        else:
+            no_new_reason = "Recommendations were filtered by controls/portfolio constraints."
+
+    summary_text = (
+        f"protect(staged={int(protect_out.get('staged', 0) or 0)}, submitted={int(protect_out.get('submitted', 0) or 0)}), "
+        f"new(parsed={int(recs_raw_n)}, eligible={int(recs_after_controls)}, staged={int(staged)}, submitted={int(submitted)}, failed={int(failed)})"
+    )
+    if no_new_reason:
+        summary_text += f" | note: {no_new_reason}"
 
     return {
         "ok": True,
         "mode": "unified_manage_and_discover",
         "protect_staged": int(protect_out.get("staged", 0) or 0),
         "protect_submitted": int(protect_out.get("submitted", 0) or 0),
+        "new_parsed": int(recs_raw_n),
+        "new_eligible": int(recs_after_controls),
         "new_staged": int(staged),
         "new_submitted": int(submitted),
         "new_failed": int(failed),
+        "note": no_new_reason,
+        "summary_text": summary_text,
     }
 
 
@@ -373,6 +393,17 @@ def _init_state() -> None:
         "bg_live_running_id": "",
         "bg_pipeline_running_id": "",
         "bg_unified_running_id": "",
+        "unified_monitor_enabled": False,
+        "unified_monitor_interval_min": 30,
+        "unified_monitor_next_epoch": 0.0,
+        "unified_monitor_last_epoch": 0.0,
+        "unified_monitor_busy": False,
+        "unified_monitor_live_profile": "",
+        "unified_monitor_auto_send_protect": False,
+        "unified_monitor_auto_submit_new": False,
+        "unified_monitor_24x7": True,
+        "unified_monitor_last_summary": "",
+        "unified_monitor_history": [],
         "pf_last_loaded_epoch": 0.0,
         "pf_last_review_epoch": 0.0,
         "global_prefetch_enabled": True,
@@ -2591,13 +2622,138 @@ with tab_portfolio:
             ),
         )
         if out.get("ok"):
-            st.success(
-                "Unified complete: "
-                f"protect(staged={int(out.get('protect_staged', 0) or 0)}, submitted={int(out.get('protect_submitted', 0) or 0)}), "
-                f"new(staged={int(out.get('new_staged', 0) or 0)}, submitted={int(out.get('new_submitted', 0) or 0)}, failed={int(out.get('new_failed', 0) or 0)})"
-            )
+            st.success(f"Unified complete: {str(out.get('summary_text', '') or '').strip()}")
         else:
             st.error(f"Unified Cycle failed at {out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}")
+
+    st.markdown("### Unified Monitor")
+    um1, um2, um3, um4, um5 = st.columns([1, 1, 1, 1, 2])
+    unified_interval = int(
+        um1.number_input(
+            "Every (min)",
+            min_value=5,
+            max_value=1440,
+            value=int(st.session_state.get("unified_monitor_interval_min", 30) or 30),
+            step=5,
+            key="unified_monitor_interval_min",
+        )
+    )
+    unified_24x7 = bool(
+        um2.checkbox(
+            "24x7",
+            value=bool(st.session_state.get("unified_monitor_24x7", True)),
+            key="unified_monitor_24x7",
+            help="If off, monitor runs only during 06:00-23:00 local time.",
+        )
+    )
+    start_unified = um3.button("Start Unified Monitor", disabled=not bool(profile))
+    stop_unified = um4.button("Stop Unified Monitor")
+    if start_unified and profile:
+        picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
+        st.session_state.unified_monitor_enabled = True
+        st.session_state.unified_monitor_next_epoch = time.time() + 2.0
+        st.session_state.unified_monitor_last_epoch = 0.0
+        st.session_state.unified_monitor_busy = False
+        st.session_state.unified_monitor_live_profile = picked_lp
+        st.session_state.unified_monitor_auto_send_protect = bool(auto_send_protect)
+        st.session_state.unified_monitor_auto_submit_new = bool(auto_submit_unified_new)
+        st.success("Unified Monitor started.")
+        st.rerun()
+    if stop_unified:
+        st.session_state.unified_monitor_enabled = False
+        st.session_state.unified_monitor_busy = False
+        st.info("Unified Monitor stopped.")
+        st.rerun()
+    um_on = bool(st.session_state.get("unified_monitor_enabled", False))
+    um_busy = bool(st.session_state.get("unified_monitor_busy", False))
+    um_next = float(st.session_state.get("unified_monitor_next_epoch", 0.0) or 0.0)
+    um_next_txt = datetime.fromtimestamp(um_next).strftime("%Y-%m-%d %H:%M:%S") if um_next > 0 else "-"
+    um5.caption(f"Status: {'RUNNING' if um_busy else ('ACTIVE' if um_on else 'OFF')} | Next run: {um_next_txt}")
+    um_last = str(st.session_state.get("unified_monitor_last_summary", "") or "").strip()
+    if um_last:
+        st.caption(f"Last run: {um_last}")
+    hist = st.session_state.get("unified_monitor_history", [])
+    if isinstance(hist, list) and hist:
+        st.caption("Recent monitor runs")
+        _show_df(pd.DataFrame(hist[-20:]), width="stretch", hide_index=True, height=220)
+
+    @st.fragment(run_every=("5s" if um_on else None))
+    def _unified_monitor_fragment() -> None:
+        if not bool(st.session_state.get("unified_monitor_enabled", False)):
+            return
+        if bool(st.session_state.get("unified_monitor_busy", False)):
+            return
+        if not bool(st.session_state.get("unified_monitor_24x7", True)):
+            hour = datetime.now().hour
+            if hour < 6 or hour >= 23:
+                return
+        nxt = float(st.session_state.get("unified_monitor_next_epoch", 0.0) or 0.0)
+        if nxt > 0 and time.time() < nxt:
+            return
+        prof = str(profile or "")
+        if not prof:
+            return
+        st.session_state.unified_monitor_busy = True
+        try:
+            out = _run_task(
+                "Unified Cycle (scheduled)",
+                lambda p=prof: _run_unified_cycle_sync(
+                    profile=p,
+                    live_profile_name=str(st.session_state.get("unified_monitor_live_profile", "") or ""),
+                    auto_send_protect=bool(st.session_state.get("unified_monitor_auto_send_protect", False)),
+                    auto_submit_new=bool(st.session_state.get("unified_monitor_auto_submit_new", False)),
+                    dt_context=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            if out.get("ok"):
+                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.unified_monitor_last_summary = f"{stamp} {str(out.get('summary_text', '') or '').strip()}"
+                h = st.session_state.get("unified_monitor_history", [])
+                if not isinstance(h, list):
+                    h = []
+                h.append(
+                    {
+                        "ts": stamp,
+                        "status": "OK",
+                        "protect_staged": int(out.get("protect_staged", 0) or 0),
+                        "protect_submitted": int(out.get("protect_submitted", 0) or 0),
+                        "new_parsed": int(out.get("new_parsed", 0) or 0),
+                        "new_eligible": int(out.get("new_eligible", 0) or 0),
+                        "new_staged": int(out.get("new_staged", 0) or 0),
+                        "new_submitted": int(out.get("new_submitted", 0) or 0),
+                        "new_failed": int(out.get("new_failed", 0) or 0),
+                        "note": str(out.get("note", "") or ""),
+                    }
+                )
+                st.session_state.unified_monitor_history = h[-200:]
+            else:
+                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.unified_monitor_last_summary = f"{stamp} failed at {out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}"
+                h = st.session_state.get("unified_monitor_history", [])
+                if not isinstance(h, list):
+                    h = []
+                h.append(
+                    {
+                        "ts": stamp,
+                        "status": "FAILED",
+                        "protect_staged": 0,
+                        "protect_submitted": 0,
+                        "new_parsed": 0,
+                        "new_eligible": 0,
+                        "new_staged": 0,
+                        "new_submitted": 0,
+                        "new_failed": 0,
+                        "note": f"{out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}",
+                    }
+                )
+                st.session_state.unified_monitor_history = h[-200:]
+        finally:
+            st.session_state.unified_monitor_last_epoch = time.time()
+            st.session_state.unified_monitor_next_epoch = time.time() + (max(5, int(st.session_state.get("unified_monitor_interval_min", 30) or 30)) * 60)
+            st.session_state.unified_monitor_busy = False
+        st.rerun()
+
+    _unified_monitor_fragment()
     if do_prune:
         out = _run_task("Prune Signal History", lambda: bridge.prune_signal_only_history(keep_last_signals=0))
         if out.get("ok"):
