@@ -1,0 +1,15 @@
+{
+  "default": {
+    "market": "crypto",
+    "timeframe": "1d",
+    "extra_timeframes": [
+      "1d",
+      "4h",
+      "8h",
+      "12h"
+    ],
+    "top_n": 10,
+    "quote": "USDT",
+    "country": "2"
+  }
+}

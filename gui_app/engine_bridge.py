@@ -177,6 +177,38 @@ class EngineBridge:
         return enriched, perf
 
     def _load_nightly_module(self):
+        # Runtime safety for environments where numba cache locators fail
+        # (observed in Streamlit + dynamic module loading on Python 3.13).
+        try:
+            os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+            os.environ.setdefault("NUMBA_CACHE_DIR", str(Path.home() / ".numba_cache"))
+            import numba  # type: ignore
+
+            if not bool(getattr(numba, "_ctmt_cache_patch", False)):
+                orig_njit = getattr(numba, "njit", None)
+                orig_jit = getattr(numba, "jit", None)
+
+                def _wrap_no_cache(orig_fn):
+                    if not callable(orig_fn):
+                        return orig_fn
+
+                    def _wrapped(*args, **kwargs):
+                        if isinstance(kwargs, dict) and "cache" in kwargs:
+                            kwargs = dict(kwargs)
+                            kwargs["cache"] = False
+                        return orig_fn(*args, **kwargs)
+
+                    return _wrapped
+
+                if callable(orig_njit):
+                    numba.njit = _wrap_no_cache(orig_njit)  # type: ignore[attr-defined]
+                if callable(orig_jit):
+                    numba.jit = _wrap_no_cache(orig_jit)  # type: ignore[attr-defined]
+                setattr(numba, "_ctmt_cache_patch", True)
+        except Exception:
+            # Non-fatal: continue with default behavior if numba patching is unavailable.
+            pass
+
         spec = importlib.util.spec_from_file_location("ctmt_nightly_gui", str(self.nightly_path))
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Failed to load nightly module from {self.nightly_path}")
@@ -734,17 +766,32 @@ class EngineBridge:
         sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
         url = endpoint.rstrip("/") + path + "?" + query + "&signature=" + sig
         headers = {"X-MBX-APIKEY": api_key}
-        try:
+
+        def _do_req(disable_proxy: bool = False):
             m = method.strip().upper()
+            kwargs: Dict[str, Any] = {"headers": headers, "timeout": 30}
+            if disable_proxy:
+                kwargs["proxies"] = {"http": None, "https": None}
             if m == "POST":
-                r = requests.post(url, headers=headers, timeout=30)
-            elif m == "DELETE":
-                r = requests.delete(url, headers=headers, timeout=30)
-            else:
-                r = requests.get(url, headers=headers, timeout=30)
+                return requests.post(url, **kwargs)
+            if m == "DELETE":
+                return requests.delete(url, **kwargs)
+            return requests.get(url, **kwargs)
+
+        try:
+            r = _do_req(disable_proxy=False)
             if not (200 <= r.status_code < 300):
                 return {"ok": False, "status": r.status_code, "error": (r.text or "")[:1200]}
             return {"ok": True, "status": r.status_code, "data": r.json()}
+        except requests.exceptions.ProxyError:
+            # Retry once with proxies disabled to handle bad local proxy defaults.
+            try:
+                r = _do_req(disable_proxy=True)
+                if not (200 <= r.status_code < 300):
+                    return {"ok": False, "status": r.status_code, "error": (r.text or "")[:1200]}
+                return {"ok": True, "status": r.status_code, "data": r.json()}
+            except Exception as e2:
+                return {"ok": False, "status": -1, "error": str(e2)}
         except Exception as e:
             return {"ok": False, "status": -1, "error": str(e)}
 
