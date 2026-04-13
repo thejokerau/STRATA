@@ -90,6 +90,19 @@ GUI (ai-nightly branch):
 
 ```bash
 python scripts/run_gui.py
+
+Streamlit (streamlit-nightly branch):
+
+```bash
+python scripts/run_streamlit.py
+```
+
+This launches an experimental web UI at `http://localhost:8501` with tabs for:
+- Live Dashboard
+- Backtest
+- AI Analysis
+- Portfolio & Open Orders
+- Position Graph Data
 ```
 
 GUI task execution:

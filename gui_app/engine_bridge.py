@@ -177,6 +177,38 @@ class EngineBridge:
         return enriched, perf
 
     def _load_nightly_module(self):
+        # Runtime safety for environments where numba cache locators fail
+        # (observed in Streamlit + dynamic module loading on Python 3.13).
+        try:
+            os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+            os.environ.setdefault("NUMBA_CACHE_DIR", str(Path.home() / ".numba_cache"))
+            import numba  # type: ignore
+
+            if not bool(getattr(numba, "_ctmt_cache_patch", False)):
+                orig_njit = getattr(numba, "njit", None)
+                orig_jit = getattr(numba, "jit", None)
+
+                def _wrap_no_cache(orig_fn):
+                    if not callable(orig_fn):
+                        return orig_fn
+
+                    def _wrapped(*args, **kwargs):
+                        if isinstance(kwargs, dict) and "cache" in kwargs:
+                            kwargs = dict(kwargs)
+                            kwargs["cache"] = False
+                        return orig_fn(*args, **kwargs)
+
+                    return _wrapped
+
+                if callable(orig_njit):
+                    numba.njit = _wrap_no_cache(orig_njit)  # type: ignore[attr-defined]
+                if callable(orig_jit):
+                    numba.jit = _wrap_no_cache(orig_jit)  # type: ignore[attr-defined]
+                setattr(numba, "_ctmt_cache_patch", True)
+        except Exception:
+            # Non-fatal: continue with default behavior if numba patching is unavailable.
+            pass
+
         spec = importlib.util.spec_from_file_location("ctmt_nightly_gui", str(self.nightly_path))
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Failed to load nightly module from {self.nightly_path}")
