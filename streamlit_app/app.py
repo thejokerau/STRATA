@@ -1353,6 +1353,12 @@ def _execution_events_from_ledger_df(ledger_df: pd.DataFrame) -> pd.DataFrame:
     d = ledger_df.copy()
     if "is_execution" in d.columns:
         d = d[d["is_execution"] == True]  # noqa: E712
+    # Keep only confirmed exchange fills for FIFO accounting.
+    panel = d.get("panel", "").astype(str).str.strip().str.lower()
+    ex_trade_id = d.get("exchange_trade_id", "").astype(str).str.strip()
+    note = d.get("note", "").astype(str).str.strip().str.lower()
+    confirmed = (panel == "binance_reconcile") | (ex_trade_id != "") | (note.str.contains("reconciled binance fill", na=False))
+    d = d[confirmed]
     d["action"] = d.get("action", "").astype(str).str.upper()
     d = d[d["action"].isin(["BUY", "SELL"])]
     d["qty"] = pd.to_numeric(d.get("qty", 0.0), errors="coerce").fillna(0.0)
@@ -3063,7 +3069,7 @@ with tab_portfolio:
     f1.metric("Closed matches (FIFO)", f"{int(fs.get('closed_rows', 0) or 0)}")
     f2.metric("Open lots (FIFO)", f"{int(fs.get('open_lots', 0) or 0)}")
     f3.metric("Realized PnL (quote)", f"{float(fs.get('realized_quote', 0.0) or 0.0):,.6f}")
-    t1, t2 = st.tabs(["Closed (Open?Close)", "Open Lots"])
+    t1, t2 = st.tabs(["Closed (Open->Close)", "Open Lots"])
     with t1:
         if isinstance(fc, pd.DataFrame) and not fc.empty:
             _show_df(fc, width="stretch", hide_index=True, height=320)
