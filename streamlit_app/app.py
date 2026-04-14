@@ -2727,9 +2727,9 @@ with tab_portfolio:
     do_review = c5.button("Review Open Positions (MTF)", disabled=not bool(profile))
     pcols = st.columns(5)
     auto_send_protect = pcols[0].checkbox(
-        "Auto-submit protection orders to Binance",
+        "Unified cycle auto-submit protection orders",
         value=False,
-        help="ON: generate protection and submit immediately. OFF: generate protection only and leave as PENDING for manual review/submit.",
+        help="When ON, protection recommendations are submitted to Binance during Unified/Protect runs. When OFF, they are staged as PENDING for manual review.",
     )
     do_protect = pcols[1].button("Protect Open Positions (AI+BT)", disabled=not bool(profile))
     do_protect_pipeline = pcols[2].button("Protect Open Positions (Live > BT > AI)", disabled=not bool(profile))
