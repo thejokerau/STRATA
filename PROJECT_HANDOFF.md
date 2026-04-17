@@ -2,9 +2,64 @@
 
 ## Date
 - 2026-04-08
+- 2026-04-17 (latest update)
+
+## Latest Status (2026-04-17)
+- Active branch: `streamlit-nightly`
+- Primary app: `streamlit_app/app.py`
+- Runtime diagnostics: `logs/runtime_diag.jsonl`
+
+### Recently Completed (Latest Session)
+- Converted additional heavy synchronous flows to async/background execution:
+  - `Retrofit Selected Position to OCO`
+  - `Standard Research` + `Comprehensive Research`
+  - `Global Prefetch` manual trigger
+  - Reconcile symbol discovery + reconcile moved into one async helper path
+  - Graph tab ledger bootstrap for PnL moved to async
+- Added Auto-Research visibility:
+  - in-tab active process monitor
+  - in-session research run history (status/duration/summary/output size)
+  - clear history control
+- Addressed remaining heavy sync hotspots identified in Streamlit:
+  - Graph PnL bootstrap no longer does direct synchronous ledger fetch
+  - Reconcile no longer does synchronous open-position analyzer fallback
+- Validation:
+  - `python -m py_compile streamlit_app/app.py` passes
+
+### Current Known Issues from Logs (Need Follow-up)
+- Background async jobs can still fail due to Streamlit session-state access in worker threads:
+  - `Unified Cycle (Manage+Discover) (async)` -> missing `task_logs`
+  - `Protect Open Positions (Live->BT->AI) (async)` -> missing `pending_recs`
+- Performance bottleneck remains:
+  - `analyze_open_positions_multi_tf` consistently ~83-86s in diagnostics
+- Live dashboard cache behavior appears suboptimal:
+  - recent `run_live_panel.end` entries show `cache_hit=false` repeatedly
+- Prefetch churn/load is high:
+  - `Global Prefetch Bundle (async)` runs frequently (~60s cadence), ~6s each
+
+### Immediate Next Actions (for new chat thread)
+1. Remove all worker-thread `st.session_state` access:
+   - background jobs should return payloads only
+   - apply UI/session changes exclusively in main thread after `_consume_bg_job(...)`
+2. Add prefetch throttling while heavy jobs are running:
+   - pause/defer prefetch during unified/protect/live/backtest heavy tasks
+3. Add freshness gating for open-position analysis:
+   - skip rerun if recent result is within configurable TTL unless forced
+4. Investigate live-panel cache key/TTL stability to restore expected cache hits
+5. Keep stage-by-stage progress visible in UI for all long jobs
+
+### Quick Verification Script (after next fixes)
+- Start app:
+  - `python -m streamlit run streamlit_app/app.py --server.address 127.0.0.1 --server.port 8516`
+- Validate:
+  - run `Unified Cycle` twice without background AttributeError
+  - switch tabs during heavy jobs without prolonged greying
+  - review `logs/runtime_diag.jsonl` for zero new `ERROR` `bg_job.end` entries
+  - check reduction in repeated long `analyze_open_positions_multi_tf` runs
 
 ## Branch
-- `gui-nightly`
+- `streamlit-nightly` (current)
+- `gui-nightly` (historical)
 
 ## Objective
 - Evolve `nightly/BTC-beta.py` into a robust multi-timeframe quant workflow with safer Fibonacci logic, faster backtesting, and tunable optimization.

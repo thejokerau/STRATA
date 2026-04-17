@@ -4832,3 +4832,43 @@ ob_id": "9b71b454-337c-4599-b042-5057f062dc8f"}
 {"ts": "2026-04-17T13:37:30.247324Z", "component": "streamlit", "event": "bg_job.end", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "a161c987-ac51-49c7-8f30-0f2a79db0a53", "ok": true, "elapsed_sec": 59.01}
 {"ts": "2026-04-17T13:37:30.653053Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
 {"ts": "2026-04-17T13:37:32.799048Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.146, "profile": "Binance", "assets": 10, "total_est_usd": 75.75}
+{"ts": "2026-04-17T13:38:31.268659Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:38:31.267930Z", "component": "streamlit", "event": "bg_job.start", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "a5a09cba-5a56-4f2e-88fe-2f704ff510ec"}
+{"ts": "2026-04-17T13:38:33.778161Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.5095, "profile": "Binance", "assets": 10, "total_est_usd": 75.7}
+{"ts": "2026-04-17T13:38:33.781808Z", "component": "engine_bridge", "event": "list_open_binance_orders.start", "level": "INFO", "profile": "Binance", "symbol": ""}
+{"ts": "2026-04-17T13:38:35.052816Z", "component": "engine_bridge", "event": "list_open_binance_orders.end", "level": "INFO", "ok": true, "elapsed_sec": 1.271, "profile": "Binance", "orders": 9}
+{"ts": "2026-04-17T13:38:35.054276Z", "component": "engine_bridge", "event": "get_trade_ledger.start", "level": "INFO"}
+{"ts": "2026-04-17T13:38:35.056549Z", "component": "engine_bridge", "event": "get_trade_ledger.end", "level": "INFO", "ok": true, "elapsed_sec": 0.0023, "entries": 44, "open_positions": 4, "signal_entries": 0, "execution_entries": 44}
+{"ts": "2026-04-17T13:39:07.792322Z", "component": "streamlit", "event": "bg_job.end", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "a5a09cba-5a56-4f2e-88fe-2f704ff510ec", "ok": true, "elapsed_sec": 36.52}
+{"ts": "2026-04-17T13:39:08.250613Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:39:10.856742Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.6061, "profile": "Binance", "assets": 10, "total_est_usd": 75.71}
+{"ts": "2026-04-17T13:40:08.281368Z", "component": "streamlit", "event": "bg_job.start", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "3b10268e-968a-4757-9203-b2a2f24b0fce"}
+{"ts": "2026-04-17T13:40:08.281685Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:40:10.539378Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.2577, "profile": "Binance", "assets": 10, "total_est_usd": 75.75}
+{"ts": "2026-04-17T13:40:10.542175Z", "component": "engine_bridge", "event": "list_open_binance_orders.start", "level": "INFO", "profile": "Binance", "symbol": ""}
+{"ts": "2026-04-17T13:40:11.622404Z", "component": "engine_bridge", "event": "list_open_binance_orders.end", "level": "INFO", "ok": true, "elapsed_sec": 1.0802, "profile": "Binance", "orders": 9}
+{"ts": "2026-04-17T13:40:11.624279Z", "component": "engine_bridge", "event": "get_trade_ledger.start", "level": "INFO"}
+{"ts": "2026-04-17T13:40:11.626097Z", "component": "engine_bridge", "event": "get_trade_ledger.end", "level": "INFO", "ok": true, "elapsed_sec": 0.0018, "entries": 44, "open_positions": 4, "signal_entries": 0, "execution_entries": 44}
+{"ts": "2026-04-17T13:40:14.271368Z", "component": "streamlit", "event": "bg_job.end", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "3b10268e-968a-4757-9203-b2a2f24b0fce", "ok": true, "elapsed_sec": 5.99}
+{"ts": "2026-04-17T13:40:14.710331Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:40:17.023786Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.3134, "profile": "Binance", "assets": 10, "total_est_usd": 75.73}
+{"ts": "2026-04-17T13:41:15.258794Z", "component": "streamlit", "event": "bg_job.start", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "3b0636ea-0956-4ab6-80ab-b80e09ed7bfd"}
+{"ts": "2026-04-17T13:41:15.259573Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:41:17.851266Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.5916, "profile": "Binance", "assets": 10, "total_est_usd": 75.73}
+{"ts": "2026-04-17T13:41:17.855998Z", "component": "engine_bridge", "event": "list_open_binance_orders.start", "level": "INFO", "profile": "Binance", "symbol": ""}
+{"ts": "2026-04-17T13:41:19.170703Z", "component": "engine_bridge", "event": "list_open_binance_orders.end", "level": "INFO", "ok": true, "elapsed_sec": 1.3147, "profile": "Binance", "orders": 9}
+{"ts": "2026-04-17T13:41:19.171812Z", "component": "engine_bridge", "event": "get_trade_ledger.start", "level": "INFO"}
+{"ts": "2026-04-17T13:41:19.173961Z", "component": "engine_bridge", "event": "get_trade_ledger.end", "level": "INFO", "ok": true, "elapsed_sec": 0.0021, "entries": 44, "open_positions": 4, "signal_entries": 0, "execution_entries": 44}
+{"ts": "2026-04-17T13:41:30.263417Z", "component": "streamlit", "event": "bg_job.end", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "3b0636ea-0956-4ab6-80ab-b80e09ed7bfd", "ok": true, "elapsed_sec": 15.0}
+{"ts": "2026-04-17T13:41:30.694674Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:41:33.166290Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.4716, "profile": "Binance", "assets": 10, "total_est_usd": 75.74}
+{"ts": "2026-04-17T13:42:31.242175Z", "component": "streamlit", "event": "bg_job.start", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "477919b9-532e-448b-a6e6-35ebef9f131b"}
+{"ts": "2026-04-17T13:42:31.242477Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:42:33.560948Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.3185, "profile": "Binance", "assets": 10, "total_est_usd": 75.9}
+{"ts": "2026-04-17T13:42:33.564331Z", "component": "engine_bridge", "event": "list_open_binance_orders.start", "level": "INFO", "profile": "Binance", "symbol": ""}
+{"ts": "2026-04-17T13:42:34.625587Z", "component": "engine_bridge", "event": "list_open_binance_orders.end", "level": "INFO", "ok": true, "elapsed_sec": 1.0612, "profile": "Binance", "orders": 9}
+{"ts": "2026-04-17T13:42:34.626780Z", "component": "engine_bridge", "event": "get_trade_ledger.start", "level": "INFO"}
+{"ts": "2026-04-17T13:42:34.629021Z", "component": "engine_bridge", "event": "get_trade_ledger.end", "level": "INFO", "ok": true, "elapsed_sec": 0.0022, "entries": 44, "open_positions": 4, "signal_entries": 0, "execution_entries": 44}
+{"ts": "2026-04-17T13:43:30.250424Z", "component": "streamlit", "event": "bg_job.end", "level": "INFO", "task": "Global Prefetch Bundle (async)", "job_id": "477919b9-532e-448b-a6e6-35ebef9f131b", "ok": true, "elapsed_sec": 59.01}
+{"ts": "2026-04-17T13:43:30.743517Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.start", "level": "INFO", "profile": "Binance"}
+{"ts": "2026-04-17T13:43:33.102464Z", "component": "engine_bridge", "event": "fetch_binance_portfolio.end", "level": "INFO", "ok": true, "elapsed_sec": 2.359, "profile": "Binance", "assets": 10, "total_est_usd": 75.85}
