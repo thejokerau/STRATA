@@ -48,18 +48,65 @@ if sys.version_info[:2] != (3, 13):
 
 print("STRATA - Crypto & Traditional Risk Dashboard (Nightly Quant)")
 
-DB_PATH = "crypto_data.db"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _assert_writable_dir(path: Path, label: str) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not accessible: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
+    probe = path / ".ctmt_write_probe.tmp"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not writable: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
+
+
+def _resolve_data_root() -> Path:
+    """
+    Canonical data root for runtime artifacts (db, experiments, snapshots).
+    Priority:
+    1) CTMT_DATA_ROOT env var (absolute, or relative to repo root)
+    2) repo root (backward-compatible default)
+    """
+    raw = str(os.environ.get("CTMT_DATA_ROOT", "") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = (REPO_ROOT / p).resolve()
+        else:
+            p = p.resolve()
+    else:
+        p = REPO_ROOT
+    _assert_writable_dir(p, "CTMT data root")
+    return p
+
+
+DATA_ROOT = _resolve_data_root()
+EXPERIMENTS_DIR = DATA_ROOT / "experiments"
+EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = str(DATA_ROOT / "crypto_data.db")
 COINGECKO_KEY = ""
-CHAMPION_REGISTRY_PATH = Path("experiments") / "registry" / "champions.json"
-GROK_OUTPUT_DIR = Path("experiments") / "grok"
-LIVE_SNAPSHOT_DIR = Path("experiments") / "live_snapshots"
+CHAMPION_REGISTRY_PATH = EXPERIMENTS_DIR / "registry" / "champions.json"
+GROK_OUTPUT_DIR = EXPERIMENTS_DIR / "grok"
+LIVE_SNAPSHOT_DIR = EXPERIMENTS_DIR / "live_snapshots"
 LATEST_LIVE_SNAPSHOT_PATH = LIVE_SNAPSHOT_DIR / "latest_live_dashboard.txt"
-BACKTEST_SNAPSHOT_DIR = Path("experiments") / "backtest_snapshots"
+BACKTEST_SNAPSHOT_DIR = EXPERIMENTS_DIR / "backtest_snapshots"
 LATEST_BACKTEST_SNAPSHOT_PATH = BACKTEST_SNAPSHOT_DIR / "latest_backtest.txt"
 USER_PREFS_DIR = Path.home() / ".ctmt"
 AI_PREFS_PATH = USER_PREFS_DIR / "ai_preferences.json"
 AI_SECRETS_PATH = USER_PREFS_DIR / "ai_secrets.json"
-REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 DISPLAY_CCY_MENU = {
@@ -2160,7 +2207,7 @@ def run_comprehensive_auto_research_task() -> None:
     except ValueError:
         optuna_jobs = max(1, min(8, (os.cpu_count() or 1)))
 
-    runs_dir = REPO_ROOT / "experiments" / "runs"
+    runs_dir = EXPERIMENTS_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
     scen_path = runs_dir / f"scenarios_comprehensive_{stamp}.json"

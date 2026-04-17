@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from .engine_bridge import EngineBridge
+from .runtime_diag import RuntimeDiagLogger
 from .state import load_state, save_state
 
 
@@ -84,6 +85,7 @@ class StrataGuiApp:
 
         self.state = load_state()
         self.bridge = EngineBridge(repo_root=self.repo_root)
+        self.diag = RuntimeDiagLogger(self.repo_root)
         self.auto_refresh_job: Optional[str] = None
         self.auto_refresh_running = False
         self.busy = False
@@ -134,6 +136,10 @@ class StrataGuiApp:
         self._build_ui()
         self._refresh_panel_list()
         self._update_run_controls_and_status()
+        try:
+            self._append_task_terminal(f"RUNTIME DIAG {'ON' if bool(self.diag.enabled) else 'OFF'} -> {self.diag.path}")
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         self.nb = ttk.Notebook(self.root)
@@ -380,7 +386,7 @@ class StrataGuiApp:
         self.ai_log_signals_var = tk.BooleanVar(value=True)
         self.pipeline_interval_min_var = tk.StringVar(value="30")
         self.ai_backtest_path = tk.StringVar(
-            value=str(self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt")
+            value=str(self._latest_backtest_snapshot_path())
         )
         ttk.Label(top, text="Date/Time Context").pack(side="left")
         ttk.Entry(top, textvariable=self.ai_datetime, width=24).pack(side="left", padx=4)
@@ -1933,6 +1939,10 @@ class StrataGuiApp:
     def _queue_if_busy(self, task_name: str, starter) -> bool:
         if self.running_tasks >= self._task_limit():
             self.task_queue.append((task_name, starter))
+            try:
+                self.diag.log("tk_gui", "task.queued", task=task_name, running=int(self.running_tasks), queued=int(len(self.task_queue)))
+            except Exception:
+                pass
             self._update_run_controls_and_status()
             self._notify_busy(task_name)
             return True
@@ -1948,6 +1958,17 @@ class StrataGuiApp:
                 "started_at": time.time(),
                 "started_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
+            try:
+                self.diag.log(
+                    "tk_gui",
+                    "task.start",
+                    task_id=int(task_id),
+                    task=task_name or "Task",
+                    running=int(self.running_tasks) + 1,
+                    queued=int(len(self.task_queue)),
+                )
+            except Exception:
+                pass
         else:
             task_id = None
             # Backward-compatible no-op return var for non-start calls.
@@ -2023,6 +2044,18 @@ class StrataGuiApp:
             self._append_task_terminal(
                 f"TASK METRIC name={rec['name']} duration={rec['duration_sec']:.3f}s started={rec['started_ts'] or 'n/a'}"
             )
+            try:
+                self.diag.log(
+                    "tk_gui",
+                    "task.end",
+                    task_id=int(task_id or 0),
+                    task=rec["name"],
+                    ok=True,
+                    elapsed_sec=float(rec["duration_sec"]),
+                    started_ts=str(rec["started_ts"] or ""),
+                )
+            except Exception:
+                pass
         self._set_busy(False, task_name=task_name)
 
     def _update_run_controls_and_status(self) -> None:
@@ -2299,8 +2332,20 @@ class StrataGuiApp:
             return self.bridge
         return EngineBridge(repo_root=self.repo_root)
 
+    def _experiments_dir(self) -> Path:
+        try:
+            return Path(getattr(self.bridge.mod, "EXPERIMENTS_DIR", self.repo_root / "experiments"))
+        except Exception:
+            return self.repo_root / "experiments"
+
+    def _latest_live_snapshot_path(self) -> Path:
+        return self._experiments_dir() / "live_snapshots" / "latest_live_dashboard.txt"
+
+    def _latest_backtest_snapshot_path(self) -> Path:
+        return self._experiments_dir() / "backtest_snapshots" / "latest_backtest.txt"
+
     def _browse_ai_backtest_file(self) -> None:
-        initial_dir = self.repo_root / "experiments" / "backtest_snapshots"
+        initial_dir = self._experiments_dir() / "backtest_snapshots"
         path = filedialog.askopenfilename(
             title="Select Backtest Result File",
             initialdir=str(initial_dir),
@@ -3939,7 +3984,7 @@ class StrataGuiApp:
             live_text = (self.latest_live_output_text or "").strip()
             if live_text:
                 return live_text
-            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            path = self._latest_live_snapshot_path()
             return path.read_text(encoding="utf-8") if path.exists() else ""
         if source == "live_all_panels":
             if self.latest_live_panel_texts:
@@ -3950,10 +3995,10 @@ class StrataGuiApp:
             live_text = (self.latest_live_output_text or "").strip()
             if live_text:
                 return live_text
-            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            path = self._latest_live_snapshot_path()
             return path.read_text(encoding="utf-8") if path.exists() else ""
         if source == "backtest_latest":
-            path = self.repo_root / "experiments" / "backtest_snapshots" / "latest_backtest.txt"
+            path = self._latest_backtest_snapshot_path()
             return path.read_text(encoding="utf-8") if path.exists() else ""
         if source == "backtest_file":
             path = Path(self.ai_backtest_path.get().strip())
@@ -6222,7 +6267,7 @@ class StrataGuiApp:
     def _import_signals_from_live(self) -> None:
         text = (self.latest_live_output_text or "").strip()
         if not text:
-            path = self.repo_root / "experiments" / "live_snapshots" / "latest_live_dashboard.txt"
+            path = self._latest_live_snapshot_path()
             if path.exists():
                 text = path.read_text(encoding="utf-8")
         if not text.strip():

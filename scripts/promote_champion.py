@@ -1,16 +1,54 @@
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPERIMENTS_DIR = ROOT / "experiments"
+
+
+def resolve_data_root() -> Path:
+    raw = str(os.environ.get("CTMT_DATA_ROOT", "") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = (ROOT / p).resolve()
+        else:
+            p = p.resolve()
+    else:
+        p = ROOT
+    return p
+
+
+DATA_ROOT = resolve_data_root()
+EXPERIMENTS_DIR = DATA_ROOT / "experiments"
 CANDIDATES_PATH = EXPERIMENTS_DIR / "candidates.jsonl"
 REGISTRY_DIR = EXPERIMENTS_DIR / "registry"
 CHAMPIONS_PATH = REGISTRY_DIR / "champions.json"
 REPORTS_DIR = EXPERIMENTS_DIR / "reports"
+
+
+def assert_writable_dir(path: Path, label: str) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not accessible: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
+    probe = path / ".ctmt_write_probe.tmp"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not writable: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
 
 
 def utc_now_iso() -> str:
@@ -131,6 +169,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    assert_writable_dir(DATA_ROOT, "CTMT data root")
+    assert_writable_dir(EXPERIMENTS_DIR, "Experiments directory")
     REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
 
     champions = read_champions()

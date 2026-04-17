@@ -137,9 +137,24 @@ Current execution mapping:
 
 ## 6.2 Background Execution Model
 
-Protection run executes in background thread via task queue:
+Heavy workflows execute in background threads via the shared task queue:
 
-- avoids UI freeze / "Not Responding" perception.
+- avoids UI freeze / "Not Responding" perception,
+- surfaces elapsed-time progress during run,
+- keeps tab navigation responsive while jobs continue.
+
+Current async coverage includes:
+
+- Live Dashboard bundle refresh
+- Backtest execution
+- AI analysis and AI follow-up
+- Open-position review (MTF)
+- Protection workflows (`AI+BT` and `Live>BT>AI`)
+- Unified cycle (`Manage + Discover`)
+- Retrofit selected open position to OCO
+- Position graph refresh
+- Auto-research (standard + comprehensive)
+- Global prefetch bundle
 
 ## 7. Performance Architecture
 
