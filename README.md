@@ -98,6 +98,30 @@ Streamlit (streamlit-nightly branch):
 python scripts/run_streamlit.py
 ```
 
+## Data Storage (Uniform Paths)
+
+Runtime data now resolves through a single data root policy used by CLI, GUI, and Streamlit-backed workflows:
+
+- `CTMT_DATA_ROOT` (env var) if set
+- otherwise repository root (backward-compatible default)
+
+Backtests and runtime artifacts are stored under that data root:
+
+- `{DATA_ROOT}/crypto_data.db`
+- `{DATA_ROOT}/experiments/backtest_snapshots/...`
+- `{DATA_ROOT}/experiments/live_snapshots/...`
+- `{DATA_ROOT}/experiments/runs/...`
+- `{DATA_ROOT}/experiments/candidates.jsonl`
+- `{DATA_ROOT}/experiments/registry/champions.json`
+
+If `CTMT_DATA_ROOT` is not writable, STRATA now fails fast with a friendly startup error that tells you to pick a writable location.
+
+Example (PowerShell) to force one shared location across multiple branch worktrees/clones:
+
+```powershell
+$env:CTMT_DATA_ROOT="C:\Users\Jacob\Documents\STRATA_DATA"
+```
+
 This launches an experimental web UI at `http://localhost:8501` with tabs for:
 - Live Dashboard
 - Backtest
@@ -143,6 +167,51 @@ Background concurrency (Streamlit):
 - Async jobs run on a shared background worker pool.
 - Default worker count is `4` (override with env `CTMT_STREAMLIT_BG_WORKERS`).
 - You can change worker count live in `Settings -> Concurrency -> Background workers`.
+- Heavy actions run async with live progress captions:
+  - `Live Dashboard`, `Backtest`, `AI Analysis`, `AI Follow-up`
+  - `Review Open Positions (MTF)`, `Protect Open Positions (AI+BT)`, `Protect Open Positions (Live>BT>AI)`
+  - `Unified Cycle`, `Retrofit Selected Position to OCO`
+  - `Position Graph Refresh`, `Standard Research`, `Comprehensive Research`, `Global Prefetch`
+- Auto-Research tab includes:
+  - active research process table (`job_id`, stage, elapsed time, started time),
+  - in-session past results table (run type, status, duration, summary, output size),
+  - `Clear Research History` control.
+
+Pipeline performance tuning (Streamlit/GUI bridge):
+
+- `CTMT_CACHE_TTL_LIVE_SEC` (default `60`)
+- `CTMT_CACHE_TTL_BACKTEST_SEC` (default `300`)
+- `CTMT_CACHE_TTL_RAW_SEC` (default `120`)
+- `CTMT_CACHE_TTL_INDICATOR_SEC` (default `180`)
+- `CTMT_PIPELINE_BUNDLE_TTL_SEC` (default `300`)
+- `CTMT_PORTFOLIO_BUNDLE_TTL_SEC` (default `6`)
+- `CTMT_GRAPH_ROWS_TTL_SEC` (default `6`)
+
+During `Live > BT > AI > Stage`, the AI tab now shows:
+
+- live stage progress in real time
+- stage timing summary (`LIVE/BACKTEST/AI/STAGE/SUBMIT`)
+- performance breakdown table (cache hits, incremental backtest hit, stage seconds)
+
+Streamlit now includes a sidebar `Perf HUD` with:
+
+- running jobs
+- success rate
+- average and P95 runtime (last 50 samples)
+- highest-latency tasks
+- last pipeline perf breakdown
+
+Runtime diagnostics (app-wide):
+
+- Structured JSONL diagnostics now emit across engine + Tk GUI + Streamlit.
+- Default log path:
+  - `CTMT_DATA_ROOT/logs/runtime_diag.jsonl` (if `CTMT_DATA_ROOT` is set)
+  - otherwise `./logs/runtime_diag.jsonl` under the repo.
+- Environment toggles:
+  - `CTMT_RUNTIME_DIAG=1` enable (default on)
+  - `CTMT_RUNTIME_DIAG=0` disable
+  - `CTMT_RUNTIME_LOG_PATH=<absolute path>` override log file destination
+- Logged events include task/job lifecycle (`start/end/error`), elapsed seconds, and key context (task name, profile, symbol, cache-hit signals where available).
 
 Live Dashboard preset management:
 

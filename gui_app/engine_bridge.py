@@ -27,6 +27,7 @@ from .binance_store import (
     save_binance_secrets,
     save_trade_ledger,
 )
+from .runtime_diag import RuntimeDiagLogger
 
 
 class EngineBridge:
@@ -39,10 +40,13 @@ class EngineBridge:
         self._result_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._raw_data_cache: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
         self._indicator_cache_store: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
-        self._cache_ttl_live_sec = 20.0
-        self._cache_ttl_backtest_sec = 90.0
-        self._cache_ttl_raw_sec = 45.0
-        self._cache_ttl_indicator_sec = 60.0
+        self._cache_ttl_live_sec = float(os.environ.get("CTMT_CACHE_TTL_LIVE_SEC", "60"))
+        self._cache_ttl_backtest_sec = float(os.environ.get("CTMT_CACHE_TTL_BACKTEST_SEC", "300"))
+        self._cache_ttl_raw_sec = float(os.environ.get("CTMT_CACHE_TTL_RAW_SEC", "120"))
+        self._cache_ttl_indicator_sec = float(os.environ.get("CTMT_CACHE_TTL_INDICATOR_SEC", "180"))
+        self._pipeline_bundle_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._backtest_signature_cache: Dict[str, Dict[str, Any]] = {}
+        self.diag = RuntimeDiagLogger(self.repo_root)
         self.mod = self._load_nightly_module()
         self.mod.ensure_table()
 
@@ -72,6 +76,36 @@ class EngineBridge:
     @staticmethod
     def _cache_put(cache: Dict[str, Tuple[float, Any]], key: str, val: Any) -> None:
         cache[key] = (time.time(), val)
+
+    def _diag(self, event: str, level: str = "INFO", run_id: Optional[str] = None, **fields: Any) -> None:
+        try:
+            self.diag.log("engine_bridge", event, level=level, run_id=run_id, **fields)
+        except Exception:
+            return
+
+    @staticmethod
+    def _raw_signature(raw_data: Dict[str, pd.DataFrame]) -> str:
+        rows: List[str] = []
+        for k in sorted(raw_data.keys()):
+            df = raw_data.get(k)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                rows.append(f"{k}|0|")
+                continue
+            try:
+                ts = pd.to_datetime(df.index.max()).isoformat()
+            except Exception:
+                ts = str(df.index.max())
+            rows.append(f"{k}|{len(df)}|{ts}")
+        blob = "||".join(rows)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+    def get_pipeline_bundle_cache(self, key: str, max_age_sec: float = 300.0) -> Optional[Dict[str, Any]]:
+        return self._cache_get(self._pipeline_bundle_cache, key, max(1.0, float(max_age_sec)))
+
+    def put_pipeline_bundle_cache(self, key: str, bundle: Dict[str, Any]) -> None:
+        if not isinstance(bundle, dict):
+            return
+        self._cache_put(self._pipeline_bundle_cache, key, bundle)
 
     def _resolve_tickers(
         self,
@@ -228,6 +262,16 @@ class EngineBridge:
         return universe[:max(1, top_n)]
 
     def run_live_panel(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        t0_diag = self._now()
+        run_id = str(cfg.get("run_id", "") or "").strip() or None
+        self._diag(
+            "run_live_panel.start",
+            run_id=run_id,
+            market=str(cfg.get("market", "crypto")),
+            timeframe=str(cfg.get("timeframe", "1d")),
+            top_n=int(cfg.get("top_n", 20)),
+            name=str(cfg.get("name", "") or ""),
+        )
         ck = self._stable_cache_key(
             "live_result",
             {
@@ -250,6 +294,7 @@ class EngineBridge:
             p["result_cache_hit"] = True
             out["perf"] = p
             out["log"] = ""
+            self._diag("run_live_panel.end", run_id=run_id, ok=True, cache_hit=True, elapsed_sec=round(self._now() - t0_diag, 4))
             return out
 
         stream = io.StringIO()
@@ -264,6 +309,16 @@ class EngineBridge:
         out["perf"] = perf
         if out.get("ok"):
             self._cache_put(self._result_cache, ck, dict(out))
+        self._diag(
+            "run_live_panel.end",
+            run_id=run_id,
+            ok=bool(out.get("ok")),
+            cache_hit=False,
+            elapsed_sec=round(self._now() - t0_diag, 4),
+            error=str(out.get("error", "") or ""),
+            loaded_assets=int(out.get("loaded_assets", 0) or 0),
+            requested_assets=int(out.get("requested_assets", 0) or 0),
+        )
         return out
 
     def _run_live_panel_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -355,6 +410,16 @@ class EngineBridge:
         return trimmed, {"mode": mode, "bars": int(target_bars), "days": int(days) if mode == "days" else None}
 
     def run_backtest(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        t0_diag = self._now()
+        run_id = str(cfg.get("run_id", "") or "").strip() or None
+        self._diag(
+            "run_backtest.start",
+            run_id=run_id,
+            market=str(cfg.get("market", "crypto")),
+            timeframe=str(cfg.get("timeframe", "1d")),
+            months=int(cfg.get("months", 12)),
+            top_n=int(cfg.get("top_n", 20)),
+        )
         ck = self._stable_cache_key(
             "backtest_result",
             {
@@ -390,13 +455,14 @@ class EngineBridge:
             p["result_cache_hit"] = True
             out["perf"] = p
             out["log"] = ""
+            self._diag("run_backtest.end", run_id=run_id, ok=True, cache_hit=True, elapsed_sec=round(self._now() - t0_diag, 4))
             return out
 
         stream = io.StringIO()
         t0 = self._now()
         with self._lock:
             with redirect_stdout(stream), redirect_stderr(stream):
-                out = self._run_backtest_impl(cfg)
+                out = self._run_backtest_impl(cfg, cache_key=ck)
         out["log"] = stream.getvalue()
         perf = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
         perf["total_sec"] = round(self._now() - t0, 4)
@@ -404,9 +470,17 @@ class EngineBridge:
         out["perf"] = perf
         if out.get("ok"):
             self._cache_put(self._result_cache, ck, dict(out))
+        self._diag(
+            "run_backtest.end",
+            run_id=run_id,
+            ok=bool(out.get("ok")),
+            cache_hit=False,
+            elapsed_sec=round(self._now() - t0_diag, 4),
+            error=str(out.get("error", "") or ""),
+        )
         return out
 
-    def _run_backtest_impl(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_backtest_impl(self, cfg: Dict[str, Any], cache_key: str = "") -> Dict[str, Any]:
         is_crypto = str(cfg.get("market", "crypto")).lower() == "crypto"
         timeframe = str(cfg.get("timeframe", "1d"))
         months = int(cfg.get("months", 12))
@@ -430,6 +504,21 @@ class EngineBridge:
         )
         if not raw_data:
             return {"ok": False, "error": "No usable data."}
+
+        data_sig = self._raw_signature(raw_data)
+        prev = self._backtest_signature_cache.get(cache_key, {}) if cache_key else {}
+        if isinstance(prev, dict) and prev.get("data_sig") == data_sig and isinstance(prev.get("result"), dict):
+            cached_res = dict(prev.get("result"))
+            perf_prev = cached_res.get("perf", {}) if isinstance(cached_res.get("perf"), dict) else {}
+            perf_prev.update(
+                {
+                    **perf_raw,
+                    "incremental_backtest_hit": True,
+                    "simulate_sec": 0.0,
+                }
+            )
+            cached_res["perf"] = perf_prev
+            return cached_res
 
         tuned = self.mod.TunedParams(
             position_size=float(cfg.get("position_size", 0.30)),
@@ -501,7 +590,7 @@ class EngineBridge:
             )
 
         trade_df = pd.DataFrame(trades).head(200) if trades else pd.DataFrame()
-        return {
+        out = {
             "ok": True,
             "summary_text": "\n".join(summary),
             "trades_text": trade_df.to_string(index=False) if not trade_df.empty else "No closed trades.",
@@ -510,8 +599,12 @@ class EngineBridge:
                 **perf_raw,
                 **perf_ind,
                 "simulate_sec": sim_sec,
+                "incremental_backtest_hit": False,
             },
         }
+        if cache_key:
+            self._backtest_signature_cache[cache_key] = {"data_sig": data_sig, "result": dict(out)}
+        return out
 
     def build_dashboard_prompt(self, dashboard_text: str, datetime_context: str) -> str:
         with self._lock:
@@ -713,6 +806,14 @@ class EngineBridge:
         prompt_override: Optional[str] = None,
         system_prompt_override: Optional[str] = None,
     ) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag(
+            "run_ai_analysis.start",
+            prompt_override=bool(str(prompt_override or "").strip()),
+            system_prompt_override=bool(str(system_prompt_override or "").strip()),
+            datetime_context=str(datetime_context or ""),
+            source_chars=len(str(dashboard_text or "")),
+        )
         with self._lock:
             stream = io.StringIO()
             prompt = ""
@@ -727,6 +828,13 @@ class EngineBridge:
                     )
                     response = self.mod.call_active_ai_provider(prompt, system_prompt=system_prompt)
             except Exception as exc:
+                self._diag(
+                    "run_ai_analysis.end",
+                    level="ERROR",
+                    ok=False,
+                    elapsed_sec=round(self._now() - t0_diag, 4),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 return {
                     "ok": False,
                     "prompt": prompt,
@@ -735,13 +843,20 @@ class EngineBridge:
                     "error": f"{type(exc).__name__}: {exc}",
                     "log": stream.getvalue(),
                 }
-            return {
+            out = {
                 "ok": bool(response),
                 "prompt": prompt,
                 "response": response or "",
                 "system_prompt": system_prompt,
                 "log": stream.getvalue(),
             }
+            self._diag(
+                "run_ai_analysis.end",
+                ok=bool(out.get("ok")),
+                elapsed_sec=round(self._now() - t0_diag, 4),
+                response_chars=len(str(out.get("response", "") or "")),
+            )
+            return out
 
     def _default_binance_endpoint(self) -> str:
         return "https://api.binance.com"
@@ -1256,24 +1371,30 @@ class EngineBridge:
             }
 
     def fetch_binance_portfolio(self, profile_name: Optional[str] = None) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag("fetch_binance_portfolio.start", profile=str(profile_name or ""))
         with self._lock:
             prefs = load_binance_preferences()
             secrets = load_binance_secrets()
             profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
             if not isinstance(profiles, dict) or not profiles:
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error="No Binance profiles configured.")
                 return {"ok": False, "error": "No Binance profiles configured."}
             active = str(profile_name or prefs.get("active_profile", "") or "").strip()
             if not active or active not in profiles:
                 active = next(iter(profiles.keys()))
             profile = profiles.get(active, {})
             if not isinstance(profile, dict):
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=f"Profile not found: {active}")
                 return {"ok": False, "error": f"Profile not found: {active}"}
             creds = self._resolve_binance_credentials(profile, secrets)
             if not creds["api_key"] or not creds["api_secret"]:
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error="Missing API key/secret")
                 return {"ok": False, "error": f"Missing API key/secret ({creds['key_source']}, {creds['secret_source']})."}
             endpoint = str(profile.get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
             acct = self._signed_binance_get(endpoint, "/api/v3/account", creds["api_key"], creds["api_secret"], params={})
             if not acct.get("ok"):
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(acct.get("error", "account request failed")))
                 return {"ok": False, "status": acct.get("status"), "error": acct.get("error", "account request failed")}
 
             try:
@@ -1281,6 +1402,7 @@ class EngineBridge:
                 tick.raise_for_status()
                 prices = tick.json()
             except Exception as e:
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=f"Failed to fetch prices: {e}")
                 return {"ok": False, "error": f"Failed to fetch prices: {e}"}
 
             price_map: Dict[str, float] = {}
@@ -1331,12 +1453,14 @@ class EngineBridge:
                     }
                 )
             rows = sorted(rows, key=lambda r: float(r.get("est_usd", 0.0)), reverse=True)
-            return {
+            out = {
                 "ok": True,
                 "profile": active,
                 "total_est_usd": round(total_usd, 2),
                 "balances": rows,
             }
+            self._diag("fetch_binance_portfolio.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), profile=active, assets=len(rows), total_est_usd=round(total_usd, 2))
+            return out
 
     def _resolve_active_binance_profile(self, profile_name: Optional[str] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, str]], Optional[str]]:
         prefs = load_binance_preferences()
@@ -1356,6 +1480,8 @@ class EngineBridge:
         return active, profile, creds, None
 
     def list_open_binance_orders(self, profile_name: Optional[str] = None, symbol: str = "") -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag("list_open_binance_orders.start", profile=str(profile_name or ""), symbol=str(symbol or ""))
         with self._lock:
             active, profile, creds, err = self._resolve_active_binance_profile(profile_name)
             if err:
@@ -1389,7 +1515,9 @@ class EngineBridge:
                             "updateTime": int(o.get("updateTime", 0) or 0),
                         }
                     )
-            return {"ok": True, "profile": active, "orders": rows}
+            ret = {"ok": True, "profile": active, "orders": rows}
+            self._diag("list_open_binance_orders.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), profile=active, orders=len(rows))
+            return ret
 
     def cancel_binance_order(self, symbol: str, order_id: int, profile_name: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
@@ -1426,6 +1554,15 @@ class EngineBridge:
         stop_price: Optional[float] = None,
         time_in_force: str = "GTC",
     ) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag(
+            "submit_binance_order.start",
+            symbol=str(symbol or ""),
+            side=str(side or ""),
+            order_type=str(order_type or ""),
+            quantity=float(quantity or 0.0),
+            profile=str(profile_name or ""),
+        )
         with self._lock:
             v = self.validate_binance_order(
                 symbol=symbol,
@@ -1480,8 +1617,9 @@ class EngineBridge:
                 params=params,
             )
             if not out.get("ok"):
+                self._diag("submit_binance_order.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(out.get("error", "order submit failed")))
                 return {"ok": False, "status": out.get("status"), "error": out.get("error", "order submit failed")}
-            return {
+            ret = {
                 "ok": True,
                 "profile": active,
                 "data": out.get("data", {}),
@@ -1489,6 +1627,8 @@ class EngineBridge:
                 "normalized_price": px_norm,
                 "normalized_stop_price": sp_norm,
             }
+            self._diag("submit_binance_order.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), profile=active, symbol=sym, order_type=t, quantity=qty)
+            return ret
 
     def submit_binance_oco_sell(
         self,
@@ -1500,6 +1640,15 @@ class EngineBridge:
         profile_name: Optional[str] = None,
         stop_limit_time_in_force: str = "GTC",
     ) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag(
+            "submit_binance_oco_sell.start",
+            symbol=str(symbol or ""),
+            quantity=float(quantity or 0.0),
+            take_profit_price=float(take_profit_price or 0.0),
+            stop_price=float(stop_price or 0.0),
+            profile=str(profile_name or ""),
+        )
         with self._lock:
             sym = str(symbol).strip().upper()
             if not sym:
@@ -1565,8 +1714,9 @@ class EngineBridge:
                 params=params,
             )
             if not out.get("ok"):
+                self._diag("submit_binance_oco_sell.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(out.get("error", "OCO submit failed")))
                 return {"ok": False, "status": out.get("status"), "error": out.get("error", "OCO submit failed")}
-            return {
+            ret = {
                 "ok": True,
                 "profile": active,
                 "data": out.get("data", {}),
@@ -1575,6 +1725,8 @@ class EngineBridge:
                 "normalized_stop_price": sp_norm,
                 "normalized_stop_limit_price": slp_norm,
             }
+            self._diag("submit_binance_oco_sell.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), profile=active, symbol=sym, quantity=nq)
+            return ret
 
     def analyze_open_positions_multi_tf(
         self,
@@ -1582,6 +1734,13 @@ class EngineBridge:
         timeframes: Optional[List[str]] = None,
         display_currency: str = "USD",
     ) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag(
+            "analyze_open_positions_multi_tf.start",
+            profile=str(profile_name or ""),
+            timeframes=",".join([str(x) for x in (timeframes or [])]),
+            display_currency=str(display_currency or "USD"),
+        )
         with self._lock:
             tf_list = [str(x).strip().lower() for x in (timeframes or ["4h", "8h", "12h", "1d"]) if str(x).strip()]
             if not tf_list:
@@ -1592,10 +1751,13 @@ class EngineBridge:
                 ledger = default_trade_ledger()
             open_positions = ledger.get("open_positions", {})
             if not isinstance(open_positions, dict) or not open_positions:
-                return {"ok": True, "rows": [], "note": "No open positions in ledger."}
+                ret = {"ok": True, "rows": [], "note": "No open positions in ledger."}
+                self._diag("analyze_open_positions_multi_tf.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), rows=0, note="no_open_positions")
+                return ret
 
             _, profile, _, err = self._resolve_active_binance_profile(profile_name)
             if err:
+                self._diag("analyze_open_positions_multi_tf.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(err))
                 return {"ok": False, "error": err}
             endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
 
@@ -1660,7 +1822,9 @@ class EngineBridge:
                 )
 
             rows = sorted(rows, key=lambda r: int(r.get("sell_votes", 0)), reverse=True)
-            return {"ok": True, "rows": rows}
+            ret = {"ok": True, "rows": rows}
+            self._diag("analyze_open_positions_multi_tf.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), rows=len(rows))
+            return ret
 
     def evaluate_agent_policy(
         self,
@@ -1793,9 +1957,18 @@ class EngineBridge:
         max_trades_per_symbol: int = 200,
         display_currency: str = "USD",
     ) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag(
+            "reconcile_binance_fills.start",
+            profile=str(profile_name or ""),
+            symbol_count=len(symbols or []),
+            max_trades_per_symbol=int(max_trades_per_symbol or 200),
+            display_currency=str(display_currency or "USD"),
+        )
         with self._lock:
             active, profile, creds, err = self._resolve_active_binance_profile(profile_name)
             if err:
+                self._diag("reconcile_binance_fills.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(err))
                 return {"ok": False, "error": err}
             endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
             syms_in = symbols or []
@@ -1808,6 +1981,7 @@ class EngineBridge:
                 seen_syms.add(sym)
                 syms.append(sym)
             if not syms:
+                self._diag("reconcile_binance_fills.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error="No symbols provided for reconciliation.")
                 return {"ok": False, "error": "No symbols provided for reconciliation."}
 
             ledger = load_trade_ledger()
@@ -2038,7 +2212,7 @@ class EngineBridge:
             ledger["open_positions"] = open_positions
             ledger["activity_guard"] = activity_guard
             save_trade_ledger(ledger)
-            return {
+            ret = {
                 "ok": True,
                 "profile": active,
                 "symbols": syms,
@@ -2047,8 +2221,22 @@ class EngineBridge:
                 "added_entries": added,
                 "errors": errors[:20],
             }
+            self._diag(
+                "reconcile_binance_fills.end",
+                ok=True,
+                elapsed_sec=round(self._now() - t0_diag, 4),
+                profile=active,
+                symbols=len(syms),
+                fetched_trades=int(fetched),
+                added_entries=int(added),
+                duplicates_skipped=int(duplicates),
+                error_count=len(errors[:20]),
+            )
+            return ret
 
     def get_trade_ledger(self) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag("get_trade_ledger.start")
         with self._lock:
             ledger = load_trade_ledger()
             if not isinstance(ledger, dict):
@@ -2098,12 +2286,22 @@ class EngineBridge:
                 save_trade_ledger(ledger)
             signal_entries = [x for x in fixed_entries if not bool(x.get("is_execution", False))]
             execution_entries = [x for x in fixed_entries if bool(x.get("is_execution", False))]
-            return {
+            ret = {
                 "ok": True,
                 "ledger": ledger,
                 "signal_entries": signal_entries,
                 "execution_entries": execution_entries,
             }
+            self._diag(
+                "get_trade_ledger.end",
+                ok=True,
+                elapsed_sec=round(self._now() - t0_diag, 4),
+                entries=len(fixed_entries),
+                open_positions=len(cleaned),
+                signal_entries=len(signal_entries),
+                execution_entries=len(execution_entries),
+            )
+            return ret
 
     def prune_signal_only_history(self, keep_last_signals: int = 0) -> Dict[str, Any]:
         with self._lock:
@@ -2318,7 +2516,8 @@ class EngineBridge:
         return self._run_subprocess(cmd)
 
     def run_comprehensive_research(self, scenarios: List[Dict[str, Any]], optuna_trials: int = 10, optuna_jobs: int = 4) -> Dict[str, Any]:
-        runs_dir = self.repo_root / "experiments" / "runs"
+        exp_dir = Path(getattr(self.mod, "EXPERIMENTS_DIR", self.repo_root / "experiments"))
+        runs_dir = exp_dir / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
         stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
         scen_path = runs_dir / f"gui_scenarios_comprehensive_{stamp}.json"
@@ -2345,6 +2544,8 @@ class EngineBridge:
         return out
 
     def _run_subprocess(self, cmd: List[str]) -> Dict[str, Any]:
+        t0_diag = self._now()
+        self._diag("run_subprocess.start", cmd=" ".join(cmd))
         try:
             proc = subprocess.run(
                 cmd,
@@ -2355,12 +2556,21 @@ class EngineBridge:
                 encoding="utf-8",
                 errors="replace",
             )
-            return {
+            ret = {
                 "ok": proc.returncode == 0,
                 "returncode": proc.returncode,
                 "stdout": (proc.stdout or "").strip(),
                 "stderr": (proc.stderr or "").strip(),
                 "cmd": " ".join(cmd),
             }
+            self._diag(
+                "run_subprocess.end",
+                ok=bool(ret.get("ok")),
+                elapsed_sec=round(self._now() - t0_diag, 4),
+                returncode=int(proc.returncode),
+                cmd=" ".join(cmd),
+            )
+            return ret
         except Exception as e:
+            self._diag("run_subprocess.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), returncode=-1, cmd=" ".join(cmd), error=str(e))
             return {"ok": False, "returncode": -1, "stdout": "", "stderr": str(e), "cmd": " ".join(cmd)}

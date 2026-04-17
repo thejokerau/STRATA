@@ -5,6 +5,7 @@ import os
 import json
 import re
 import time
+import hashlib
 import tempfile
 import concurrent.futures
 import uuid
@@ -19,6 +20,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from gui_app.engine_bridge import EngineBridge
+from gui_app.runtime_diag import RuntimeDiagLogger
 
 # Streamlit + numba/pandas_ta safety for dynamic-loader contexts.
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
@@ -39,6 +41,7 @@ def get_bridge(repo_root: str) -> EngineBridge:
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 bridge = get_bridge(REPO_ROOT)
+diag = RuntimeDiagLogger(Path(REPO_ROOT))
 _DEFAULT_BG_WORKERS = max(1, min(16, int(os.environ.get("CTMT_STREAMLIT_BG_WORKERS", "4") or "4")))
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_DEFAULT_BG_WORKERS)
 EXECUTOR_WORKERS = _DEFAULT_BG_WORKERS
@@ -117,23 +120,48 @@ def _save_live_profiles(profiles: Dict[str, Any]) -> Tuple[bool, str]:
     return False, " | ".join(errs[-3:])
 
 
-def _run_live_panels_sync(configs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _run_live_panels_sync(configs: List[Dict[str, Any]], bridge_obj: Optional[EngineBridge] = None) -> Dict[str, Any]:
+    br = bridge_obj or bridge
     combined: List[str] = []
     runs: List[Dict[str, str]] = []
     errors: List[str] = []
+    perf_rows: List[Dict[str, Any]] = []
+    total_sec = 0.0
     for cfg in configs:
         tf = str(cfg.get("timeframe", ""))
-        res = bridge.run_live_panel(cfg)
+        res = br.run_live_panel(cfg)
         if not res.get("ok"):
             errors.append(f"{tf}: {res.get('error', 'Live run failed')}")
             continue
+        pf = res.get("perf", {}) if isinstance(res.get("perf"), dict) else {}
+        panel_name = str(cfg.get("name", f"panel-{tf}"))
+        psec = float(pf.get("total_sec", 0.0) or 0.0)
+        total_sec += psec
+        perf_rows.append(
+            {
+                "stage": "LIVE",
+                "panel": panel_name,
+                "sec": round(psec, 3),
+                "result_cache_hit": bool(pf.get("result_cache_hit", False)),
+                "raw_cache_hit": bool(pf.get("raw_cache_hit", False)),
+                "indicator_cache_hit": bool(pf.get("indicator_cache_hit", False)),
+                "assets": int(res.get("loaded_assets", 0) or 0),
+            }
+        )
         t = res.get("table_text", "")
         b = res.get("breakdown_text", "")
         c = res.get("context_text", "")
         block = "\n\n".join([str(t), str(b), str(c)]).strip()
         runs.append({"name": str(cfg.get("name", f"panel-{tf}")), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "text": block})
         combined.append(block)
-    return {"ok": bool(combined), "runs": runs, "combined_text": "\n\n".join(combined).strip(), "errors": errors}
+    return {
+        "ok": bool(combined),
+        "runs": runs,
+        "combined_text": "\n\n".join(combined).strip(),
+        "errors": errors,
+        "perf_rows": perf_rows,
+        "perf_summary": {"live_total_sec": round(total_sec, 3), "live_panels": len(perf_rows)},
+    }
 
 
 def _expand_live_cfgs(live_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -152,9 +180,15 @@ def _expand_live_cfgs(live_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def _run_live_cfg_bundle_sync(live_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _run_live_cfg_bundle_sync(live_cfg: Dict[str, Any], bridge_obj: Optional[EngineBridge] = None) -> Dict[str, Any]:
     cfgs = _expand_live_cfgs(live_cfg)
-    return _run_live_panels_sync(cfgs)
+    return _run_live_panels_sync(cfgs, bridge_obj=bridge_obj)
+
+
+def _pipeline_bundle_cache_key(live_cfg: Dict[str, Any], bt_cfg: Dict[str, Any]) -> str:
+    payload = {"live": live_cfg, "bt": bt_cfg}
+    blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
 def _build_live_cfg_from_state_or_profile(profile_name: str = "") -> Dict[str, Any]:
@@ -200,26 +234,117 @@ def _build_live_cfg_from_state_or_profile(profile_name: str = "") -> Dict[str, A
     }
 
 
-def _run_full_pipeline_sync(live_cfg: Dict[str, Any], bt_cfg: Dict[str, Any], dt_context: str) -> Dict[str, Any]:
-    live_res = _run_live_cfg_bundle_sync(live_cfg)
-    if not live_res.get("ok"):
-        return {"ok": False, "stage": "live", "error": str(live_res.get("error", "Live failed"))}
-    live_block = str(live_res.get("combined_text", "") or "").strip()
-    bt_res = bridge.run_backtest(bt_cfg)
-    if not bt_res.get("ok"):
-        return {"ok": False, "stage": "backtest", "error": str(bt_res.get("error", "Backtest failed")), "live_block": live_block}
-    bt_summary = str(bt_res.get("summary_text", "") or "")
-    bt_trades = str(bt_res.get("trade_text", "") or "")
+def _run_full_pipeline_sync(
+    live_cfg: Dict[str, Any],
+    bt_cfg: Dict[str, Any],
+    dt_context: str,
+    bridge_obj: Optional[EngineBridge] = None,
+) -> Dict[str, Any]:
+    br = bridge_obj or bridge
+    stage_events: List[Dict[str, Any]] = []
+    perf_rows: List[Dict[str, Any]] = []
+    bundle_ttl = float(os.environ.get("CTMT_PIPELINE_BUNDLE_TTL_SEC", "300") or "300")
+    bundle_key = _pipeline_bundle_cache_key(live_cfg, bt_cfg)
+    live_block = ""
+    bt_summary = ""
+    bt_trades = ""
+
+    cached_bundle = br.get_pipeline_bundle_cache(bundle_key, max_age_sec=bundle_ttl)
+    if isinstance(cached_bundle, dict):
+        live_block = str(cached_bundle.get("live_block", "") or "")
+        bt_summary = str(cached_bundle.get("bt_summary", "") or "")
+        bt_trades = str(cached_bundle.get("bt_trades", "") or "")
+        cached_perf = cached_bundle.get("perf_rows", []) if isinstance(cached_bundle.get("perf_rows"), list) else []
+        perf_rows.extend(cached_perf)
+        stage_events.append({"stage": "LIVE", "status": "done", "sec": 0.0, "note": "bundle-cache-hit"})
+        stage_events.append({"stage": "BACKTEST", "status": "done", "sec": 0.0, "note": "bundle-cache-hit"})
+        print("[STAGE] LIVE done (0.00s): bundle-cache-hit", flush=True)
+        print("[STAGE] BACKTEST done (0.00s): bundle-cache-hit", flush=True)
+    else:
+        t_live0 = time.time()
+        print("[STAGE] LIVE start", flush=True)
+        live_res = _run_live_cfg_bundle_sync(live_cfg, bridge_obj=br)
+        live_sec = round(time.time() - t_live0, 3)
+        if not live_res.get("ok"):
+            stage_events.append({"stage": "LIVE", "status": "failed", "sec": live_sec, "note": str(live_res.get("error", "Live failed"))})
+            print(f"[STAGE] LIVE failed ({live_sec:.2f}s): {live_res.get('error', 'Live failed')}", flush=True)
+            return {"ok": False, "stage": "live", "error": str(live_res.get("error", "Live failed")), "stage_events": stage_events}
+        stage_events.append({"stage": "LIVE", "status": "done", "sec": live_sec, "note": ""})
+        print(f"[STAGE] LIVE done ({live_sec:.2f}s)", flush=True)
+        live_block = str(live_res.get("combined_text", "") or "").strip()
+        perf_rows.extend(live_res.get("perf_rows", []) if isinstance(live_res.get("perf_rows"), list) else [])
+
+        t_bt0 = time.time()
+        print("[STAGE] BACKTEST start", flush=True)
+        bt_res = br.run_backtest(bt_cfg)
+        bt_sec = round(time.time() - t_bt0, 3)
+        if not bt_res.get("ok"):
+            stage_events.append({"stage": "BACKTEST", "status": "failed", "sec": bt_sec, "note": str(bt_res.get("error", "Backtest failed"))})
+            print(f"[STAGE] BACKTEST failed ({bt_sec:.2f}s): {bt_res.get('error', 'Backtest failed')}", flush=True)
+            return {
+                "ok": False,
+                "stage": "backtest",
+                "error": str(bt_res.get("error", "Backtest failed")),
+                "live_block": live_block,
+                "stage_events": stage_events,
+                "perf_rows": perf_rows,
+            }
+        stage_events.append({"stage": "BACKTEST", "status": "done", "sec": bt_sec, "note": ""})
+        print(f"[STAGE] BACKTEST done ({bt_sec:.2f}s)", flush=True)
+        bt_summary = str(bt_res.get("summary_text", "") or "")
+        bt_trades = str(bt_res.get("trades_text", bt_res.get("trade_text", "")) or "")
+        bt_perf = bt_res.get("perf", {}) if isinstance(bt_res.get("perf"), dict) else {}
+        perf_rows.append(
+            {
+                "stage": "BACKTEST",
+                "panel": str(bt_cfg.get("timeframe", "1d")),
+                "sec": round(float(bt_perf.get("total_sec", bt_perf.get("simulate_sec", bt_sec)) or bt_sec), 3),
+                "result_cache_hit": bool(bt_perf.get("result_cache_hit", False)),
+                "raw_cache_hit": bool(bt_perf.get("raw_cache_hit", False)),
+                "indicator_cache_hit": bool(bt_perf.get("indicator_cache_hit", False)),
+                "incremental_backtest_hit": bool(bt_perf.get("incremental_backtest_hit", False)),
+                "assets": int(bt_perf.get("loaded_assets", 0) or 0),
+            }
+        )
+        br.put_pipeline_bundle_cache(
+            bundle_key,
+            {
+                "live_block": live_block,
+                "bt_summary": bt_summary,
+                "bt_trades": bt_trades,
+                "perf_rows": perf_rows,
+            },
+        )
+
     src = "\n\n".join([live_block, bt_summary, bt_trades]).strip()
-    ai_res = bridge.run_ai_analysis(src, dt_context)
+    t_ai0 = time.time()
+    print("[STAGE] AI start", flush=True)
+    ai_res = br.run_ai_analysis(src, dt_context)
+    ai_sec = round(time.time() - t_ai0, 3)
     if not ai_res.get("ok"):
-        return {"ok": False, "stage": "ai", "error": str(ai_res.get("error", "AI failed")), "live_block": live_block, "bt_summary": bt_summary, "bt_trades": bt_trades}
+        stage_events.append({"stage": "AI", "status": "failed", "sec": ai_sec, "note": str(ai_res.get("error", "AI failed"))})
+        print(f"[STAGE] AI failed ({ai_sec:.2f}s): {ai_res.get('error', 'AI failed')}", flush=True)
+        return {
+            "ok": False,
+            "stage": "ai",
+            "error": str(ai_res.get("error", "AI failed")),
+            "live_block": live_block,
+            "bt_summary": bt_summary,
+            "bt_trades": bt_trades,
+            "stage_events": stage_events,
+            "perf_rows": perf_rows,
+        }
+    stage_events.append({"stage": "AI", "status": "done", "sec": ai_sec, "note": ""})
+    print(f"[STAGE] AI done ({ai_sec:.2f}s)", flush=True)
+
     return {
         "ok": True,
         "live_block": live_block,
         "bt_summary": bt_summary,
         "bt_trades": bt_trades,
         "ai_response": str(ai_res.get("response", "") or ""),
+        "stage_events": stage_events,
+        "perf_rows": perf_rows,
     }
 
 
@@ -400,6 +525,7 @@ def _init_state() -> None:
         "last_review_df": pd.DataFrame(),
         "last_graph_df": pd.DataFrame(),
         "last_research_text": "",
+        "research_history": [],
         "live_profile_name": "default",
         "pending_live_profile_apply": None,
         "bg_jobs": {},
@@ -432,10 +558,60 @@ def _init_state() -> None:
         "task_monitor_auto_refresh": False,
         "bg_max_workers": int(EXECUTOR_WORKERS),
         "bg_prefetch_running_id": "",
+        "last_pipeline_stage_events": [],
+        "last_pipeline_perf_rows": [],
+        "perf_history": [],
+        "perf_hud_enabled": True,
+        "session_cache": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def _session_cache_get(cache_key: str, max_age_sec: float) -> Any:
+    cache = st.session_state.get("session_cache", {})
+    if not isinstance(cache, dict):
+        return None
+    rec = cache.get(str(cache_key))
+    if not isinstance(rec, dict):
+        return None
+    ts = float(rec.get("ts", 0.0) or 0.0)
+    if ts <= 0 or (time.time() - ts) > float(max_age_sec):
+        return None
+    return rec.get("value")
+
+
+def _session_cache_put(cache_key: str, value: Any) -> None:
+    cache = st.session_state.get("session_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[str(cache_key)] = {"ts": time.time(), "value": value}
+    # keep cache bounded
+    if len(cache) > 128:
+        try:
+            keys = sorted(cache.keys(), key=lambda k: float(cache[k].get("ts", 0.0) or 0.0))
+            for k in keys[:-96]:
+                cache.pop(k, None)
+        except Exception:
+            pass
+    st.session_state.session_cache = cache
+
+
+def _record_perf_event(task: str, sec: float, ok: bool, meta: Optional[Dict[str, Any]] = None) -> None:
+    hist = st.session_state.get("perf_history", [])
+    if not isinstance(hist, list):
+        hist = []
+    row = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "task": str(task),
+        "sec": round(float(sec or 0.0), 3),
+        "ok": bool(ok),
+    }
+    if isinstance(meta, dict):
+        row.update(meta)
+    hist.append(row)
+    st.session_state.perf_history = hist[-1000:]
 
 
 def _log(msg: str) -> None:
@@ -460,6 +636,14 @@ def _set_bg_executor_workers(max_workers: int) -> None:
 
 
 def _fetch_portfolio_bundle_payload(profile: str, include_review: bool = False) -> Dict[str, Any]:
+    ttl = float(os.environ.get("CTMT_PORTFOLIO_BUNDLE_TTL_SEC", "6") or "6")
+    key = f"pf_bundle::{str(profile)}::{int(bool(include_review))}"
+    cached = _session_cache_get(key, max_age_sec=max(1.0, ttl))
+    if isinstance(cached, dict):
+        out = dict(cached)
+        out["cache_hit"] = True
+        return out
+    t0 = time.time()
     out_pf = bridge.fetch_binance_portfolio(profile_name=profile)
     out_oo = bridge.list_open_binance_orders(profile_name=profile)
     out_led = bridge.get_trade_ledger()
@@ -468,7 +652,7 @@ def _fetch_portfolio_bundle_payload(profile: str, include_review: bool = False) 
         out_rev = bridge.analyze_open_positions_multi_tf(
             profile_name=profile, timeframes=["4h", "8h", "12h", "1d"], display_currency="USD"
         )
-    return {
+    out = {
         "ok": bool(out_pf.get("ok") and out_oo.get("ok") and out_led.get("ok") and (out_rev.get("ok") if include_review else True)),
         "profile": str(profile),
         "include_review": bool(include_review),
@@ -476,7 +660,11 @@ def _fetch_portfolio_bundle_payload(profile: str, include_review: bool = False) 
         "orders": out_oo,
         "ledger": out_led,
         "review": out_rev,
+        "cache_hit": False,
+        "sec": round(time.time() - t0, 3),
     }
+    _session_cache_put(key, out)
+    return out
 
 
 def _apply_portfolio_bundle_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -519,6 +707,9 @@ class _QueueWriter:
         txt = str(s or "")
         if not txt:
             return 0
+        # Treat carriage-return progress updates as line boundaries so logs stream
+        # instead of appearing in one large burst at task completion.
+        txt = txt.replace("\r", "\n")
         self._buf += txt
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
@@ -526,6 +717,16 @@ class _QueueWriter:
             if line.strip():
                 try:
                     self.q.put_nowait(line)
+                except Exception:
+                    pass
+        # If producer prints without newline for a long time, emit a chunk so UI
+        # still shows forward progress.
+        if len(self._buf) >= 240:
+            chunk = self._buf
+            self._buf = ""
+            if chunk.strip():
+                try:
+                    self.q.put_nowait(chunk.strip())
                 except Exception:
                     pass
         return len(txt)
@@ -565,6 +766,10 @@ def _run_task(name: str, fn):
     t0 = time.time()
     _log(f"START {name}")
     try:
+        diag.log("streamlit", "task.start", task=name)
+    except Exception:
+        pass
+    try:
         cap = io.StringIO()
         with redirect_stdout(cap), redirect_stderr(cap):
             out = fn()
@@ -576,7 +781,12 @@ def _run_task(name: str, fn):
         dt = time.time() - t0
         st.session_state.task_history.append({"task": name, "sec": round(dt, 3), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": True})
         st.session_state.task_history = st.session_state.task_history[-300:]
+        _record_perf_event(task=name, sec=dt, ok=True)
         _log(f"DONE {name} ({dt:.2f}s)")
+        try:
+            diag.log("streamlit", "task.end", task=name, ok=True, elapsed_sec=round(dt, 4))
+        except Exception:
+            pass
         return out
     except Exception as exc:
         try:
@@ -590,7 +800,12 @@ def _run_task(name: str, fn):
         dt = time.time() - t0
         st.session_state.task_history.append({"task": name, "sec": round(dt, 3), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": False})
         st.session_state.task_history = st.session_state.task_history[-300:]
+        _record_perf_event(task=name, sec=dt, ok=False, meta={"error_type": type(exc).__name__})
         _log(f"DONE {name} (error: {type(exc).__name__}: {exc})")
+        try:
+            diag.log("streamlit", "task.end", level="ERROR", task=name, ok=False, elapsed_sec=round(dt, 4), error=f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
         raise
 
 
@@ -621,12 +836,17 @@ def _start_bg_job(name: str, fn) -> str:
     }
     st.session_state.bg_jobs = jobs
     _log(f"START {name} [job={job_id[:8]}]")
+    try:
+        diag.log("streamlit", "bg_job.start", task=name, job_id=job_id)
+    except Exception:
+        pass
     return job_id
 
 
-def _poll_bg_jobs() -> None:
+def _poll_bg_jobs() -> Dict[str, bool]:
     jobs = st.session_state.bg_jobs if isinstance(st.session_state.bg_jobs, dict) else {}
     dirty = False
+    completed = False
     for jid, j in list(jobs.items()):
         if not isinstance(j, dict):
             continue
@@ -644,6 +864,7 @@ def _poll_bg_jobs() -> None:
             jobs[jid] = j
             continue
         dirty = True
+        completed = True
         try:
             res = fut.result()
             _drain_job_log_queue(j)
@@ -651,6 +872,17 @@ def _poll_bg_jobs() -> None:
             j["result"] = res
             j["state"] = "DONE"
             _log(f"DONE {j.get('name', 'job')} [job={jid[:8]}]")
+            try:
+                diag.log(
+                    "streamlit",
+                    "bg_job.end",
+                    task=str(j.get("name", "job")),
+                    job_id=str(jid),
+                    ok=True,
+                    elapsed_sec=float(j.get("elapsed_sec", 0.0) or 0.0),
+                )
+            except Exception:
+                pass
             st.session_state.task_history.append(
                 {
                     "task": str(j.get("name", "job")),
@@ -659,12 +891,26 @@ def _poll_bg_jobs() -> None:
                     "ok": True,
                 }
             )
+            _record_perf_event(task=str(j.get("name", "job")), sec=float(j.get("elapsed_sec", 0.0) or 0.0), ok=True)
         except Exception as exc:
             _drain_job_log_queue(j)
             j["status"] = "failed"
             j["error"] = f"{type(exc).__name__}: {exc}"
             j["state"] = "FAILED"
             _log(f"DONE {j.get('name', 'job')} [job={jid[:8]}] error={j['error']}")
+            try:
+                diag.log(
+                    "streamlit",
+                    "bg_job.end",
+                    level="ERROR",
+                    task=str(j.get("name", "job")),
+                    job_id=str(jid),
+                    ok=False,
+                    elapsed_sec=float(j.get("elapsed_sec", 0.0) or 0.0),
+                    error=str(j.get("error", "")),
+                )
+            except Exception:
+                pass
             st.session_state.task_history.append(
                 {
                     "task": str(j.get("name", "job")),
@@ -673,10 +919,52 @@ def _poll_bg_jobs() -> None:
                     "ok": False,
                 }
             )
+            _record_perf_event(
+                task=str(j.get("name", "job")),
+                sec=float(j.get("elapsed_sec", 0.0) or 0.0),
+                ok=False,
+                meta={"error": str(j.get("error", ""))},
+            )
         j["_log_queue"] = None
         jobs[jid] = j
     if dirty:
         st.session_state.bg_jobs = jobs
+    return {"dirty": bool(dirty), "completed": bool(completed)}
+
+
+def _running_bg_job_count() -> int:
+    jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+    n = 0
+    for j in jobs.values():
+        if isinstance(j, dict) and str(j.get("status", "")).lower() == "running":
+            n += 1
+    return n
+
+
+def _get_bg_job(job_id: str) -> Dict[str, Any]:
+    jid = str(job_id or "").strip()
+    if not jid:
+        return {}
+    jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+    if not isinstance(jobs, dict):
+        return {}
+    j = jobs.get(jid, {})
+    return j if isinstance(j, dict) else {}
+
+
+def _consume_bg_job(state_key: str) -> Dict[str, Any]:
+    jid = str(st.session_state.get(state_key, "") or "").strip()
+    if not jid:
+        return {"state": "idle", "job_id": "", "job": {}}
+    j = _get_bg_job(jid)
+    status = str(j.get("status", "")).lower() if isinstance(j, dict) else ""
+    if status == "running":
+        return {"state": "running", "job_id": jid, "job": j}
+    if status in ("done", "failed"):
+        st.session_state[state_key] = ""
+        return {"state": status, "job_id": jid, "job": j}
+    st.session_state[state_key] = ""
+    return {"state": "idle", "job_id": jid, "job": j}
 
 
 def _extract_json_block(text: str, begin: str, end: str) -> Optional[Dict[str, Any]]:
@@ -694,6 +982,36 @@ def _extract_json_block(text: str, begin: str, end: str) -> Optional[Dict[str, A
     except Exception:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def _parse_stage_events_from_logs(lines: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ln in lines or []:
+        s = str(ln or "")
+        if "[STAGE]" not in s:
+            continue
+        m = re.search(r"\[STAGE\]\s+([A-Z_]+)\s+(start|done|failed)(?:\s+\(([\d.]+)s\))?(?::\s*(.*))?$", s, flags=re.IGNORECASE)
+        if not m:
+            continue
+        stage = str(m.group(1) or "").upper()
+        status = str(m.group(2) or "").lower()
+        sec_raw = m.group(3)
+        note = str(m.group(4) or "").strip()
+        sec = 0.0
+        try:
+            sec = float(sec_raw) if sec_raw else 0.0
+        except Exception:
+            sec = 0.0
+        out.append({"stage": stage, "status": status, "sec": sec, "note": note})
+    return out
+
+
+def _latest_stage_label(lines: List[str]) -> str:
+    ev = _parse_stage_events_from_logs(lines)
+    if not ev:
+        return ""
+    last = ev[-1]
+    return f"{str(last.get('stage', '')).upper()}:{str(last.get('status', '')).lower()}"
 
 
 def _extract_trade_recs(ai_text: str, default_tf: str = "4h") -> List[Dict[str, Any]]:
@@ -1216,6 +1534,107 @@ def _derive_oco_prices_live_bt_ai(
     return {"ok": True, "fallback": True}
 
 
+def _compute_retrofit_preview(
+    profile: str,
+    symbol: str,
+    stop_pct: float,
+    tp_pct: float,
+    use_pipeline: bool,
+    live_profile_name: str,
+    ai_only_values: bool,
+) -> Dict[str, Any]:
+    base_px = 0.0
+    lp_prev = bridge.get_binance_last_price(symbol=str(symbol), profile_name=profile)
+    if lp_prev.get("ok"):
+        try:
+            base_px = float(lp_prev.get("price", 0.0) or 0.0)
+        except Exception:
+            base_px = 0.0
+    preview_src = "fallback"
+    sl_prev = base_px * (1.0 - float(stop_pct) / 100.0) if base_px > 0 else 0.0
+    tp_prev = base_px * (1.0 + float(tp_pct) / 100.0) if base_px > 0 else 0.0
+    if bool(use_pipeline):
+        dprev = _derive_oco_prices_live_bt_ai(
+            profile=profile,
+            symbol=str(symbol),
+            live_profile_name=str(live_profile_name or ""),
+            strict_ai_values=bool(ai_only_values),
+            fallback_stop_pct=float(stop_pct),
+            fallback_tp_pct=float(tp_pct),
+        )
+        if dprev.get("ok"):
+            if not bool(dprev.get("fallback", False)):
+                preview_src = "AI"
+                sl_prev = float(dprev.get("stop", 0.0) or 0.0)
+                tp_prev = float(dprev.get("tp", 0.0) or 0.0)
+        else:
+            return {"ok": False, "error": str(dprev.get("error", "Preview derivation failed"))}
+    rr = 0.0
+    if base_px > 0 and sl_prev > 0 and tp_prev > 0 and (base_px - sl_prev) > 0:
+        rr = (tp_prev - base_px) / (base_px - sl_prev)
+    return {
+        "ok": True,
+        "base_px": float(base_px),
+        "preview_src": str(preview_src),
+        "sl_prev": float(sl_prev),
+        "tp_prev": float(tp_prev),
+        "rr": float(rr),
+    }
+
+
+def _run_retrofit_selected_oco_sync(
+    profile: str,
+    symbol: str,
+    stop_pct: float,
+    tp_pct: float,
+    replace_existing: bool,
+    use_total_qty: bool,
+    use_pipeline: bool,
+    live_profile_name: str,
+    ai_only_values: bool,
+) -> Dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    if not profile:
+        return {"ok": False, "error": "No Binance profile selected."}
+    if not sym or sym == "(NONE)":
+        return {"ok": False, "error": "Pick a symbol first."}
+
+    ex_sl = 0.0
+    ex_tp = 0.0
+    pipeline_info = ""
+    if bool(use_pipeline):
+        d = _derive_oco_prices_live_bt_ai(
+            profile=profile,
+            symbol=sym,
+            live_profile_name=str(live_profile_name or ""),
+            strict_ai_values=bool(ai_only_values),
+            fallback_stop_pct=float(stop_pct),
+            fallback_tp_pct=float(tp_pct),
+        )
+        if not d.get("ok"):
+            return {"ok": False, "error": str(d.get("error", "Could not derive OCO values from Live>BT>AI."))}
+        if not bool(d.get("fallback", False)):
+            ex_sl = float(d.get("stop", 0.0) or 0.0)
+            ex_tp = float(d.get("tp", 0.0) or 0.0)
+            pipeline_info = f"Using Live>BT>AI OCO values: SL={ex_sl:.8f}, TP={ex_tp:.8f}"
+        else:
+            pipeline_info = "Live>BT>AI did not return SL/TP for symbol; using % fallback."
+
+    out = _retrofit_symbol_to_oco(
+        profile=profile,
+        symbol=sym,
+        stop_loss_pct=float(stop_pct),
+        take_profit_pct=float(tp_pct),
+        replace_existing=bool(replace_existing),
+        use_total_qty=bool(use_total_qty),
+        explicit_stop_price=float(ex_sl),
+        explicit_take_profit_price=float(ex_tp),
+    )
+    if pipeline_info:
+        out["pipeline_info"] = pipeline_info
+    return out
+
+
 def _compact_pending_queue() -> Dict[str, Any]:
     rows = st.session_state.pending_recs if isinstance(st.session_state.pending_recs, list) else []
     history = st.session_state.pending_history if isinstance(st.session_state.pending_history, list) else []
@@ -1297,6 +1716,32 @@ def _portfolio_symbols_for_profile(profile: str, quote_pref: str = "USDT") -> Li
         seen.add(sym)
         syms.append(sym)
     return syms
+
+
+def _reconcile_fills_for_profile_sync(profile: str, quote_pref: str = "USDT") -> Dict[str, Any]:
+    if not str(profile or "").strip():
+        return {"ok": False, "error": "No profile selected."}
+    syms = _portfolio_symbols_for_profile(profile=profile, quote_pref=str(quote_pref or "USDT"))
+    if not syms:
+        try:
+            pos_out = bridge.analyze_open_positions_multi_tf(
+                profile_name=profile,
+                timeframes=["4h"],
+                display_currency="USD",
+            )
+            rows = pos_out.get("rows", []) if isinstance(pos_out.get("rows"), list) else []
+            syms = sorted(
+                {
+                    str(r.get("symbol", "")).strip().upper()
+                    for r in rows
+                    if isinstance(r, dict) and str(r.get("symbol", "")).strip()
+                }
+            )
+        except Exception:
+            syms = []
+    if not syms:
+        return {"ok": False, "error": "No symbols available for reconciliation."}
+    return bridge.reconcile_binance_fills(profile_name=profile, symbols=syms)
 
 
 def _safe_select_option(label: str, options: List[str], preferred: str = "") -> Optional[str]:
@@ -1737,7 +2182,7 @@ def _fifo_cost_basis_by_symbol(entries: List[Dict[str, Any]]) -> Dict[str, float
     return out
 
 
-def _position_graph_rows(profile: str, quote_pref: str = "USDT") -> pd.DataFrame:
+def _position_graph_rows_compute(profile: str, quote_pref: str = "USDT") -> pd.DataFrame:
     l = bridge.get_trade_ledger()
     if not l.get("ok"):
         return pd.DataFrame()
@@ -1887,6 +2332,56 @@ def _position_graph_rows(profile: str, quote_pref: str = "USDT") -> pd.DataFrame
     if not df.empty:
         df = df.sort_values("symbol")
     return df
+
+
+def _position_graph_rows(profile: str, quote_pref: str = "USDT") -> pd.DataFrame:
+    ttl = float(os.environ.get("CTMT_GRAPH_ROWS_TTL_SEC", "6") or "6")
+    cache_key = f"graph_rows::{str(profile)}::{str(quote_pref).upper()}"
+    cached_df = _session_cache_get(cache_key, max_age_sec=max(1.0, ttl))
+    if isinstance(cached_df, pd.DataFrame):
+        st.session_state["_last_graph_rows_cache_hit"] = True
+        return cached_df.copy()
+    st.session_state["_last_graph_rows_cache_hit"] = False
+    df = _position_graph_rows_compute(profile=profile, quote_pref=quote_pref)
+    _session_cache_put(cache_key, df.copy())
+    return df
+
+
+def _fetch_portfolio_bundle_payload_uncached(profile: str, include_review: bool = False) -> Dict[str, Any]:
+    t0 = time.time()
+    out_pf = bridge.fetch_binance_portfolio(profile_name=profile)
+    out_oo = bridge.list_open_binance_orders(profile_name=profile)
+    out_led = bridge.get_trade_ledger()
+    out_rev: Dict[str, Any] = {"ok": True, "rows": []}
+    if include_review:
+        out_rev = bridge.analyze_open_positions_multi_tf(
+            profile_name=profile, timeframes=["4h", "8h", "12h", "1d"], display_currency="USD"
+        )
+    return {
+        "ok": bool(out_pf.get("ok") and out_oo.get("ok") and out_led.get("ok") and (out_rev.get("ok") if include_review else True)),
+        "profile": str(profile),
+        "include_review": bool(include_review),
+        "portfolio": out_pf,
+        "orders": out_oo,
+        "ledger": out_led,
+        "review": out_rev,
+        "cache_hit": False,
+        "sec": round(time.time() - t0, 3),
+    }
+
+
+def _build_graph_refresh_payload(profile: str, quote_pref: str = "USDT") -> Dict[str, Any]:
+    t0 = time.time()
+    bundle_payload = _fetch_portfolio_bundle_payload_uncached(profile=profile, include_review=False)
+    graph_df = _position_graph_rows_compute(profile=profile, quote_pref=quote_pref)
+    return {
+        "ok": True,
+        "profile": str(profile),
+        "quote_pref": str(quote_pref or "USDT"),
+        "bundle_payload": bundle_payload,
+        "graph_df": graph_df,
+        "sec": round(time.time() - t0, 3),
+    }
 
 
 def _render_position_graph_visuals(df: pd.DataFrame) -> None:
@@ -2252,8 +2747,20 @@ def _protect_open_positions_live_bt_ai(profile: str, auto_submit: bool = False, 
 
 
 def _refresh_portfolio_bundle(profile: str, include_review: bool = False) -> Dict[str, Any]:
+    t0 = time.time()
     payload = _fetch_portfolio_bundle_payload(profile=profile, include_review=include_review)
-    return _apply_portfolio_bundle_payload(payload)
+    out = _apply_portfolio_bundle_payload(payload)
+    _record_perf_event(
+        task="Portfolio Bundle Refresh",
+        sec=(time.time() - t0),
+        ok=bool(out.get("ok", False)),
+        meta={
+            "cache_hit": bool(payload.get("cache_hit", False)),
+            "include_review": bool(include_review),
+            "profile": str(profile),
+        },
+    )
+    return out
 
 
 _init_state()
@@ -2310,6 +2817,92 @@ def _global_prefetch_heartbeat() -> None:
 
 
 _global_prefetch_heartbeat()
+
+
+@st.fragment(run_every="3s")
+def _bg_jobs_heartbeat() -> None:
+    """
+    Keep async task progress moving without manual clicks.
+    This avoids long jobs appearing "stuck" until user interaction.
+    """
+    try:
+        running = _running_bg_job_count()
+        if running <= 0:
+            return
+        polled = _poll_bg_jobs()
+        # Keep this heartbeat invisible to avoid app-wide repaint/flicker.
+        st.session_state["bg_jobs_running_count"] = int(running)
+        # Only force a full app rerun when a job transitions to done/failed.
+        # Avoiding continuous reruns prevents whole-page greying across tabs.
+        if bool((polled or {}).get("completed", False)):
+            now = time.time()
+            last = float(st.session_state.get("_bg_jobs_last_rerun_epoch", 0.0) or 0.0)
+            if now - last >= 1.0:
+                st.session_state["_bg_jobs_last_rerun_epoch"] = now
+                st.rerun()
+    except Exception:
+        return
+
+
+_bg_jobs_heartbeat()
+
+
+def _render_perf_hud() -> None:
+    with st.sidebar:
+        st.markdown("### Perf HUD")
+        try:
+            st.caption(f"Runtime diag: {'ON' if bool(diag.enabled) else 'OFF'} | {diag.path}")
+        except Exception:
+            pass
+        enabled = st.checkbox(
+            "Enable Perf HUD",
+            value=bool(st.session_state.get("perf_hud_enabled", True)),
+            key="perf_hud_enabled",
+        )
+        if not enabled:
+            return
+        hist = st.session_state.get("perf_history", [])
+        if not isinstance(hist, list) or not hist:
+            st.caption("No perf samples yet.")
+            return
+        df = pd.DataFrame(hist)
+        if df.empty:
+            st.caption("No perf samples yet.")
+            return
+        df["sec"] = pd.to_numeric(df.get("sec"), errors="coerce").fillna(0.0)
+        if "ok" in df.columns:
+            ok_rate = float(pd.to_numeric(df["ok"], errors="coerce").fillna(0.0).mean()) * 100.0
+        else:
+            ok_rate = 0.0
+        last_n = df.tail(50)
+        avg50 = float(last_n["sec"].mean()) if not last_n.empty else 0.0
+        p95 = float(last_n["sec"].quantile(0.95)) if len(last_n) >= 3 else avg50
+        running = _running_bg_job_count()
+        c1, c2 = st.columns(2)
+        c1.metric("Running jobs", f"{running}")
+        c2.metric("Success rate", f"{ok_rate:.1f}%")
+        c3, c4 = st.columns(2)
+        c3.metric("Avg sec (last50)", f"{avg50:.2f}")
+        c4.metric("P95 sec (last50)", f"{p95:.2f}")
+
+        grp = (
+            last_n.groupby("task", dropna=False)["sec"]
+            .agg(["count", "mean", "max"])
+            .reset_index()
+            .sort_values("mean", ascending=False)
+            .head(8)
+        )
+        grp = grp.rename(columns={"task": "Task", "count": "N", "mean": "Avg sec", "max": "Max sec"})
+        st.caption("Top latency tasks (last 50 samples)")
+        st.dataframe(grp, width="stretch", hide_index=True, height=220)
+
+        lp = st.session_state.get("last_pipeline_perf_rows", [])
+        if isinstance(lp, list) and lp:
+            st.caption("Last pipeline perf breakdown")
+            st.dataframe(pd.DataFrame(lp), width="stretch", hide_index=True, height=220)
+
+
+_render_perf_hud()
 
 tab_live, tab_backtest, tab_ai, tab_portfolio, tab_graph, tab_research, tab_tasks, tab_settings = st.tabs(
     ["Live Dashboard", "Backtest", "AI Analysis", "Portfolio & Ledger", "Position Graph", "Auto-Research", "Task Monitor", "Settings"]
@@ -2487,7 +3080,9 @@ with tab_backtest:
     min_hold_bars = int(bt2[2].number_input("Min hold bars", value=2, min_value=0, max_value=100, step=1))
     cooldown_bars = int(bt2[3].number_input("Cooldown bars", value=1, min_value=0, max_value=100, step=1))
     cache_workers = int(bt2[4].number_input("Indicator cache workers", value=4, min_value=1, max_value=64, step=1))
-    if st.button("Run Backtest", type="primary"):
+    _bt_job = _consume_bg_job("bg_backtest_job_id")
+    _bt_running = str(_bt_job.get("state", "")) == "running"
+    if st.button("Run Backtest", type="primary", disabled=_bt_running):
         cfg = {
             "market": market,
             "timeframe": timeframe,
@@ -2520,14 +3115,24 @@ with tab_backtest:
             "optuna_trials": int(optuna_trials),
             "optuna_jobs": 2,
         }
-        with st.spinner("Running backtest..."):
-            res = _run_task("Backtest", lambda: bridge.run_backtest(cfg))
+        jid = _start_bg_job("Backtest (async)", lambda ccfg=cfg: bridge.run_backtest(ccfg))
+        st.session_state.bg_backtest_job_id = str(jid)
+        st.info("Backtest started in background.")
+    if _bt_running:
+        _elapsed = float((_bt_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Backtest running... {_elapsed:.1f}s")
+    elif str(_bt_job.get("state", "")) == "done":
+        _res = (_bt_job.get("job", {}) or {}).get("result", {})
+        res = _res if isinstance(_res, dict) else {}
         if not res.get("ok"):
             st.error(res.get("error", "Backtest failed"))
         else:
             st.success("Backtest complete")
             st.session_state.last_backtest_summary = str(res.get("summary_text", "") or "")
             st.session_state.last_backtest_trades = str(res.get("trade_text", "") or "")
+    elif str(_bt_job.get("state", "")) == "failed":
+        _err = str((_bt_job.get("job", {}) or {}).get("error", "") or "Backtest failed")
+        st.error(_err)
     if st.session_state.last_backtest_summary:
         st.text(st.session_state.last_backtest_summary)
     if st.session_state.last_backtest_trades:
@@ -2737,7 +3342,12 @@ with tab_ai:
         }
         jid = _start_bg_job(
             "Pipeline Live->BT->AI (async)",
-            lambda lcfg=live_cfg, bcfg=bt_cfg, dctx=dt_context: _run_full_pipeline_sync(lcfg, bcfg, dctx),
+            lambda lcfg=live_cfg, bcfg=bt_cfg, dctx=dt_context: _run_full_pipeline_sync(
+                lcfg,
+                bcfg,
+                dctx,
+                bridge_obj=EngineBridge(Path(REPO_ROOT)),
+            ),
         )
         jobs = st.session_state.bg_jobs if isinstance(st.session_state.bg_jobs, dict) else {}
         j = jobs.get(jid, {})
@@ -2765,6 +3375,16 @@ with tab_ai:
 
     if pipeline_running:
         st.info("Pipeline is running in background...")
+        try:
+            _pj = (st.session_state.bg_jobs or {}).get(pipeline_running_id, {})
+            _logs = _pj.get("logs", []) if isinstance(_pj, dict) else []
+            _events = _parse_stage_events_from_logs(_logs if isinstance(_logs, list) else [])
+            if _events:
+                _df = pd.DataFrame(_events)
+                st.caption("Pipeline stage progress (live)")
+                _show_df(_df.tail(12), width="stretch", hide_index=True)
+        except Exception:
+            pass
 
     # consume completed pipeline
     pipeline_done_id = str(st.session_state.get("bg_pipeline_running_id", "") or "")
@@ -2776,6 +3396,12 @@ with tab_ai:
             else:
                 pres = pj.get("result", {}) if isinstance(pj.get("result"), dict) else {}
                 meta = pj.get("meta", {}) if isinstance(pj.get("meta"), dict) else {}
+                stage_events = list(pres.get("stage_events", []) if isinstance(pres, dict) else [])
+                perf_rows = list(pres.get("perf_rows", []) if isinstance(pres, dict) else [])
+                if isinstance(stage_events, list):
+                    st.session_state.last_pipeline_stage_events = stage_events
+                if isinstance(perf_rows, list):
+                    st.session_state.last_pipeline_perf_rows = perf_rows
                 if not pres.get("ok"):
                     st.error(f"Pipeline failed at {pres.get('stage', 'unknown')}: {pres.get('error', 'unknown error')}")
                 else:
@@ -2809,11 +3435,13 @@ with tab_ai:
                     if recs:
                         seq0 = int(st.session_state.pending_rec_seq or 0)
                         n = _append_pending(recs, source="pipeline_live_bt_ai")
+                        stage_events.append({"stage": "STAGE", "status": "done", "sec": 0.0, "note": f"staged={int(n)}"})
                         st.success(f"Pipeline complete. Staged {n} recommendation(s).")
                         if bool(meta.get("pipe_auto_submit", False)):
                             prof = str(meta.get("pipe_profile", "") or "")
                             if not prof:
                                 st.warning("No Binance profile selected for auto-submit.")
+                                stage_events.append({"stage": "SUBMIT", "status": "failed", "sec": 0.0, "note": "No Binance profile selected for auto-submit."})
                             else:
                                 new_ids = set(range(seq0 + 1, seq0 + n + 1))
                                 ok_n, fail_n = 0, 0
@@ -2826,9 +3454,30 @@ with tab_ai:
                                     else:
                                         fail_n += 1
                                 st.info(f"Auto-submit results: submitted={ok_n}, failed={fail_n}")
+                                stage_events.append({"stage": "SUBMIT", "status": "done" if fail_n == 0 else "failed", "sec": 0.0, "note": f"submitted={int(ok_n)}, failed={int(fail_n)}"})
                     else:
+                        stage_events.append({"stage": "STAGE", "status": "failed", "sec": 0.0, "note": "No structured trade recommendations to stage."})
                         st.warning("Pipeline AI returned no structured trade recommendations to stage.")
+                if isinstance(stage_events, list) and stage_events:
+                    st.session_state.last_pipeline_stage_events = stage_events
+                    st.caption("Pipeline stage timings")
+                    _show_df(pd.DataFrame(stage_events), width="stretch", hide_index=True)
+                if isinstance(perf_rows, list) and perf_rows:
+                    st.caption("Pipeline performance breakdown")
+                    _show_df(pd.DataFrame(perf_rows), width="stretch", hide_index=True)
             st.session_state.bg_pipeline_running_id = ""
+    elif isinstance(st.session_state.get("last_pipeline_stage_events"), list) and st.session_state.last_pipeline_stage_events:
+        st.caption("Last pipeline stage timings")
+        try:
+            _show_df(pd.DataFrame(st.session_state.last_pipeline_stage_events), width="stretch", hide_index=True)
+        except Exception:
+            pass
+        if isinstance(st.session_state.get("last_pipeline_perf_rows"), list) and st.session_state.last_pipeline_perf_rows:
+            st.caption("Last pipeline performance breakdown")
+            try:
+                _show_df(pd.DataFrame(st.session_state.last_pipeline_perf_rows), width="stretch", hide_index=True)
+            except Exception:
+                pass
 
     if not str(st.session_state.get("ai_source_text_area", "")).strip() and str(st.session_state.get("ai_source_text", "")).strip():
         st.session_state.ai_source_text_area = str(st.session_state.ai_source_text or "")
@@ -2843,27 +3492,52 @@ with tab_ai:
     st.session_state.ai_source_text = current_src
     if st.session_state.ai_prompt_preview:
         st.text_area("Prompt Preview", value=st.session_state.ai_prompt_preview, height=200)
-    if st.button("Run AI Analysis", type="primary"):
+    _ai_job = _consume_bg_job("bg_ai_run_job_id")
+    _ai_running = str(_ai_job.get("state", "")) == "running"
+    if st.button("Run AI Analysis", type="primary", disabled=_ai_running):
         if not current_src:
             st.warning("Provide source text first.")
         else:
-            with st.spinner("Calling AI provider..."):
-                res = _run_task("AI Analysis", lambda: bridge.run_ai_analysis(current_src, dt_context))
-            if not res.get("ok"):
-                st.error(res.get("error", "AI failed"))
-            else:
-                st.session_state.ai_response = str(res.get("response", "") or "")
-                st.success("AI response received")
+            jid = _start_bg_job("AI Analysis (async)", lambda src=current_src, dtx=dt_context: bridge.run_ai_analysis(src, dtx))
+            st.session_state.bg_ai_run_job_id = str(jid)
+            st.info("AI analysis started in background.")
+    if _ai_running:
+        _elapsed = float((_ai_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"AI analysis running... {_elapsed:.1f}s")
+    elif str(_ai_job.get("state", "")) == "done":
+        _res = (_ai_job.get("job", {}) or {}).get("result", {})
+        res = _res if isinstance(_res, dict) else {}
+        if not res.get("ok"):
+            st.error(res.get("error", "AI failed"))
+        else:
+            st.session_state.ai_response = str(res.get("response", "") or "")
+            st.success("AI response received")
+    elif str(_ai_job.get("state", "")) == "failed":
+        _err = str((_ai_job.get("job", {}) or {}).get("error", "") or "AI failed")
+        st.error(_err)
     if st.session_state.ai_response:
         st.text_area("AI Response", value=st.session_state.ai_response, height=420)
     follow = st.text_input("Follow-up")
-    if st.button("Run Follow-up") and follow.strip():
+    _ai_fu_job = _consume_bg_job("bg_ai_followup_job_id")
+    _ai_fu_running = str(_ai_fu_job.get("state", "")) == "running"
+    if st.button("Run Follow-up", disabled=_ai_fu_running) and follow.strip():
         compound = (st.session_state.ai_source_text or "") + "\n\nPrevious response:\n" + (st.session_state.ai_response or "") + "\n\nFollow-up:\n" + follow
-        out_fu = _run_task("AI Follow-up", lambda: bridge.run_ai_analysis(compound, dt_context))
+        jid = _start_bg_job("AI Follow-up (async)", lambda cmp=compound, dtx=dt_context: bridge.run_ai_analysis(cmp, dtx))
+        st.session_state.bg_ai_followup_job_id = str(jid)
+        st.info("AI follow-up started in background.")
+    if _ai_fu_running:
+        _elapsed_fu = float((_ai_fu_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"AI follow-up running... {_elapsed_fu:.1f}s")
+    elif str(_ai_fu_job.get("state", "")) == "done":
+        _res_fu = (_ai_fu_job.get("job", {}) or {}).get("result", {})
+        out_fu = _res_fu if isinstance(_res_fu, dict) else {}
         if out_fu.get("ok"):
             st.session_state.ai_response = str(out_fu.get("response", "") or "")
         else:
             st.error(out_fu.get("error", "Follow-up failed"))
+    elif str(_ai_fu_job.get("state", "")) == "failed":
+        _err_fu = str((_ai_fu_job.get("job", {}) or {}).get("error", "") or "Follow-up failed")
+        st.error(_err_fu)
 
 with tab_portfolio:
     st.subheader("Portfolio & Ledger")
@@ -3039,41 +3713,42 @@ with tab_portfolio:
     do_retrofit_oco = st.button("Retrofit Selected to OCO", disabled=(not bool(profile) or _retro_pick == "(none)"))
 
     if do_preview_retrofit and profile and _retro_pick != "(none)":
-        base_px = 0.0
-        lp_prev = bridge.get_binance_last_price(symbol=str(_retro_pick), profile_name=profile)
-        if lp_prev.get("ok"):
-            try:
-                base_px = float(lp_prev.get("price", 0.0) or 0.0)
-            except Exception:
-                base_px = 0.0
-        preview_src = "fallback"
-        sl_prev = base_px * (1.0 - float(_retro_sl) / 100.0) if base_px > 0 else 0.0
-        tp_prev = base_px * (1.0 + float(_retro_tp) / 100.0) if base_px > 0 else 0.0
-        if bool(_retro_use_pipeline):
-            picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
-            dprev = _run_task(
-                "Preview OCO from Live->BT->AI",
-                lambda p=profile, s=str(_retro_pick), lp=picked_lp, strict=bool(_retro_ai_only), sl=float(_retro_sl), tp=float(_retro_tp): _derive_oco_prices_live_bt_ai(
-                    profile=p,
-                    symbol=s,
-                    live_profile_name=lp,
-                    strict_ai_values=strict,
-                    fallback_stop_pct=sl,
-                    fallback_tp_pct=tp,
-                ),
-            )
-            if dprev.get("ok"):
-                if not bool(dprev.get("fallback", False)):
-                    preview_src = "AI"
-                    sl_prev = float(dprev.get("stop", 0.0) or 0.0)
-                    tp_prev = float(dprev.get("tp", 0.0) or 0.0)
-                else:
-                    preview_src = "fallback"
-            else:
-                st.error(str(dprev.get("error", "Preview derivation failed")))
-        rr = 0.0
-        if base_px > 0 and sl_prev > 0 and tp_prev > 0 and (base_px - sl_prev) > 0:
-            rr = (tp_prev - base_px) / (base_px - sl_prev)
+        picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
+        jid = _start_bg_job(
+            "Preview OCO Values (async)",
+            lambda p=profile, s=str(_retro_pick), sl=float(_retro_sl), tp=float(_retro_tp), up=bool(_retro_use_pipeline), lp=picked_lp, ao=bool(_retro_ai_only): _compute_retrofit_preview(
+                profile=p,
+                symbol=s,
+                stop_pct=sl,
+                tp_pct=tp,
+                use_pipeline=up,
+                live_profile_name=lp,
+                ai_only_values=ao,
+            ),
+        )
+        st.session_state.bg_preview_retrofit_job_id = str(jid)
+        st.info("OCO preview started in background.")
+    _prev_job = _consume_bg_job("bg_preview_retrofit_job_id")
+    if str(_prev_job.get("state", "")) == "running":
+        _prev_elapsed = float((_prev_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"OCO preview running... {_prev_elapsed:.1f}s")
+    elif str(_prev_job.get("state", "")) == "done":
+        _prev_res = (_prev_job.get("job", {}) or {}).get("result", {})
+        dprev = _prev_res if isinstance(_prev_res, dict) else {}
+        if dprev.get("ok"):
+            st.session_state.last_retrofit_preview = dict(dprev)
+        else:
+            st.error(str(dprev.get("error", "Preview derivation failed")))
+    elif str(_prev_job.get("state", "")) == "failed":
+        st.error(str((_prev_job.get("job", {}) or {}).get("error", "") or "Preview derivation failed"))
+
+    _prev = st.session_state.get("last_retrofit_preview", {})
+    if isinstance(_prev, dict) and _prev:
+        base_px = float(_prev.get("base_px", 0.0) or 0.0)
+        sl_prev = float(_prev.get("sl_prev", 0.0) or 0.0)
+        tp_prev = float(_prev.get("tp_prev", 0.0) or 0.0)
+        rr = float(_prev.get("rr", 0.0) or 0.0)
+        preview_src = str(_prev.get("preview_src", "fallback") or "fallback")
         pc_prev = st.columns(4)
         pc_prev[0].metric("Preview source", preview_src.upper())
         pc_prev[1].metric("Last price", f"{base_px:.8f}" if base_px > 0 else "n/a")
@@ -3081,7 +3756,16 @@ with tab_portfolio:
         pc_prev[3].metric("Est. R:R", f"{rr:.2f}" if rr > 0 else "n/a")
 
     if do_pf and profile:
-        out = _run_task("Portfolio Refresh", lambda: bridge.fetch_binance_portfolio(profile_name=profile))
+        jid = _start_bg_job("Portfolio Refresh (async)", lambda p=profile: bridge.fetch_binance_portfolio(profile_name=p))
+        st.session_state.bg_portfolio_refresh_job_id = str(jid)
+        st.info("Portfolio refresh started in background.")
+    _pf_job = _consume_bg_job("bg_portfolio_refresh_job_id")
+    if str(_pf_job.get("state", "")) == "running":
+        _pf_elapsed = float((_pf_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Portfolio refresh running... {_pf_elapsed:.1f}s")
+    elif str(_pf_job.get("state", "")) == "done":
+        _pf_res = (_pf_job.get("job", {}) or {}).get("result", {})
+        out = _pf_res if isinstance(_pf_res, dict) else {}
         if not out.get("ok"):
             st.error(out.get("error", "Portfolio fetch failed"))
         else:
@@ -3091,9 +3775,20 @@ with tab_portfolio:
             st.session_state.last_portfolio_df = df
             if not df.empty:
                 _show_df(df, width="stretch", hide_index=True)
+    elif str(_pf_job.get("state", "")) == "failed":
+        st.error(str((_pf_job.get("job", {}) or {}).get("error", "") or "Portfolio refresh failed"))
 
     if do_oo and profile:
-        out = _run_task("Open Orders Refresh", lambda: bridge.list_open_binance_orders(profile_name=profile))
+        jid = _start_bg_job("Open Orders Refresh (async)", lambda p=profile: bridge.list_open_binance_orders(profile_name=p))
+        st.session_state.bg_open_orders_refresh_job_id = str(jid)
+        st.info("Open orders refresh started in background.")
+    _oo_job = _consume_bg_job("bg_open_orders_refresh_job_id")
+    if str(_oo_job.get("state", "")) == "running":
+        _oo_elapsed = float((_oo_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Open orders refresh running... {_oo_elapsed:.1f}s")
+    elif str(_oo_job.get("state", "")) == "done":
+        _oo_res = (_oo_job.get("job", {}) or {}).get("result", {})
+        out = _oo_res if isinstance(_oo_res, dict) else {}
         if not out.get("ok"):
             st.error(out.get("error", "Open orders fetch failed"))
         else:
@@ -3105,9 +3800,20 @@ with tab_portfolio:
             else:
                 st.info("No open orders.")
             _sync_pending_statuses(profile)
+    elif str(_oo_job.get("state", "")) == "failed":
+        st.error(str((_oo_job.get("job", {}) or {}).get("error", "") or "Open orders refresh failed"))
 
     if do_led:
-        out = _run_task("Ledger Refresh", lambda: bridge.get_trade_ledger())
+        jid = _start_bg_job("Ledger Refresh (async)", lambda: bridge.get_trade_ledger())
+        st.session_state.bg_ledger_refresh_job_id = str(jid)
+        st.info("Ledger refresh started in background.")
+    _led_job = _consume_bg_job("bg_ledger_refresh_job_id")
+    if str(_led_job.get("state", "")) == "running":
+        _led_elapsed = float((_led_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Ledger refresh running... {_led_elapsed:.1f}s")
+    elif str(_led_job.get("state", "")) == "done":
+        _led_res = (_led_job.get("job", {}) or {}).get("result", {})
+        out = _led_res if isinstance(_led_res, dict) else {}
         if not out.get("ok"):
             st.error(out.get("error", "Ledger fetch failed"))
         else:
@@ -3118,111 +3824,142 @@ with tab_portfolio:
                 df = pd.DataFrame(entries)
                 st.session_state.last_ledger_df = df
                 _show_df(df, width="stretch", hide_index=True)
+    elif str(_led_job.get("state", "")) == "failed":
+        st.error(str((_led_job.get("job", {}) or {}).get("error", "") or "Ledger refresh failed"))
     if do_rec and profile:
-        syms = _portfolio_symbols_for_profile(profile=profile, quote_pref=str(st.session_state.get("live_quote", "USDT")))
-        if not syms:
-            try:
-                pos_out = bridge.analyze_open_positions_multi_tf(profile_name=profile, timeframes=["4h"], display_currency="USD")
-                rows = pos_out.get("rows", []) if isinstance(pos_out.get("rows"), list) else []
-                syms = sorted({str(r.get("symbol", "")).strip().upper() for r in rows if isinstance(r, dict) and str(r.get("symbol", "")).strip()})
-            except Exception:
-                syms = []
-        if not syms:
-            st.warning("No symbols detected from portfolio/open positions; reconcile skipped.")
-            out = {"ok": False, "error": "No symbols available for reconciliation."}
-        else:
-            out = _run_task("Reconcile Fills", lambda: bridge.reconcile_binance_fills(profile_name=profile, symbols=syms))
+        jid = _start_bg_job(
+            "Reconcile Fills (async)",
+            lambda p=profile, q=str(st.session_state.get("live_quote", "USDT")): _reconcile_fills_for_profile_sync(profile=p, quote_pref=q),
+        )
+        st.session_state.bg_reconcile_job_id = str(jid)
+        st.info("Reconcile started in background.")
+    _rec_job = _consume_bg_job("bg_reconcile_job_id")
+    if str(_rec_job.get("state", "")) == "running":
+        _rec_elapsed = float((_rec_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Reconcile running... {_rec_elapsed:.1f}s")
+    elif str(_rec_job.get("state", "")) == "done":
+        _rec_res = (_rec_job.get("job", {}) or {}).get("result", {})
+        out = _rec_res if isinstance(_rec_res, dict) else {}
         if out.get("ok"):
             st.success(f"Reconcile added={int(out.get('added', 0) or 0)}, dup={int(out.get('duplicates', 0) or 0)}")
             _sync_pending_statuses(profile)
         else:
             st.error(out.get("error", "Reconcile failed"))
+    elif str(_rec_job.get("state", "")) == "failed":
+        st.error(str((_rec_job.get("job", {}) or {}).get("error", "") or "Reconcile failed"))
     if do_review and profile:
-        out = _run_task(
-            "Open Position Review (MTF)",
-            lambda: bridge.analyze_open_positions_multi_tf(profile_name=profile, timeframes=["4h", "8h", "12h", "1d"], display_currency="USD"),
+        jid = _start_bg_job(
+            "Open Position Review (MTF) (async)",
+            lambda p=profile: bridge.analyze_open_positions_multi_tf(profile_name=p, timeframes=["4h", "8h", "12h", "1d"], display_currency="USD"),
         )
+        st.session_state.bg_review_job_id = str(jid)
+        st.info("MTF review started in background.")
+    _rev_job = _consume_bg_job("bg_review_job_id")
+    if str(_rev_job.get("state", "")) == "running":
+        _rev_elapsed = float((_rev_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"MTF review running... {_rev_elapsed:.1f}s")
+    elif str(_rev_job.get("state", "")) == "done":
+        _rev_res = (_rev_job.get("job", {}) or {}).get("result", {})
+        out = _rev_res if isinstance(_rev_res, dict) else {}
         if out.get("ok"):
             rdf = pd.DataFrame(out.get("rows", []) or [])
             st.session_state.last_review_df = rdf
             _show_df(rdf, width="stretch", hide_index=True)
         else:
             st.error(out.get("error", "Review failed"))
+    elif str(_rev_job.get("state", "")) == "failed":
+        st.error(str((_rev_job.get("job", {}) or {}).get("error", "") or "Review failed"))
     if do_retrofit_oco and profile:
         pick_sym = str(st.session_state.get("retrofit_oco_symbol", "(none)") or "(none)")
         if pick_sym == "(none)":
             st.warning("Pick a symbol first.")
         else:
-            ex_sl = 0.0
-            ex_tp = 0.0
-            if bool(_retro_use_pipeline):
-                picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
-                d = _run_task(
-                    "Derive OCO from Live->BT->AI",
-                    lambda p=profile, s=pick_sym, lp=picked_lp, strict=bool(_retro_ai_only), sl=float(_retro_sl), tp=float(_retro_tp): _derive_oco_prices_live_bt_ai(
-                        profile=p,
-                        symbol=s,
-                        live_profile_name=lp,
-                        strict_ai_values=strict,
-                        fallback_stop_pct=sl,
-                        fallback_tp_pct=tp,
-                    ),
-                )
-                if not d.get("ok"):
-                    st.error(str(d.get("error", "Could not derive OCO values from Live>BT>AI.")))
-                    d = {}
-                else:
-                    if not bool(d.get("fallback", False)):
-                        ex_sl = float(d.get("stop", 0.0) or 0.0)
-                        ex_tp = float(d.get("tp", 0.0) or 0.0)
-                        st.info(f"Using Live>BT>AI OCO values: SL={ex_sl:.8f}, TP={ex_tp:.8f}")
-                    else:
-                        st.info("Live>BT>AI did not return SL/TP for symbol; using % fallback.")
-            out = _run_task(
-                "Retrofit Selected Position to OCO",
-                lambda p=profile, s=pick_sym, sl=float(_retro_sl), tp=float(_retro_tp), rep=bool(_retro_replace), ut=bool(_retro_use_total), es=float(ex_sl), et=float(ex_tp): _retrofit_symbol_to_oco(
+            picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
+            jid = _start_bg_job(
+                "Retrofit Selected Position to OCO (async)",
+                lambda p=profile, s=pick_sym, sl=float(_retro_sl), tp=float(_retro_tp), rep=bool(_retro_replace), ut=bool(_retro_use_total), upl=bool(_retro_use_pipeline), lp=picked_lp, ao=bool(_retro_ai_only): _run_retrofit_selected_oco_sync(
                     profile=p,
                     symbol=s,
-                    stop_loss_pct=sl,
-                    take_profit_pct=tp,
+                    stop_pct=sl,
+                    tp_pct=tp,
                     replace_existing=rep,
                     use_total_qty=ut,
-                    explicit_stop_price=es,
-                    explicit_take_profit_price=et,
+                    use_pipeline=upl,
+                    live_profile_name=lp,
+                    ai_only_values=ao,
                 ),
             )
-            if out.get("ok"):
-                st.success(
-                    f"OCO set for {out.get('symbol')} qty={float(out.get('qty', 0.0) or 0.0):.8f} | "
-                    f"SL={float(out.get('stop', 0.0) or 0.0):.8f} TP={float(out.get('tp', 0.0) or 0.0):.8f}"
-                )
-                bridge.list_open_binance_orders(profile_name=profile)
-                _sync_pending_statuses(profile)
-            else:
-                st.error(str(out.get("error", "Retrofit OCO failed")))
+            st.session_state.bg_retrofit_oco_job_id = str(jid)
+            st.info("Retrofit OCO started in background.")
+    _retro_job = _consume_bg_job("bg_retrofit_oco_job_id")
+    if str(_retro_job.get("state", "")) == "running":
+        _retro_elapsed = float((_retro_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Retrofit OCO running... {_retro_elapsed:.1f}s")
+    elif str(_retro_job.get("state", "")) == "done":
+        _retro_res = (_retro_job.get("job", {}) or {}).get("result", {})
+        out = _retro_res if isinstance(_retro_res, dict) else {}
+        _msg = str(out.get("pipeline_info", "") or "").strip()
+        if _msg:
+            st.info(_msg)
+        if out.get("ok"):
+            st.success(
+                f"OCO set for {out.get('symbol')} qty={float(out.get('qty', 0.0) or 0.0):.8f} | "
+                f"SL={float(out.get('stop', 0.0) or 0.0):.8f} TP={float(out.get('tp', 0.0) or 0.0):.8f}"
+            )
+            bridge.list_open_binance_orders(profile_name=profile)
+            _sync_pending_statuses(profile)
+        else:
+            st.error(str(out.get("error", "Retrofit OCO failed")))
+    elif str(_retro_job.get("state", "")) == "failed":
+        st.error(str((_retro_job.get("job", {}) or {}).get("error", "") or "Retrofit OCO failed"))
     if do_protect and profile:
-        out = _run_task("Protect Open Positions (AI+BT)", lambda: _protect_open_positions_simple(profile, auto_submit=bool(auto_send_protect)))
+        jid = _start_bg_job(
+            "Protect Open Positions (AI+BT) (async)",
+            lambda p=profile, a=bool(auto_send_protect): _protect_open_positions_simple(p, auto_submit=a),
+        )
+        st.session_state.bg_protect_job_id = str(jid)
+        st.info("Protection (AI+BT) started in background.")
+    _prot_job = _consume_bg_job("bg_protect_job_id")
+    if str(_prot_job.get("state", "")) == "running":
+        _prot_elapsed = float((_prot_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Protection (AI+BT) running... {_prot_elapsed:.1f}s")
+    elif str(_prot_job.get("state", "")) == "done":
+        _prot_res = (_prot_job.get("job", {}) or {}).get("result", {})
+        out = _prot_res if isinstance(_prot_res, dict) else {}
         if out.get("ok"):
             mode_txt = str(out.get("mode", "ai_bt"))
             st.success(f"Protection ({mode_txt}) staged={int(out.get('staged', 0) or 0)}, submitted={int(out.get('submitted', 0) or 0)}")
         else:
             st.error(out.get("error", "Protect failed"))
+    elif str(_prot_job.get("state", "")) == "failed":
+        st.error(str((_prot_job.get("job", {}) or {}).get("error", "") or "Protect failed"))
 
     if do_protect_pipeline and profile:
         picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
-        out = _run_task(
-            "Protect Open Positions (Live->BT->AI)",
-            lambda: _protect_open_positions_live_bt_ai(profile, auto_submit=bool(auto_send_protect), live_profile_name=picked_lp),
+        jid = _start_bg_job(
+            "Protect Open Positions (Live->BT->AI) (async)",
+            lambda p=profile, a=bool(auto_send_protect), lp=picked_lp: _protect_open_positions_live_bt_ai(p, auto_submit=a, live_profile_name=lp),
         )
+        st.session_state.bg_protect_pipeline_job_id = str(jid)
+        st.info("Protection (Live->BT->AI) started in background.")
+    _prot_pipe_job = _consume_bg_job("bg_protect_pipeline_job_id")
+    if str(_prot_pipe_job.get("state", "")) == "running":
+        _prot_pipe_elapsed = float((_prot_pipe_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Protection (Live->BT->AI) running... {_prot_pipe_elapsed:.1f}s")
+    elif str(_prot_pipe_job.get("state", "")) == "done":
+        _prot_pipe_res = (_prot_pipe_job.get("job", {}) or {}).get("result", {})
+        out = _prot_pipe_res if isinstance(_prot_pipe_res, dict) else {}
         if out.get("ok"):
             mode_txt = str(out.get("mode", "live_bt_ai"))
             st.success(f"Protection ({mode_txt}) staged={int(out.get('staged', 0) or 0)}, submitted={int(out.get('submitted', 0) or 0)}")
         else:
             st.error(out.get("error", "Protect failed"))
+    elif str(_prot_pipe_job.get("state", "")) == "failed":
+        st.error(str((_prot_pipe_job.get("job", {}) or {}).get("error", "") or "Protect failed"))
     if do_unified and profile:
         picked_lp = "" if protect_live_profile_pick == "(current live settings)" else str(protect_live_profile_pick)
-        out = _run_task(
-            "Unified Cycle (Manage+Discover)",
+        jid = _start_bg_job(
+            "Unified Cycle (Manage+Discover) (async)",
             lambda p=profile, lp=picked_lp, asp=bool(auto_send_protect), asn=bool(auto_submit_unified_new): _run_unified_cycle_sync(
                 profile=p,
                 live_profile_name=lp,
@@ -3234,10 +3971,21 @@ with tab_portfolio:
                 ai_only_oco_values=bool(st.session_state.get("sig_ai_only_oco", False)),
             ),
         )
+        st.session_state.bg_unified_manual_job_id = str(jid)
+        st.info("Unified cycle started in background.")
+    _unified_job = _consume_bg_job("bg_unified_manual_job_id")
+    if str(_unified_job.get("state", "")) == "running":
+        _unified_elapsed = float((_unified_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Unified cycle running... {_unified_elapsed:.1f}s")
+    elif str(_unified_job.get("state", "")) == "done":
+        _unified_res = (_unified_job.get("job", {}) or {}).get("result", {})
+        out = _unified_res if isinstance(_unified_res, dict) else {}
         if out.get("ok"):
             st.success(f"Unified complete: {str(out.get('summary_text', '') or '').strip()}")
         else:
             st.error(f"Unified Cycle failed at {out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}")
+    elif str(_unified_job.get("state", "")) == "failed":
+        st.error(str((_unified_job.get("job", {}) or {}).get("error", "") or "Unified cycle failed"))
 
     st.markdown("### Unified Monitor")
     um1, um2, um3, um4, um5 = st.columns([1, 1, 1, 1, 2])
@@ -3267,6 +4015,7 @@ with tab_portfolio:
         st.session_state.unified_monitor_next_epoch = time.time() + 2.0
         st.session_state.unified_monitor_last_epoch = 0.0
         st.session_state.unified_monitor_busy = False
+        st.session_state.unified_monitor_job_id = ""
         st.session_state.unified_monitor_live_profile = picked_lp
         st.session_state.unified_monitor_auto_send_protect = bool(auto_send_protect)
         st.session_state.unified_monitor_auto_submit_new = bool(auto_submit_unified_new)
@@ -3278,6 +4027,7 @@ with tab_portfolio:
     if stop_unified:
         st.session_state.unified_monitor_enabled = False
         st.session_state.unified_monitor_busy = False
+        st.session_state.unified_monitor_job_id = ""
         st.info("Unified Monitor stopped.")
         st.rerun()
     um_on = bool(st.session_state.get("unified_monitor_enabled", False))
@@ -3302,36 +4052,19 @@ with tab_portfolio:
     def _unified_monitor_fragment() -> None:
         if not bool(st.session_state.get("unified_monitor_enabled", False)):
             return
+        running_job_id = str(st.session_state.get("unified_monitor_job_id", "") or "")
         if bool(st.session_state.get("unified_monitor_busy", False)):
-            return
-        if not bool(st.session_state.get("unified_monitor_24x7", True)):
-            hour = datetime.now().hour
-            if hour < 6 or hour >= 23:
+            if not running_job_id:
                 return
-        nxt = float(st.session_state.get("unified_monitor_next_epoch", 0.0) or 0.0)
-        if nxt > 0 and time.time() < nxt:
-            return
-        prof = str(profile or "")
-        if not prof:
-            return
-        st.session_state.unified_monitor_busy = True
-        st.session_state.unified_monitor_started_epoch = time.time()
-        try:
-            out = _run_task(
-                "Unified Cycle (scheduled)",
-                lambda p=prof: _run_unified_cycle_sync(
-                    profile=p,
-                    live_profile_name=str(st.session_state.get("unified_monitor_live_profile", "") or ""),
-                    auto_send_protect=bool(st.session_state.get("unified_monitor_auto_send_protect", False)),
-                    auto_submit_new=bool(st.session_state.get("unified_monitor_auto_submit_new", False)),
-                    dt_context=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    signal_order_type=str(st.session_state.get("unified_monitor_signal_order_type", "as_ai") or "as_ai"),
-                    post_buy_protection_mode=str(st.session_state.get("unified_monitor_post_buy_mode", "none") or "none"),
-                    ai_only_oco_values=bool(st.session_state.get("unified_monitor_ai_only_oco", False)),
-                ),
-            )
-            if out.get("ok"):
-                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+            job = jobs.get(running_job_id, {}) if isinstance(jobs, dict) else {}
+            jstatus = str(job.get("status", "") or "").lower() if isinstance(job, dict) else ""
+            if jstatus == "running":
+                return
+            # Completed (done/failed): consume result and finalize without blocking UI.
+            stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            out = job.get("result", {}) if isinstance(job.get("result"), dict) else {}
+            if jstatus == "done" and bool(out.get("ok", False)):
                 st.session_state.unified_monitor_last_summary = f"{stamp} {str(out.get('summary_text', '') or '').strip()}"
                 h = st.session_state.get("unified_monitor_history", [])
                 if not isinstance(h, list):
@@ -3352,8 +4085,10 @@ with tab_portfolio:
                 )
                 st.session_state.unified_monitor_history = h[-200:]
             else:
-                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                st.session_state.unified_monitor_last_summary = f"{stamp} failed at {out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}"
+                err = str(job.get("error", "") or "")
+                stage = str(out.get("stage", "unknown") or "unknown")
+                detail = str(out.get("error", "") or err or "unknown error")
+                st.session_state.unified_monitor_last_summary = f"{stamp} failed at {stage}: {detail}"
                 h = st.session_state.get("unified_monitor_history", [])
                 if not isinstance(h, list):
                     h = []
@@ -3361,23 +4096,51 @@ with tab_portfolio:
                     {
                         "ts": stamp,
                         "status": "FAILED",
-                        "protect_staged": 0,
-                        "protect_submitted": 0,
-                        "new_parsed": 0,
-                        "new_eligible": 0,
-                        "new_staged": 0,
-                        "new_submitted": 0,
-                        "new_failed": 0,
-                        "note": f"{out.get('stage', 'unknown')}: {out.get('error', 'unknown error')}",
+                        "protect_staged": int(out.get("protect_staged", 0) or 0),
+                        "protect_submitted": int(out.get("protect_submitted", 0) or 0),
+                        "new_parsed": int(out.get("new_parsed", 0) or 0),
+                        "new_eligible": int(out.get("new_eligible", 0) or 0),
+                        "new_staged": int(out.get("new_staged", 0) or 0),
+                        "new_submitted": int(out.get("new_submitted", 0) or 0),
+                        "new_failed": int(out.get("new_failed", 0) or 0),
+                        "note": f"{stage}: {detail}",
                     }
                 )
                 st.session_state.unified_monitor_history = h[-200:]
-        finally:
             st.session_state.unified_monitor_last_epoch = time.time()
             st.session_state.unified_monitor_next_epoch = time.time() + (max(5, int(st.session_state.get("unified_monitor_interval_min", 30) or 30)) * 60)
             st.session_state.unified_monitor_busy = False
             st.session_state.unified_monitor_started_epoch = 0.0
-        st.rerun()
+            st.session_state.unified_monitor_job_id = ""
+            return
+        if not bool(st.session_state.get("unified_monitor_24x7", True)):
+            hour = datetime.now().hour
+            if hour < 6 or hour >= 23:
+                return
+        nxt = float(st.session_state.get("unified_monitor_next_epoch", 0.0) or 0.0)
+        if nxt > 0 and time.time() < nxt:
+            return
+        prof = str(profile or "")
+        if not prof:
+            return
+        st.session_state.unified_monitor_busy = True
+        st.session_state.unified_monitor_started_epoch = time.time()
+        jid = _start_bg_job(
+            "Unified Cycle (scheduled)",
+            lambda p=prof: _run_unified_cycle_sync(
+                profile=p,
+                live_profile_name=str(st.session_state.get("unified_monitor_live_profile", "") or ""),
+                auto_send_protect=bool(st.session_state.get("unified_monitor_auto_send_protect", False)),
+                auto_submit_new=bool(st.session_state.get("unified_monitor_auto_submit_new", False)),
+                dt_context=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                signal_order_type=str(st.session_state.get("unified_monitor_signal_order_type", "as_ai") or "as_ai"),
+                post_buy_protection_mode=str(st.session_state.get("unified_monitor_post_buy_mode", "none") or "none"),
+                ai_only_oco_values=bool(st.session_state.get("unified_monitor_ai_only_oco", False)),
+            ),
+        )
+        st.session_state.unified_monitor_job_id = str(jid)
+        # UI remains responsive; completion handled in subsequent fragment ticks.
+        return
 
     _unified_monitor_fragment()
     if do_prune:
@@ -3509,32 +4272,87 @@ with tab_graph:
     graph_interval = int(g2.number_input("Every (sec)", min_value=5, max_value=300, value=20, step=5, key="graph_interval_sec"))
     refresh_now = g3.button("Refresh Position Graph Data", type="primary", disabled=not bool(profile), key="graph_refresh_btn")
 
-    def _refresh_graph_once() -> None:
-        if not profile:
-            st.warning("Select a Binance profile first.")
-            return
-        # Keep graph aligned with latest portfolio/open-order/ledger cache.
-        try:
-            _refresh_portfolio_bundle(profile, include_review=False)
-        except Exception:
-            pass
-        with st.spinner("Building position graph data..."):
-            df = _run_task("Position Graph Refresh", lambda: _position_graph_rows(profile=profile, quote_pref=quote_pref))
-        if df.empty:
-            st.session_state.last_graph_df = pd.DataFrame()
-        else:
-            st.session_state.last_graph_df = df.copy()
-        st.session_state.graph_last_refresh_epoch = time.time()
+    def _start_graph_refresh_job(p: str, q: str) -> None:
+        jid = _start_bg_job(
+            "Position Graph Refresh (async)",
+            lambda pp=p, qq=q: _build_graph_refresh_payload(profile=pp, quote_pref=qq),
+        )
+        st.session_state.graph_refresh_job_id = str(jid)
+        st.session_state.graph_refresh_profile = str(p)
+        st.session_state.graph_refresh_quote = str(q)
+        # Force a fresh non-blocking ledger bootstrap for PnL breakdown on graph tab.
+        st.session_state.graph_ledger_bootstrap_done = False
 
-    if refresh_now:
-        _refresh_graph_once()
+    # manual refresh -> async kickoff
+    if refresh_now and profile:
+        running_jid = str(st.session_state.get("graph_refresh_job_id", "") or "")
+        jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+        running = False
+        if running_jid and isinstance(jobs, dict):
+            j = jobs.get(running_jid, {})
+            running = isinstance(j, dict) and str(j.get("status", "")).lower() == "running"
+        if running:
+            st.info("Graph refresh already running.")
+        else:
+            _start_graph_refresh_job(str(profile), str(quote_pref))
+            st.info("Graph refresh started in background.")
 
     run_every = f"{int(graph_interval)}s" if graph_auto else None
 
     @st.fragment(run_every=run_every)
     def _graph_fragment() -> None:
+        # Auto trigger
         if graph_auto and profile:
-            _refresh_graph_once()
+            nxt = float(st.session_state.get("graph_next_refresh_epoch", 0.0) or 0.0)
+            rid = str(st.session_state.get("graph_refresh_job_id", "") or "")
+            jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+            is_running = False
+            if rid and isinstance(jobs, dict):
+                j = jobs.get(rid, {})
+                is_running = isinstance(j, dict) and str(j.get("status", "")).lower() == "running"
+            if (not is_running) and (nxt <= 0 or time.time() >= nxt):
+                _start_graph_refresh_job(str(profile), str(quote_pref))
+                st.session_state.graph_next_refresh_epoch = time.time() + float(max(5, int(graph_interval)))
+
+        # Consume completed graph job result
+        rid = str(st.session_state.get("graph_refresh_job_id", "") or "")
+        if rid:
+            jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+            j = jobs.get(rid, {}) if isinstance(jobs, dict) else {}
+            status = str(j.get("status", "")).lower() if isinstance(j, dict) else ""
+            if status == "running":
+                elapsed = float(j.get("elapsed_sec", 0.0) or 0.0) if isinstance(j, dict) else 0.0
+                st.caption(f"Graph refresh running... {elapsed:.1f}s")
+            elif status in ("done", "failed"):
+                if status == "done":
+                    res = j.get("result", {}) if isinstance(j.get("result"), dict) else {}
+                    bundle = res.get("bundle_payload", {}) if isinstance(res.get("bundle_payload"), dict) else {}
+                    try:
+                        _apply_portfolio_bundle_payload(bundle)
+                    except Exception:
+                        pass
+                    df = res.get("graph_df", pd.DataFrame())
+                    if isinstance(df, pd.DataFrame):
+                        st.session_state.last_graph_df = df.copy()
+                        st.session_state["_last_graph_rows_cache_hit"] = False
+                        _session_cache_put(
+                            f"graph_rows::{str(st.session_state.get('graph_refresh_profile', profile))}::{str(st.session_state.get('graph_refresh_quote', quote_pref)).upper()}",
+                            df.copy(),
+                        )
+                        st.session_state.graph_last_refresh_epoch = time.time()
+                        _record_perf_event(
+                            task="Position Graph Refresh",
+                            sec=float(res.get("sec", 0.0) or 0.0),
+                            ok=True,
+                            meta={
+                                "cache_hit": False,
+                                "rows": int(len(df)),
+                                "profile": str(st.session_state.get("graph_refresh_profile", profile)),
+                            },
+                        )
+                else:
+                    st.warning(f"Graph refresh failed: {str(j.get('error', 'unknown error') or 'unknown error')}")
+                st.session_state.graph_refresh_job_id = ""
         if isinstance(st.session_state.last_graph_df, pd.DataFrame) and not st.session_state.last_graph_df.empty:
             st.caption("Latest position graph data")
             _show_df(st.session_state.last_graph_df, width="stretch", hide_index=True)
@@ -3550,16 +4368,33 @@ with tab_graph:
     st.markdown("### PnL Breakdown (Open + Closed)")
     led_df = st.session_state.last_ledger_df if isinstance(st.session_state.last_ledger_df, pd.DataFrame) else pd.DataFrame()
     if (not isinstance(led_df, pd.DataFrame)) or led_df.empty:
-        # Best-effort load when user opens graph without visiting portfolio tab first.
-        try:
-            lout = bridge.get_trade_ledger()
+        _gled_job = _consume_bg_job("bg_graph_ledger_load_job_id")
+        _gled_state = str(_gled_job.get("state", "")).lower()
+        if _gled_state == "running":
+            _gled_elapsed = float((_gled_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+            st.caption(f"Loading ledger for PnL breakdown... {_gled_elapsed:.1f}s")
+        elif _gled_state == "done":
+            _gled_res = (_gled_job.get("job", {}) or {}).get("result", {})
+            lout = _gled_res if isinstance(_gled_res, dict) else {}
             if lout.get("ok"):
                 ldg = lout.get("ledger", {}) if isinstance(lout.get("ledger"), dict) else {}
                 ent = ldg.get("entries", []) if isinstance(ldg.get("entries"), list) else []
                 led_df = pd.DataFrame(ent)
                 st.session_state.last_ledger_df = led_df
-        except Exception:
-            led_df = pd.DataFrame()
+            st.session_state.graph_ledger_bootstrap_done = True
+        elif _gled_state == "failed":
+            st.warning(str((_gled_job.get("job", {}) or {}).get("error", "") or "Ledger load failed for PnL breakdown."))
+            st.session_state.graph_ledger_bootstrap_done = True
+
+        _boot_done = bool(st.session_state.get("graph_ledger_bootstrap_done", False))
+        if ((not _boot_done) and _gled_state != "running"):
+            jid = _start_bg_job("Graph Ledger Bootstrap (async)", lambda: bridge.get_trade_ledger())
+            st.session_state.bg_graph_ledger_load_job_id = str(jid)
+            st.caption("Loading ledger in background for PnL breakdown...")
+        elif _boot_done and ((not isinstance(led_df, pd.DataFrame)) or led_df.empty):
+            if st.button("Retry Ledger Load", key="graph_retry_ledger_load"):
+                st.session_state.graph_ledger_bootstrap_done = False
+                st.rerun()
 
     if isinstance(st.session_state.last_graph_df, pd.DataFrame) and not st.session_state.last_graph_df.empty:
         pb = _compute_pnl_breakdown(st.session_state.last_graph_df, led_df)
@@ -3623,22 +4458,152 @@ with tab_research:
     scen_tfs = st.multiselect("Scenario timeframes", ["1d", "4h", "8h", "12h"], default=["1d", "4h"])
     scen_months = st.selectbox("Scenario months", [1, 3, 6, 12, 18, 24], index=3)
     if std_btn:
-        out = _run_task("Standard Research", lambda: bridge.run_standard_research())
-        if out.get("ok"):
-            st.success("Standard research completed.")
-            st.session_state.last_research_text = str(out.get("output", "") or out.get("stdout", "") or "")
-        else:
-            st.error(out.get("error", "Standard research failed"))
+        jid = _start_bg_job("Standard Research (async)", lambda: bridge.run_standard_research())
+        st.session_state.bg_standard_research_job_id = str(jid)
+        st.info("Standard research started in background.")
     if st.button("Run Comprehensive Research"):
         scenarios = []
         for tf in (scen_tfs or ["1d"]):
             scenarios.append({"market": scen_market, "timeframe": tf, "top_n": int(scen_topn), "months": int(scen_months)})
-        out = _run_task("Comprehensive Research", lambda: bridge.run_comprehensive_research(scenarios=scenarios, optuna_trials=trials, optuna_jobs=jobs))
+        jid = _start_bg_job(
+            "Comprehensive Research (async)",
+            lambda ss=scenarios, tr=int(trials), jb=int(jobs): bridge.run_comprehensive_research(scenarios=ss, optuna_trials=tr, optuna_jobs=jb),
+        )
+        st.session_state.bg_comprehensive_research_job_id = str(jid)
+        st.info("Comprehensive research started in background.")
+
+    def _record_research_history(run_type: str, status: str, elapsed: float, summary: str, output_text: str = "") -> None:
+        hist = st.session_state.get("research_history", [])
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(
+            {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "run_type": str(run_type),
+                "status": str(status),
+                "elapsed_sec": round(float(elapsed or 0.0), 2),
+                "summary": str(summary or ""),
+                "output_chars": int(len(str(output_text or ""))),
+            }
+        )
+        st.session_state.research_history = hist[-200:]
+
+    _sr_job = _consume_bg_job("bg_standard_research_job_id")
+    if str(_sr_job.get("state", "")) == "running":
+        _sr_elapsed = float((_sr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Standard research running... {_sr_elapsed:.1f}s")
+    elif str(_sr_job.get("state", "")) == "done":
+        _sr_res = (_sr_job.get("job", {}) or {}).get("result", {})
+        out = _sr_res if isinstance(_sr_res, dict) else {}
+        if out.get("ok"):
+            st.success("Standard research completed.")
+            _txt = str(out.get("output", "") or out.get("stdout", "") or "")
+            st.session_state.last_research_text = _txt
+            _record_research_history(
+                run_type="standard",
+                status="DONE",
+                elapsed=float((_sr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+                summary="Standard research completed",
+                output_text=_txt,
+            )
+        else:
+            st.error(out.get("error", "Standard research failed"))
+            _record_research_history(
+                run_type="standard",
+                status="FAILED",
+                elapsed=float((_sr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+                summary=str(out.get("error", "Standard research failed")),
+                output_text=str(out.get("output", "") or out.get("stdout", "") or ""),
+            )
+    elif str(_sr_job.get("state", "")) == "failed":
+        _err = str((_sr_job.get("job", {}) or {}).get("error", "") or "Standard research failed")
+        st.error(_err)
+        _record_research_history(
+            run_type="standard",
+            status="FAILED",
+            elapsed=float((_sr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+            summary=_err,
+            output_text="",
+        )
+    _cr_job = _consume_bg_job("bg_comprehensive_research_job_id")
+    if str(_cr_job.get("state", "")) == "running":
+        _cr_elapsed = float((_cr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Comprehensive research running... {_cr_elapsed:.1f}s")
+    elif str(_cr_job.get("state", "")) == "done":
+        _cr_res = (_cr_job.get("job", {}) or {}).get("result", {})
+        out = _cr_res if isinstance(_cr_res, dict) else {}
         if out.get("ok"):
             st.success("Comprehensive research completed.")
-            st.session_state.last_research_text = str(out.get("output", "") or out.get("stdout", "") or "")
+            _txt = str(out.get("output", "") or out.get("stdout", "") or "")
+            st.session_state.last_research_text = _txt
+            _record_research_history(
+                run_type="comprehensive",
+                status="DONE",
+                elapsed=float((_cr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+                summary="Comprehensive research completed",
+                output_text=_txt,
+            )
         else:
             st.error(out.get("error", "Comprehensive research failed"))
+            _record_research_history(
+                run_type="comprehensive",
+                status="FAILED",
+                elapsed=float((_cr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+                summary=str(out.get("error", "Comprehensive research failed")),
+                output_text=str(out.get("output", "") or out.get("stdout", "") or ""),
+            )
+    elif str(_cr_job.get("state", "")) == "failed":
+        _err = str((_cr_job.get("job", {}) or {}).get("error", "") or "Comprehensive research failed")
+        st.error(_err)
+        _record_research_history(
+            run_type="comprehensive",
+            status="FAILED",
+            elapsed=float((_cr_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0),
+            summary=_err,
+            output_text="",
+        )
+
+    st.markdown("### Research Process Monitor")
+    _jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+    _active = []
+    for _jid, _j in (_jobs.items() if isinstance(_jobs, dict) else []):
+        if not isinstance(_j, dict):
+            continue
+        _nm = str(_j.get("name", ""))
+        if "research" not in _nm.lower():
+            continue
+        if str(_j.get("status", "")).lower() != "running":
+            continue
+        _active.append(
+            {
+                "job_id": str(_jid)[:8],
+                "name": _nm,
+                "stage": _latest_stage_label(_j.get("logs", []) if isinstance(_j.get("logs"), list) else []),
+                "elapsed_sec": float(_j.get("elapsed_sec", 0.0) or 0.0),
+                "started_ts": str(_j.get("started_ts", "")),
+            }
+        )
+    if _active:
+        _show_df(pd.DataFrame(_active), width="stretch", hide_index=True, height=180)
+    else:
+        st.caption("No research jobs running.")
+
+    rh1, rh2 = st.columns([1, 4])
+    if rh1.button("Clear Research History", key="research_clear_history"):
+        st.session_state.research_history = []
+        st.rerun()
+    rhist = st.session_state.get("research_history", [])
+    if isinstance(rhist, list) and rhist:
+        _hdf = pd.DataFrame(rhist)
+        _show_df(_hdf.iloc[::-1], width="stretch", hide_index=True, height=220)
+        _latest = _hdf.iloc[-1].to_dict()
+        rh2.caption(
+            f"Latest: {str(_latest.get('run_type', '')).title()} | "
+            f"{_latest.get('status', '')} | {float(_latest.get('elapsed_sec', 0.0) or 0.0):.2f}s"
+        )
+    else:
+        rh2.caption("No past research runs yet.")
+
     if st.session_state.last_research_text:
         st.text_area("Research Output", value=st.session_state.last_research_text, height=420)
 
@@ -3667,6 +4632,7 @@ with tab_tasks:
                     "name": str(j.get("name", "")),
                     "state": str(j.get("state", j.get("status", ""))),
                     "status": str(j.get("status", "")),
+                    "stage": _latest_stage_label(j.get("logs", []) if isinstance(j.get("logs"), list) else []),
                     "started_ts": str(j.get("started_ts", "")),
                     "elapsed_sec": float(j.get("elapsed_sec", 0.0) or 0.0),
                     "last_log_ts": str(j.get("last_log_ts", "")),
@@ -3742,11 +4708,25 @@ with tab_settings:
         if not prof:
             st.warning("No active Binance profile found for prefetch.")
         else:
-            out = _run_task("Global Prefetch Bundle", lambda: _refresh_portfolio_bundle(prof, include_review=False))
-            if out.get("ok"):
-                st.success(f"Prefetch complete for profile: {prof}")
-            else:
-                st.warning("Prefetch completed with warnings.")
+            jid = _start_bg_job(
+                "Global Prefetch Bundle (async)",
+                lambda p=prof: _refresh_portfolio_bundle(p, include_review=False),
+            )
+            st.session_state.bg_global_prefetch_job_id = str(jid)
+            st.info(f"Prefetch started in background for profile: {prof}")
+    _gp_job = _consume_bg_job("bg_global_prefetch_job_id")
+    if str(_gp_job.get("state", "")) == "running":
+        _gp_elapsed = float((_gp_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+        st.caption(f"Global prefetch running... {_gp_elapsed:.1f}s")
+    elif str(_gp_job.get("state", "")) == "done":
+        _gp_res = (_gp_job.get("job", {}) or {}).get("result", {})
+        out = _gp_res if isinstance(_gp_res, dict) else {}
+        if out.get("ok"):
+            st.success("Prefetch complete.")
+        else:
+            st.warning("Prefetch completed with warnings.")
+    elif str(_gp_job.get("state", "")) == "failed":
+        st.error(str((_gp_job.get("job", {}) or {}).get("error", "") or "Global prefetch failed"))
     st.session_state.auto_retry_locked_sell = gp4.checkbox(
         "Auto-retry SELL MARKET (cancel protective orders first)",
         value=bool(st.session_state.get("auto_retry_locked_sell", True)),

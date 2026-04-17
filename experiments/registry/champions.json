@@ -29172,5 +29172,155 @@
         }
       }
     }
+  },
+  "scenario": {
+    "promoted_at_utc": "2026-04-17T04:45:05+00:00",
+    "source_run_file": "experiments/runs/run_20260417T044504Z.json",
+    "metrics": {
+      "return_pct": 34.89793618747381,
+      "max_drawdown_pct": 0.0,
+      "sharpe": 3.548919213818045,
+      "sortino": 0.0,
+      "turnover_per_year": 0.0,
+      "holdout_return_pct": 1.2195729376359266,
+      "holdout_max_drawdown_pct": 29.861525996123984,
+      "holdout_sharpe": 0.5532566520341184
+    },
+    "selected": {
+      "name": "tuned",
+      "config": {
+        "initial_capital": 10000.0,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "max_hold_days": 45,
+        "fee_pct": 0.1,
+        "slippage_pct": 0.05,
+        "min_hold_bars": 2,
+        "cooldown_bars": 1,
+        "same_asset_cooldown_bars": 3,
+        "max_consecutive_same_asset_entries": 3,
+        "max_drawdown_limit_pct": 35.0,
+        "max_exposure_pct": 0.4,
+        "tuned": {
+          "position_size": 0.3510078206567547,
+          "atr_multiplier": 2.266584313300287,
+          "adx_threshold": 20.09632215254488,
+          "cmf_threshold": 0.0972300419016712,
+          "obv_slope_threshold": 0.002391131784030251,
+          "buy_threshold": 3,
+          "sell_threshold": -1
+        }
+      },
+      "result": {
+        "final": 13489.79361874738,
+        "return_pct": 34.89793618747381,
+        "trades_closed": 0,
+        "metrics": {
+          "max_drawdown_pct": 0.0,
+          "sharpe": 3.548919213818045,
+          "sortino": 0.0,
+          "turnover_per_year": 0.0,
+          "avg_hold_days": 0.0,
+          "total_years": 0.07939767282683094,
+          "asset_contrib": {}
+        }
+      }
+    },
+    "tuned": {
+      "config": {
+        "initial_capital": 10000.0,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "max_hold_days": 45,
+        "fee_pct": 0.1,
+        "slippage_pct": 0.05,
+        "min_hold_bars": 2,
+        "cooldown_bars": 1,
+        "same_asset_cooldown_bars": 3,
+        "max_consecutive_same_asset_entries": 3,
+        "max_drawdown_limit_pct": 35.0,
+        "max_exposure_pct": 0.4,
+        "tuned": {
+          "position_size": 0.3510078206567547,
+          "atr_multiplier": 2.266584313300287,
+          "adx_threshold": 20.09632215254488,
+          "cmf_threshold": 0.0972300419016712,
+          "obv_slope_threshold": 0.002391131784030251,
+          "buy_threshold": 3,
+          "sell_threshold": -1
+        }
+      },
+      "score": 41.9957746151099,
+      "result": {
+        "final": 13489.79361874738,
+        "return_pct": 34.89793618747381,
+        "trades_closed": 0,
+        "metrics": {
+          "max_drawdown_pct": 0.0,
+          "sharpe": 3.548919213818045,
+          "sortino": 0.0,
+          "turnover_per_year": 0.0,
+          "avg_hold_days": 0.0,
+          "total_years": 0.07939767282683094,
+          "asset_contrib": {}
+        }
+      },
+      "holdout": {
+        "final": 10121.957293763593,
+        "return_pct": 1.2195729376359266,
+        "trades_closed": 3,
+        "metrics": {
+          "max_drawdown_pct": 29.861525996123984,
+          "sharpe": 0.5532566520341184,
+          "sortino": 0.5289157985733232,
+          "turnover_per_year": 6.333815028901734,
+          "avg_hold_days": 38.333333333333336,
+          "total_years": 0.4736481861738535,
+          "asset_contrib": {
+            "TRX": 132.45000000000005
+          }
+        }
+      }
+    },
+    "baseline": {
+      "config": {
+        "initial_capital": 10000.0,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "max_hold_days": 45,
+        "fee_pct": 0.1,
+        "slippage_pct": 0.05,
+        "min_hold_bars": 2,
+        "cooldown_bars": 1,
+        "same_asset_cooldown_bars": 3,
+        "max_consecutive_same_asset_entries": 3,
+        "max_drawdown_limit_pct": 35.0,
+        "max_exposure_pct": 0.4,
+        "tuned": {
+          "position_size": 0.3,
+          "atr_multiplier": 2.2,
+          "adx_threshold": 25.0,
+          "cmf_threshold": 0.02,
+          "obv_slope_threshold": 0.0,
+          "buy_threshold": 2,
+          "sell_threshold": -2
+        }
+      },
+      "score": 36.92446974500494,
+      "result": {
+        "final": 12982.663131736885,
+        "return_pct": 29.826631317368847,
+        "trades_closed": 0,
+        "metrics": {
+          "max_drawdown_pct": 0.0,
+          "sharpe": 3.5489192138180456,
+          "sortino": 0.0,
+          "turnover_per_year": 0.0,
+          "avg_hold_days": 0.0,
+          "total_years": 0.07939767282683094,
+          "asset_contrib": {}
+        }
+      }
+    }
   }
 }

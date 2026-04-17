@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -6,11 +7,48 @@ from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 HANDOFF = ROOT / "PROJECT_HANDOFF.md"
-RUNS_DIR = ROOT / "experiments" / "runs"
-CHAMPIONS = ROOT / "experiments" / "registry" / "champions.json"
+
+
+def resolve_data_root() -> Path:
+    raw = str(os.environ.get("CTMT_DATA_ROOT", "") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = (ROOT / p).resolve()
+        else:
+            p = p.resolve()
+    else:
+        p = ROOT
+    return p
+
+
+DATA_ROOT = resolve_data_root()
+RUNS_DIR = DATA_ROOT / "experiments" / "runs"
+CHAMPIONS = DATA_ROOT / "experiments" / "registry" / "champions.json"
 
 START = "<!-- AUTO_HANDBACK_START -->"
 END = "<!-- AUTO_HANDBACK_END -->"
+
+
+def assert_writable_dir(path: Path, label: str) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not accessible: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
+    probe = path / ".ctmt_write_probe.tmp"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not writable: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
 
 
 def utc_now_iso() -> str:
@@ -60,7 +98,10 @@ def build_block() -> str:
     lines.append("## Automated Research Status")
     lines.append(f"- Last update UTC: {utc_now_iso()}")
     if has_run:
-        rel = run_file.relative_to(ROOT).as_posix()
+        try:
+            rel = run_file.relative_to(ROOT).as_posix()
+        except Exception:
+            rel = str(run_file)
         lines.append(f"- Latest experiment artifact: `{rel}`")
     else:
         lines.append("- Latest experiment artifact: none")
@@ -76,6 +117,8 @@ def build_block() -> str:
 
 
 def main() -> None:
+    assert_writable_dir(DATA_ROOT, "CTMT data root")
+    assert_writable_dir(DATA_ROOT / "experiments", "Experiments directory")
     if not HANDOFF.exists():
         raise SystemExit(f"Missing {HANDOFF}")
 

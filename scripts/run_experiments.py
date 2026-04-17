@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,10 +12,47 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY_PATH = ROOT / "nightly" / "BTC-beta.py"
-EXPERIMENTS_DIR = ROOT / "experiments"
+
+
+def resolve_data_root() -> Path:
+    raw = str(os.environ.get("CTMT_DATA_ROOT", "") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = (ROOT / p).resolve()
+        else:
+            p = p.resolve()
+    else:
+        p = ROOT
+    return p
+
+
+DATA_ROOT = resolve_data_root()
+EXPERIMENTS_DIR = DATA_ROOT / "experiments"
 RUNS_DIR = EXPERIMENTS_DIR / "runs"
 CANDIDATES_PATH = EXPERIMENTS_DIR / "candidates.jsonl"
 SCENARIOS_PATH = EXPERIMENTS_DIR / "scenarios.json"
+
+
+def assert_writable_dir(path: Path, label: str) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not accessible: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
+    probe = path / ".ctmt_write_probe.tmp"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"{label} is not writable: {path}\n"
+            f"Reason: {e}\n"
+            "Set CTMT_DATA_ROOT to a writable location and retry."
+        )
 
 
 def utc_now_iso() -> str:
@@ -22,6 +60,8 @@ def utc_now_iso() -> str:
 
 
 def ensure_dirs() -> None:
+    assert_writable_dir(DATA_ROOT, "CTMT data root")
+    assert_writable_dir(EXPERIMENTS_DIR, "Experiments directory")
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -246,13 +286,17 @@ def write_artifacts(results: List[Dict[str, Any]]) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_path = RUNS_DIR / f"run_{stamp}.json"
     run_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    try:
+        run_file_ref = str(run_path.relative_to(ROOT)).replace("\\", "/")
+    except Exception:
+        run_file_ref = str(run_path)
 
     with CANDIDATES_PATH.open("a", encoding="utf-8") as f:
         for rec in results:
             row = {
                 "logged_at_utc": utc_now_iso(),
                 "scenario_id": rec["scenario"]["id"],
-                "run_file": str(run_path.relative_to(ROOT)).replace("\\", "/"),
+                "run_file": run_file_ref,
                 "selected": rec["selected"],
                 "tuned": rec["tuned"],
                 "baseline": rec["baseline"],
