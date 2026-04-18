@@ -1,5 +1,7 @@
 # Generated local databases
 **/crypto_data.db
+**/crypto_data.db-wal
+**/crypto_data.db-shm
 
 # Generated experiment/test artifacts (root and nested workdirs)
 **/experiments/runs/

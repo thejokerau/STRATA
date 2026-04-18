@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import copy
 import hashlib
 import hmac
 import os
@@ -40,12 +41,17 @@ class EngineBridge:
         self._result_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._raw_data_cache: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
         self._indicator_cache_store: Dict[str, Tuple[float, Dict[str, pd.DataFrame]]] = {}
-        self._cache_ttl_live_sec = float(os.environ.get("CTMT_CACHE_TTL_LIVE_SEC", "60"))
+        self._cache_ttl_live_sec = float(os.environ.get("CTMT_CACHE_TTL_LIVE_SEC", "180"))
         self._cache_ttl_backtest_sec = float(os.environ.get("CTMT_CACHE_TTL_BACKTEST_SEC", "300"))
         self._cache_ttl_raw_sec = float(os.environ.get("CTMT_CACHE_TTL_RAW_SEC", "120"))
         self._cache_ttl_indicator_sec = float(os.environ.get("CTMT_CACHE_TTL_INDICATOR_SEC", "180"))
         self._pipeline_bundle_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._backtest_signature_cache: Dict[str, Dict[str, Any]] = {}
+        self._portfolio_cb_fail_count = 0
+        self._portfolio_cb_open_until = 0.0
+        self._portfolio_cb_last_error = ""
+        self._portfolio_cb_threshold = max(1, int(os.environ.get("CTMT_BINANCE_PORTFOLIO_CB_FAILS", "3") or "3"))
+        self._portfolio_cb_cooldown_sec = max(5.0, float(os.environ.get("CTMT_BINANCE_PORTFOLIO_CB_COOLDOWN_SEC", "45") or "45"))
         self.diag = RuntimeDiagLogger(self.repo_root)
         self.mod = self._load_nightly_module()
         self.mod.ensure_table()
@@ -77,11 +83,114 @@ class EngineBridge:
     def _cache_put(cache: Dict[str, Tuple[float, Any]], key: str, val: Any) -> None:
         cache[key] = (time.time(), val)
 
+    @staticmethod
+    def _cache_probe(cache: Dict[str, Tuple[float, Any]], key: str, ttl_sec: float) -> Dict[str, Any]:
+        rec = cache.get(key)
+        if not rec:
+            return {"exists": False, "hit": False, "age_sec": None, "expired": False, "value": None}
+        ts, val = rec
+        age = time.time() - float(ts)
+        expired = age > float(ttl_sec)
+        if expired:
+            try:
+                del cache[key]
+            except Exception:
+                pass
+        return {"exists": True, "hit": not expired, "age_sec": round(age, 4), "expired": bool(expired), "value": (None if expired else val)}
+
+    @staticmethod
+    def _cache_key_tail(cache_key: str) -> str:
+        key = str(cache_key or "")
+        if not key:
+            return ""
+        parts = key.split(":")
+        return parts[-1] if parts else key
+
+    @staticmethod
+    def _live_cache_payload(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "market": str(cfg.get("market", "crypto")).strip().lower(),
+            "timeframe": str(cfg.get("timeframe", "1d")).strip().lower(),
+            "top_n": int(cfg.get("top_n", 20)),
+            "quote_currency": str(cfg.get("quote_currency", "USD")).strip().upper(),
+            "country": str(cfg.get("country", "2")).strip(),
+            "display_currency": str(cfg.get("display_currency", "USD")).strip().upper(),
+            # Deliberately exclude panel/display name from cache key so repeated
+            # runs across UI profiles can reuse identical computations.
+            "analysis_window_mode": str(cfg.get("analysis_window_mode", "full")).strip().lower(),
+            "analysis_window_days": int(cfg.get("analysis_window_days", 0) or 0),
+            "analysis_window_bars": int(cfg.get("analysis_window_bars", 0) or 0),
+            "fetch_workers": max(1, int(cfg.get("fetch_workers", 1) or 1)),
+            "cache_workers": max(1, int(cfg.get("cache_workers", 1) or 1)),
+        }
+
     def _diag(self, event: str, level: str = "INFO", run_id: Optional[str] = None, **fields: Any) -> None:
         try:
             self.diag.log("engine_bridge", event, level=level, run_id=run_id, **fields)
         except Exception:
             return
+
+    @staticmethod
+    def _is_transient_network_error(msg: str) -> bool:
+        s = str(msg or "").lower()
+        if not s:
+            return False
+        needles = (
+            "proxyerror",
+            "httpsconnectionpool",
+            "max retries exceeded",
+            "failed to establish a new connection",
+            "connection refused",
+            "connection aborted",
+            "timed out",
+            "read timed out",
+            "connect timeout",
+            "connectionerror",
+        )
+        return any(n in s for n in needles)
+
+    def _portfolio_cb_can_attempt(self) -> bool:
+        return float(self._portfolio_cb_open_until or 0.0) <= self._now()
+
+    def _portfolio_cb_on_failure(self, err: str) -> None:
+        self._portfolio_cb_last_error = str(err or "")
+        if not self._is_transient_network_error(self._portfolio_cb_last_error):
+            return
+        self._portfolio_cb_fail_count = int(self._portfolio_cb_fail_count or 0) + 1
+        if self._portfolio_cb_fail_count >= int(self._portfolio_cb_threshold):
+            self._portfolio_cb_open_until = self._now() + float(self._portfolio_cb_cooldown_sec)
+            self._diag(
+                "fetch_binance_portfolio.circuit_open",
+                level="WARNING",
+                fail_count=int(self._portfolio_cb_fail_count),
+                open_for_sec=float(self._portfolio_cb_cooldown_sec),
+                error=str(self._portfolio_cb_last_error),
+            )
+
+    def _portfolio_cb_on_success(self) -> None:
+        if int(self._portfolio_cb_fail_count or 0) > 0 or float(self._portfolio_cb_open_until or 0.0) > 0:
+            self._diag(
+                "fetch_binance_portfolio.circuit_reset",
+                fail_count=int(self._portfolio_cb_fail_count or 0),
+            )
+        self._portfolio_cb_fail_count = 0
+        self._portfolio_cb_open_until = 0.0
+        self._portfolio_cb_last_error = ""
+
+    def get_portfolio_circuit_state(self) -> Dict[str, Any]:
+        now = self._now()
+        open_until = float(self._portfolio_cb_open_until or 0.0)
+        retry_in = max(0.0, open_until - now)
+        return {
+            "ok": True,
+            "circuit_open": retry_in > 0,
+            "retry_in_sec": round(retry_in, 3),
+            "open_until_epoch": open_until,
+            "fail_count": int(self._portfolio_cb_fail_count or 0),
+            "threshold": int(self._portfolio_cb_threshold or 0),
+            "cooldown_sec": float(self._portfolio_cb_cooldown_sec or 0.0),
+            "last_error": str(self._portfolio_cb_last_error or ""),
+        }
 
     @staticmethod
     def _raw_signature(raw_data: Dict[str, pd.DataFrame]) -> str:
@@ -264,6 +373,10 @@ class EngineBridge:
     def run_live_panel(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         t0_diag = self._now()
         run_id = str(cfg.get("run_id", "") or "").strip() or None
+        ck_payload = self._live_cache_payload(cfg)
+        ck = self._stable_cache_key("live_result", ck_payload)
+        cache_ttl = float(self._cache_ttl_live_sec)
+        ck_tail = self._cache_key_tail(ck)
         self._diag(
             "run_live_panel.start",
             run_id=run_id,
@@ -271,34 +384,36 @@ class EngineBridge:
             timeframe=str(cfg.get("timeframe", "1d")),
             top_n=int(cfg.get("top_n", 20)),
             name=str(cfg.get("name", "") or ""),
+            cache_key_tail=ck_tail,
+            cache_ttl_sec=cache_ttl,
         )
-        ck = self._stable_cache_key(
-            "live_result",
-            {
-                "market": str(cfg.get("market", "crypto")),
-                "timeframe": str(cfg.get("timeframe", "1d")),
-                "top_n": int(cfg.get("top_n", 20)),
-                "quote_currency": str(cfg.get("quote_currency", "USD")).upper(),
-                "country": str(cfg.get("country", "2")),
-                "display_currency": str(cfg.get("display_currency", "USD")).upper(),
-                "name": str(cfg.get("name", "")),
-                "analysis_window_mode": str(cfg.get("analysis_window_mode", "full")).lower(),
-                "analysis_window_days": int(cfg.get("analysis_window_days", 0) or 0),
-                "analysis_window_bars": int(cfg.get("analysis_window_bars", 0) or 0),
-            },
-        )
-        cached = self._cache_get(self._result_cache, ck, self._cache_ttl_live_sec)
-        if isinstance(cached, dict):
-            out = dict(cached)
+        probe = self._cache_probe(self._result_cache, ck, cache_ttl)
+        cached = probe.get("value")
+        if isinstance(cached, dict) and bool(probe.get("hit", False)):
+            out = copy.deepcopy(cached)
             p = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
             p["result_cache_hit"] = True
+            p["result_cache_key_tail"] = ck_tail
+            p["result_cache_age_sec"] = float(probe.get("age_sec", 0.0) or 0.0)
             out["perf"] = p
             out["log"] = ""
-            self._diag("run_live_panel.end", run_id=run_id, ok=True, cache_hit=True, elapsed_sec=round(self._now() - t0_diag, 4))
+            self._diag(
+                "run_live_panel.end",
+                run_id=run_id,
+                ok=True,
+                cache_hit=True,
+                cache_key_tail=ck_tail,
+                cache_age_sec=float(probe.get("age_sec", 0.0) or 0.0),
+                cache_ttl_sec=cache_ttl,
+                elapsed_sec=round(self._now() - t0_diag, 4),
+            )
             return out
 
         stream = io.StringIO()
         t0 = self._now()
+        miss_reason = "miss_no_entry"
+        if bool(probe.get("exists", False)) and bool(probe.get("expired", False)):
+            miss_reason = "miss_ttl_expired"
         with self._lock:
             with redirect_stdout(stream), redirect_stderr(stream):
                 out = self._run_live_panel_impl(cfg)
@@ -306,14 +421,19 @@ class EngineBridge:
         perf = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
         perf["total_sec"] = round(self._now() - t0, 4)
         perf["result_cache_hit"] = False
+        perf["result_cache_key_tail"] = ck_tail
+        perf["result_cache_miss_reason"] = miss_reason
         out["perf"] = perf
         if out.get("ok"):
-            self._cache_put(self._result_cache, ck, dict(out))
+            self._cache_put(self._result_cache, ck, copy.deepcopy(out))
         self._diag(
             "run_live_panel.end",
             run_id=run_id,
             ok=bool(out.get("ok")),
             cache_hit=False,
+            cache_key_tail=ck_tail,
+            cache_miss_reason=miss_reason,
+            cache_ttl_sec=cache_ttl,
             elapsed_sec=round(self._now() - t0_diag, 4),
             error=str(out.get("error", "") or ""),
             loaded_assets=int(out.get("loaded_assets", 0) or 0),
@@ -450,7 +570,7 @@ class EngineBridge:
         )
         cached = self._cache_get(self._result_cache, ck, self._cache_ttl_backtest_sec)
         if isinstance(cached, dict):
-            out = dict(cached)
+            out = copy.deepcopy(cached)
             p = out.get("perf", {}) if isinstance(out.get("perf"), dict) else {}
             p["result_cache_hit"] = True
             out["perf"] = p
@@ -469,7 +589,7 @@ class EngineBridge:
         perf["result_cache_hit"] = False
         out["perf"] = perf
         if out.get("ok"):
-            self._cache_put(self._result_cache, ck, dict(out))
+            self._cache_put(self._result_cache, ck, copy.deepcopy(out))
         self._diag(
             "run_backtest.end",
             run_id=run_id,
@@ -1374,6 +1494,26 @@ class EngineBridge:
         t0_diag = self._now()
         self._diag("fetch_binance_portfolio.start", profile=str(profile_name or ""))
         with self._lock:
+            if not self._portfolio_cb_can_attempt():
+                retry_in = max(0.0, float(self._portfolio_cb_open_until) - self._now())
+                msg = f"Portfolio fetch temporarily paused ({retry_in:.1f}s) after repeated network/proxy failures."
+                self._diag(
+                    "fetch_binance_portfolio.end",
+                    level="WARNING",
+                    ok=False,
+                    elapsed_sec=round(self._now() - t0_diag, 4),
+                    error=msg,
+                    circuit_open=True,
+                    retry_in_sec=round(retry_in, 3),
+                    fail_count=int(self._portfolio_cb_fail_count or 0),
+                )
+                return {
+                    "ok": False,
+                    "error": msg,
+                    "circuit_open": True,
+                    "retry_in_sec": round(retry_in, 3),
+                    "fail_count": int(self._portfolio_cb_fail_count or 0),
+                }
             prefs = load_binance_preferences()
             secrets = load_binance_secrets()
             profiles = prefs.get("profiles", {}) if isinstance(prefs, dict) else {}
@@ -1394,7 +1534,9 @@ class EngineBridge:
             endpoint = str(profile.get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
             acct = self._signed_binance_get(endpoint, "/api/v3/account", creds["api_key"], creds["api_secret"], params={})
             if not acct.get("ok"):
-                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(acct.get("error", "account request failed")))
+                _err = str(acct.get("error", "account request failed"))
+                self._portfolio_cb_on_failure(_err)
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=_err)
                 return {"ok": False, "status": acct.get("status"), "error": acct.get("error", "account request failed")}
 
             try:
@@ -1402,8 +1544,10 @@ class EngineBridge:
                 tick.raise_for_status()
                 prices = tick.json()
             except Exception as e:
-                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=f"Failed to fetch prices: {e}")
-                return {"ok": False, "error": f"Failed to fetch prices: {e}"}
+                _err = f"Failed to fetch prices: {e}"
+                self._portfolio_cb_on_failure(_err)
+                self._diag("fetch_binance_portfolio.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=_err)
+                return {"ok": False, "error": _err}
 
             price_map: Dict[str, float] = {}
             if isinstance(prices, list):
@@ -1459,6 +1603,7 @@ class EngineBridge:
                 "total_est_usd": round(total_usd, 2),
                 "balances": rows,
             }
+            self._portfolio_cb_on_success()
             self._diag("fetch_binance_portfolio.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), profile=active, assets=len(rows), total_est_usd=round(total_usd, 2))
             return out
 
@@ -1735,49 +1880,49 @@ class EngineBridge:
         display_currency: str = "USD",
     ) -> Dict[str, Any]:
         t0_diag = self._now()
+        tf_list = [str(x).strip().lower() for x in (timeframes or ["4h", "8h", "12h", "1d"]) if str(x).strip()]
+        if not tf_list:
+            tf_list = ["4h", "8h", "12h", "1d"]
+        workers = max(1, min(8, int(os.environ.get("CTMT_OPEN_POS_ANALYSIS_WORKERS", "4") or "4")))
         self._diag(
             "analyze_open_positions_multi_tf.start",
             profile=str(profile_name or ""),
-            timeframes=",".join([str(x) for x in (timeframes or [])]),
+            timeframes=",".join(tf_list),
             display_currency=str(display_currency or "USD"),
+            workers=int(workers),
         )
-        with self._lock:
-            tf_list = [str(x).strip().lower() for x in (timeframes or ["4h", "8h", "12h", "1d"]) if str(x).strip()]
-            if not tf_list:
-                tf_list = ["4h", "8h", "12h", "1d"]
+        ledger = load_trade_ledger()
+        if not isinstance(ledger, dict):
+            ledger = default_trade_ledger()
+        open_positions = ledger.get("open_positions", {})
+        if not isinstance(open_positions, dict) or not open_positions:
+            ret = {"ok": True, "rows": [], "note": "No open positions in ledger."}
+            self._diag("analyze_open_positions_multi_tf.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), rows=0, note="no_open_positions")
+            return ret
 
-            ledger = load_trade_ledger()
-            if not isinstance(ledger, dict):
-                ledger = default_trade_ledger()
-            open_positions = ledger.get("open_positions", {})
-            if not isinstance(open_positions, dict) or not open_positions:
-                ret = {"ok": True, "rows": [], "note": "No open positions in ledger."}
-                self._diag("analyze_open_positions_multi_tf.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), rows=0, note="no_open_positions")
-                return ret
+        _, profile, _, err = self._resolve_active_binance_profile(profile_name)
+        if err:
+            self._diag("analyze_open_positions_multi_tf.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(err))
+            return {"ok": False, "error": err}
+        endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+        tuned = self.mod.TunedParams()
 
-            _, profile, _, err = self._resolve_active_binance_profile(profile_name)
-            if err:
-                self._diag("analyze_open_positions_multi_tf.end", level="ERROR", ok=False, elapsed_sec=round(self._now() - t0_diag, 4), error=str(err))
-                return {"ok": False, "error": err}
-            endpoint = str((profile or {}).get("endpoint", self._default_binance_endpoint()) or self._default_binance_endpoint())
+        positions: List[Dict[str, Any]] = [dict(pos) for pos in open_positions.values() if isinstance(pos, dict)]
 
-            rows: List[Dict[str, Any]] = []
-            for _, pos in open_positions.items():
-                if not isinstance(pos, dict):
-                    continue
-                base = str(pos.get("asset", "")).strip().upper()
-                quote = str(pos.get("quote_currency", "USDT")).strip().upper() or "USDT"
-                if not base:
-                    continue
-                symbol = f"{base}{quote}"
-                info = self._get_symbol_exchange_info(endpoint, symbol)
-                if not info:
-                    # skip non-Binance spot symbols in this monitor.
-                    continue
-                tf_actions: Dict[str, str] = {}
-                tf_scores: Dict[str, str] = {}
-                for tf in tf_list:
-                    tkr = f"{base}-{quote}"
+        def _analyze_position(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            base = str(pos.get("asset", "")).strip().upper()
+            quote = str(pos.get("quote_currency", "USDT")).strip().upper() or "USDT"
+            if not base:
+                return None
+            symbol = f"{base}{quote}"
+            info = self._get_symbol_exchange_info(endpoint, symbol)
+            if not info:
+                return None
+            tf_actions: Dict[str, str] = {}
+            tf_scores: Dict[str, str] = {}
+            tkr = f"{base}-{quote}"
+            for tf in tf_list:
+                try:
                     df = self.mod.fetch_with_cache(tkr, tf, is_crypto=True, years=2.2)
                     if df is None or len(df) < 60:
                         tf_actions[tf] = "N/A"
@@ -1788,7 +1933,7 @@ class EngineBridge:
                         tf_actions[tf] = "N/A"
                         tf_scores[tf] = "N/A"
                         continue
-                    table, _ = self.mod.build_live_tables(enriched, True, self.mod.TunedParams(), tf)
+                    table, _ = self.mod.build_live_tables(enriched, True, tuned, tf)
                     if table is None or table.empty:
                         tf_actions[tf] = "N/A"
                         tf_scores[tf] = "N/A"
@@ -1796,35 +1941,59 @@ class EngineBridge:
                     row = table.iloc[0]
                     tf_actions[tf] = str(row.get("Action", "N/A"))
                     tf_scores[tf] = str(row.get("Score", "N/A"))
+                except Exception:
+                    tf_actions[tf] = "N/A"
+                    tf_scores[tf] = "N/A"
 
-                sell_votes = sum([1 for v in tf_actions.values() if "SELL" in str(v).upper()])
-                hold_votes = sum([1 for v in tf_actions.values() if "HOLD" in str(v).upper()])
-                buy_votes = sum([1 for v in tf_actions.values() if "BUY" in str(v).upper()])
-                stance = "HOLD"
-                if sell_votes >= 3:
-                    stance = "REDUCE/EXIT"
-                elif buy_votes >= 3:
-                    stance = "HOLD/ADD"
-                rows.append(
-                    {
-                        "asset": base,
-                        "symbol": symbol,
-                        "qty": float(pos.get("qty", 0.0) or 0.0),
-                        "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
-                        "stance": stance,
-                        "buy_votes": buy_votes,
-                        "hold_votes": hold_votes,
-                        "sell_votes": sell_votes,
-                        "actions": tf_actions,
-                        "scores": tf_scores,
-                        "display_currency": str(display_currency or "USD").strip().upper() or "USD",
-                    }
-                )
+            sell_votes = sum(1 for v in tf_actions.values() if "SELL" in str(v).upper())
+            hold_votes = sum(1 for v in tf_actions.values() if "HOLD" in str(v).upper())
+            buy_votes = sum(1 for v in tf_actions.values() if "BUY" in str(v).upper())
+            stance = "HOLD"
+            if sell_votes >= 3:
+                stance = "REDUCE/EXIT"
+            elif buy_votes >= 3:
+                stance = "HOLD/ADD"
+            return {
+                "asset": base,
+                "symbol": symbol,
+                "qty": float(pos.get("qty", 0.0) or 0.0),
+                "entry_price": float(pos.get("entry_price", 0.0) or 0.0),
+                "stance": stance,
+                "buy_votes": buy_votes,
+                "hold_votes": hold_votes,
+                "sell_votes": sell_votes,
+                "actions": tf_actions,
+                "scores": tf_scores,
+                "display_currency": str(display_currency or "USD").strip().upper() or "USD",
+            }
 
-            rows = sorted(rows, key=lambda r: int(r.get("sell_votes", 0)), reverse=True)
-            ret = {"ok": True, "rows": rows}
-            self._diag("analyze_open_positions_multi_tf.end", ok=True, elapsed_sec=round(self._now() - t0_diag, 4), rows=len(rows))
-            return ret
+        rows: List[Dict[str, Any]] = []
+        if workers <= 1 or len(positions) <= 1:
+            for pos in positions:
+                rr = _analyze_position(pos)
+                if isinstance(rr, dict):
+                    rows.append(rr)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_analyze_position, pos) for pos in positions]
+                for fut in as_completed(futs):
+                    try:
+                        rr = fut.result()
+                    except Exception:
+                        rr = None
+                    if isinstance(rr, dict):
+                        rows.append(rr)
+
+        rows = sorted(rows, key=lambda r: int(r.get("sell_votes", 0)), reverse=True)
+        ret = {"ok": True, "rows": rows}
+        self._diag(
+            "analyze_open_positions_multi_tf.end",
+            ok=True,
+            elapsed_sec=round(self._now() - t0_diag, 4),
+            rows=len(rows),
+            workers=int(workers),
+        )
+        return ret
 
     def evaluate_agent_policy(
         self,
@@ -2096,6 +2265,16 @@ class EngineBridge:
                 if matched_idx is not None:
                     rec = dict(entries[matched_idx]) if isinstance(entries[matched_idx], dict) else {}
                     entry_id = int(rec.get("id", 0) or 0) or (matched_idx + 1)
+                    # Clear stale close/pnl linkage when replacing placeholder rows with
+                    # reconciled fills to avoid inconsistent downstream FIFO/PnL views.
+                    for stale_key in (
+                        "closed_entry_id",
+                        "pnl_pct",
+                        "pnl_quote",
+                        "pnl_display",
+                        "fx_usd_to_display",
+                    ):
+                        rec.pop(stale_key, None)
                     rec.update(
                         {
                             "id": entry_id,

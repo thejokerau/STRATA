@@ -10,6 +10,38 @@
 - Runtime diagnostics: `logs/runtime_diag.jsonl`
 
 ### Recently Completed (Latest Session)
+- Improved live-panel cache stability and diagnostics:
+  - normalized `run_live_panel` cache key (removed panel-name entropy)
+  - raised default live cache TTL baseline (`CTMT_CACHE_TTL_LIVE_SEC` now defaults higher in Streamlit path)
+  - added cache key tail + miss-reason telemetry (`miss_no_entry` vs `miss_ttl_expired`)
+- Reduced open-position analysis contention and runtime tails:
+  - removed long-held bridge lock around `analyze_open_positions_multi_tf`
+  - added bounded symbol-level parallelism (`CTMT_OPEN_POS_ANALYSIS_WORKERS`, default 4)
+  - added worker-count diagnostics on start/end events
+- Added portfolio-fetch pressure controls and visibility:
+  - session-thread-safe portfolio-only cache helper in Streamlit to reduce duplicate `fetch_binance_portfolio` calls
+  - portfolio bundle stage timing with soft-timeout signal (`CTMT_PORTFOLIO_STAGE_SOFT_TIMEOUT_SEC`)
+  - prefetch UI now surfaces per-stage timings and soft-timeout warnings
+  - settings now display Binance portfolio circuit-breaker state (`OPEN/retry/failure streak`)
+- Added configurable min-notional safety buffer for AI recommendation execution:
+  - new controls in AI Signal Test Controls:
+    - `MinNotional buffer %`
+    - `MinNotional buffer (abs)`
+  - BUY/SELL sizing and quote-notional conversion now target buffered min-notional instead of bare exchange minimum
+  - prevents fragile near-minimum recommendations that can fail after price drift
+- Reworked FIFO Open-to-Close tracker toward ledger-truth:
+  - added `Use reconciled-only rows` toggle (default OFF = ledger-truth mode)
+  - FIFO now surfaces diagnostics tabs for `Unmatched SELL` and `Excluded Rows`
+  - summary now includes excluded-row count and unmatched SELL quantity
+  - reconcile placeholder upgrades now clear stale `closed_entry_id`/`pnl_*` fields before applying reconciled fill data
+- Fixed worker-thread session-state violations in async protection/unified paths:
+  - background workers now return payload-only results
+  - pending recommendations and shared UI/session updates are now applied in main thread after `_consume_bg_job(...)`
+  - removed `st.session_state` captures from async job lambdas by snapshotting inputs before launch
+- Added open-position freshness gating with configurable TTL (`open_pos_review_ttl_sec`) and optional force-refresh toggle in UI.
+- Added global prefetch throttling while heavy jobs are running (Unified, Protect Live>BT>AI, Live Dashboard, Backtest, Pipeline), with visible defer status/logging.
+- Added live panel cache TTL control (`live_panel_cache_ttl_sec`) and set a higher default live cache TTL for better repeat-hit chances.
+- Improved stage visibility for long protection flows with explicit `[STAGE] ...` progress lines in worker logs.
 - Converted additional heavy synchronous flows to async/background execution:
   - `Retrofit Selected Position to OCO`
   - `Standard Research` + `Comprehensive Research`
@@ -27,15 +59,13 @@
   - `python -m py_compile streamlit_app/app.py` passes
 
 ### Current Known Issues from Logs (Need Follow-up)
-- Background async jobs can still fail due to Streamlit session-state access in worker threads:
-  - `Unified Cycle (Manage+Discover) (async)` -> missing `task_logs`
-  - `Protect Open Positions (Live->BT->AI) (async)` -> missing `pending_recs`
 - Performance bottleneck remains:
   - `analyze_open_positions_multi_tf` consistently ~83-86s in diagnostics
 - Live dashboard cache behavior appears suboptimal:
   - recent `run_live_panel.end` entries show `cache_hit=false` repeatedly
-- Prefetch churn/load is high:
-  - `Global Prefetch Bundle (async)` runs frequently (~60s cadence), ~6s each
+- Need interactive verification pass in full Streamlit UI:
+  - confirm no new worker-thread `st.session_state` AttributeErrors during repeated Unified/Protect runs
+  - validate cache-hit improvement after TTL/key stability updates under repeated same-profile runs
 
 ### Immediate Next Actions (for new chat thread)
 1. Remove all worker-thread `st.session_state` access:
@@ -368,13 +398,13 @@
 
 <!-- AUTO_HANDBACK_START -->
 ## Automated Research Status
-- Last update UTC: 2026-04-17T05:09:11+00:00
-- Latest experiment artifact: `experiments/runs/run_20260417T050911Z.json`
+- Last update UTC: 2026-04-17T16:29:33+00:00
+- Latest experiment artifact: `experiments/runs/run_20260417T162932Z.json`
 - Champion scenarios tracked: 173
 - Latest run summary:
-- `scenario`: selected `tuned`, return +230.16%, maxDD 39.45%, sharpe 1.20
-- `scenario`: selected `tuned`, return +76.43%, maxDD 33.65%, sharpe 1.27
-- `scenario`: selected `tuned`, return +158.88%, maxDD 38.42%, sharpe 1.15
-- `scenario`: selected `tuned`, return +194.20%, maxDD 37.97%, sharpe 1.15
+- `scenario`: selected `tuned`, return +46.29%, maxDD 37.31%, sharpe 0.93
+- `scenario`: selected `tuned`, return +104.58%, maxDD 29.54%, sharpe 1.04
+- `scenario`: selected `tuned`, return +81.80%, maxDD 35.07%, sharpe 0.96
+- `scenario`: selected `tuned`, return +130.34%, maxDD 33.76%, sharpe 1.06
 <!-- AUTO_HANDBACK_END -->
 
