@@ -2119,6 +2119,127 @@ class EngineBridge:
                 "reasons": reasons,
             }
 
+    def _rebuild_open_positions_from_entries(self, entries: Any) -> Dict[str, Dict[str, Any]]:
+        lots: Dict[str, List[Dict[str, Any]]] = {}
+        if not isinstance(entries, list):
+            return {}
+        ev_rows: List[Dict[str, Any]] = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if not bool(e.get("is_execution", False)):
+                continue
+            action = str(e.get("action", "")).strip().upper()
+            if action not in ("BUY", "SELL"):
+                continue
+            market = str(e.get("market", "crypto") or "crypto").strip().lower()
+            timeframe = str(e.get("timeframe", "spot") or "spot").strip().lower()
+            asset = str(e.get("asset", "") or "").strip().upper()
+            if not asset:
+                continue
+            quote = str(e.get("quote_currency", "USDT") or "USDT").strip().upper() or "USDT"
+            display = str(e.get("display_currency", "USD") or "USD").strip().upper() or "USD"
+            panel = str(e.get("panel", "") or "").strip()
+            sym = str(e.get("exchange_symbol", "") or "").strip().upper()
+            if not sym:
+                sym = f"{asset}{quote}"
+            try:
+                qty = float(e.get("qty", 0.0) or 0.0)
+                px = float(e.get("price", 0.0) or 0.0)
+            except Exception:
+                qty, px = 0.0, 0.0
+            if qty <= 0 or px <= 0:
+                continue
+            ts = str(e.get("ts", "") or "")
+            try:
+                ts_ord = float(pd.Timestamp(pd.to_datetime(ts, utc=True, errors="coerce")).value)
+            except Exception:
+                ts_ord = 0.0
+            try:
+                eid = int(e.get("id", 0) or 0)
+            except Exception:
+                eid = 0
+            ev_rows.append(
+                {
+                    "key": f"{market}|{timeframe}|{asset}",
+                    "action": action,
+                    "qty": qty,
+                    "price": px,
+                    "ts": ts,
+                    "ord": ts_ord,
+                    "id": eid,
+                    "asset": asset,
+                    "market": market,
+                    "timeframe": timeframe,
+                    "quote_currency": quote,
+                    "display_currency": display,
+                    "panel": panel,
+                    "symbol": sym,
+                }
+            )
+        ev_rows.sort(key=lambda r: (float(r.get("ord", 0.0) or 0.0), int(r.get("id", 0) or 0)))
+
+        for r in ev_rows:
+            key = str(r.get("key", ""))
+            action = str(r.get("action", ""))
+            qty = float(r.get("qty", 0.0) or 0.0)
+            book = lots.setdefault(key, [])
+            if action == "BUY":
+                book.append(
+                    {
+                        "entry_id": int(r.get("id", 0) or 0),
+                        "entry_ts": str(r.get("ts", "") or ""),
+                        "entry_price": float(r.get("price", 0.0) or 0.0),
+                        "qty_remain": qty,
+                        "quote_currency": str(r.get("quote_currency", "USDT") or "USDT"),
+                        "display_currency": str(r.get("display_currency", "USD") or "USD"),
+                        "asset": str(r.get("asset", "") or ""),
+                        "market": str(r.get("market", "crypto") or "crypto"),
+                        "timeframe": str(r.get("timeframe", "spot") or "spot"),
+                        "panel": str(r.get("panel", "") or ""),
+                        "symbol": str(r.get("symbol", "") or ""),
+                    }
+                )
+                continue
+            rem = qty
+            while rem > 1e-12 and book:
+                lot = book[0]
+                lq = float(lot.get("qty_remain", 0.0) or 0.0)
+                if lq <= 1e-12:
+                    book.pop(0)
+                    continue
+                take = min(rem, lq)
+                lot["qty_remain"] = lq - take
+                rem -= take
+                if float(lot.get("qty_remain", 0.0) or 0.0) <= 1e-12:
+                    book.pop(0)
+            lots[key] = book
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, book in lots.items():
+            if not isinstance(book, list) or not book:
+                continue
+            qty_open = sum(float(x.get("qty_remain", 0.0) or 0.0) for x in book)
+            if qty_open <= 1e-12:
+                continue
+            notional_open = sum(float(x.get("qty_remain", 0.0) or 0.0) * float(x.get("entry_price", 0.0) or 0.0) for x in book)
+            first = book[0]
+            entry_price_avg = (notional_open / qty_open) if notional_open > 0 else float(first.get("entry_price", 0.0) or 0.0)
+            out[str(key)] = {
+                "entry_id": int(first.get("entry_id", 0) or 0),
+                "entry_ts": str(first.get("entry_ts", "") or ""),
+                "entry_price": float(entry_price_avg),
+                "qty": float(qty_open),
+                "quote_currency": str(first.get("quote_currency", "USDT") or "USDT").strip().upper() or "USDT",
+                "display_currency": str(first.get("display_currency", "USD") or "USD").strip().upper() or "USD",
+                "asset": str(first.get("asset", "") or "").strip().upper(),
+                "market": str(first.get("market", "crypto") or "crypto").strip().lower() or "crypto",
+                "timeframe": str(first.get("timeframe", "spot") or "spot").strip().lower() or "spot",
+                "panel": str(first.get("panel", "") or "").strip(),
+                "symbol": str(first.get("symbol", "") or "").strip().upper(),
+            }
+        return out
+
     def reconcile_binance_fills(
         self,
         profile_name: Optional[str] = None,
@@ -2165,6 +2286,35 @@ class EngineBridge:
                 open_positions = {}
             if not isinstance(activity_guard, dict):
                 activity_guard = {}
+
+            # Expand reconciliation scope with ledger-known symbols so we can catch
+            # closing sells for assets that no longer appear in current balances.
+            for v in open_positions.values():
+                if not isinstance(v, dict):
+                    continue
+                sym = str(v.get("symbol", "") or "").strip().upper()
+                if not sym:
+                    asset = str(v.get("asset", "") or "").strip().upper()
+                    quote = str(v.get("quote_currency", "USDT") or "USDT").strip().upper() or "USDT"
+                    if asset:
+                        sym = f"{asset}{quote}"
+                if sym and sym not in seen_syms:
+                    seen_syms.add(sym)
+                    syms.append(sym)
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if not bool(e.get("is_execution", False)):
+                    continue
+                sym = str(e.get("exchange_symbol", "") or "").strip().upper()
+                if not sym:
+                    asset = str(e.get("asset", "") or "").strip().upper()
+                    quote = str(e.get("quote_currency", "USDT") or "USDT").strip().upper() or "USDT"
+                    if asset:
+                        sym = f"{asset}{quote}"
+                if sym and sym not in seen_syms:
+                    seen_syms.add(sym)
+                    syms.append(sym)
 
             existing_trade_keys: set = set()
             for e in entries:
@@ -2342,6 +2492,7 @@ class EngineBridge:
                         "market": "crypto",
                         "timeframe": "spot",
                         "panel": "binance_reconcile",
+                        "symbol": str(rec.get("exchange_symbol", "") or "").strip().upper() or f"{rec['asset']}{rec['quote_currency']}",
                     }
                 elif rec["action"] == "SELL":
                     if isinstance(open_pos, dict):
@@ -2388,7 +2539,7 @@ class EngineBridge:
                         open_positions.pop(pos_key, None)
 
             ledger["entries"] = entries
-            ledger["open_positions"] = open_positions
+            ledger["open_positions"] = self._rebuild_open_positions_from_entries(entries)
             ledger["activity_guard"] = activity_guard
             save_trade_ledger(ledger)
             ret = {
@@ -2442,22 +2593,41 @@ class EngineBridge:
                     entries_changed = True
                 else:
                     ee["is_execution"] = bool(ee.get("is_execution", False))
+                panel = str(ee.get("panel", "") or "").strip().lower()
+                ex_trade_id = str(ee.get("exchange_trade_id", "") or "").strip()
+                if ex_trade_id.lower() in ("nan", "none", "null"):
+                    ex_trade_id = ""
+                    ee["exchange_trade_id"] = ""
+                    entries_changed = True
+                ex_symbol = str(ee.get("exchange_symbol", "") or "").strip().upper()
+                if ex_symbol.lower() in ("nan", "none", "null"):
+                    ex_symbol = ""
+                    ee["exchange_symbol"] = ""
+                    entries_changed = True
+                try:
+                    px = float(ee.get("price", 0.0) or 0.0)
+                except Exception:
+                    px = 0.0
+                # Queue submissions are intents/placeholders until reconciled.
+                if panel == "ai_trade_queue" and (px <= 0 or not ex_trade_id):
+                    if bool(ee.get("is_execution", False)):
+                        ee["is_execution"] = False
+                        entries_changed = True
+                    ee["is_placeholder"] = True
+                    for stale_key in (
+                        "closed_entry_id",
+                        "pnl_pct",
+                        "pnl_quote",
+                        "pnl_display",
+                        "fx_usd_to_display",
+                    ):
+                        if stale_key in ee:
+                            ee.pop(stale_key, None)
+                            entries_changed = True
                 fixed_entries.append(ee)
 
-            cleaned: Dict[str, Any] = {}
-            changed = False
-            for k, v in open_positions.items():
-                if not isinstance(k, str) or not isinstance(v, dict):
-                    changed = True
-                    continue
-                try:
-                    qty = float(v.get("qty", 0.0) or 0.0)
-                except Exception:
-                    qty = 0.0
-                if qty <= 0:
-                    changed = True
-                    continue
-                cleaned[k] = v
+            cleaned = self._rebuild_open_positions_from_entries(fixed_entries)
+            changed = cleaned != open_positions
             if changed or entries_changed:
                 ledger["entries"] = fixed_entries
                 ledger["open_positions"] = cleaned
@@ -2510,21 +2680,7 @@ class EngineBridge:
                 if isinstance(e, dict):
                     e["id"] = i
             ledger["entries"] = new_entries
-            # Also clean open positions to execution-only sane rows.
-            open_positions = ledger.get("open_positions", {})
-            if not isinstance(open_positions, dict):
-                open_positions = {}
-            clean_open = {}
-            for k, v in open_positions.items():
-                if not isinstance(k, str) or not isinstance(v, dict):
-                    continue
-                try:
-                    q = float(v.get("qty", 0.0) or 0.0)
-                except Exception:
-                    q = 0.0
-                if q > 0:
-                    clean_open[k] = v
-            ledger["open_positions"] = clean_open
+            ledger["open_positions"] = self._rebuild_open_positions_from_entries(new_entries)
             save_trade_ledger(ledger)
             return {
                 "ok": True,
@@ -2563,6 +2719,9 @@ class EngineBridge:
             note = str(event.get("note", "")).strip()
             score = str(event.get("score", "")).strip()
             is_execution = bool(event.get("is_execution", False))
+            exchange_trade_id = str(event.get("exchange_trade_id", "") or "").strip()
+            if exchange_trade_id.lower() in ("nan", "none", "null"):
+                exchange_trade_id = ""
             quote_currency = str(event.get("quote_currency", "USD")).strip().upper() or "USD"
             display_currency = str(event.get("display_currency", "USD")).strip().upper() or "USD"
             try:
@@ -2573,6 +2732,9 @@ class EngineBridge:
                 qty = float(event.get("qty", 0.0) or 0.0)
             except Exception:
                 qty = 0.0
+            panel_l = str(panel or "").strip().lower()
+            if panel_l == "ai_trade_queue" and (price <= 0 or not exchange_trade_id):
+                is_execution = False
 
             if not asset or action not in ("BUY", "SELL", "HOLD"):
                 return {"ok": False, "error": "Event must include valid asset and action (BUY/SELL/HOLD)."}
@@ -2618,6 +2780,8 @@ class EngineBridge:
             for extra_key in ("exchange_symbol", "exchange_trade_id", "exchange_order_id", "is_placeholder"):
                 if extra_key in event:
                     rec[extra_key] = event.get(extra_key)
+            if panel_l == "ai_trade_queue" and not bool(rec.get("is_execution", False)):
+                rec["is_placeholder"] = True
             entries.append(rec)
             if action != "HOLD" or guard_hold_signals:
                 activity_guard[guard_key] = {"ts": rec["ts"], "id": entry_id}
@@ -2685,7 +2849,7 @@ class EngineBridge:
                     open_positions.pop(pos_key, None)
 
             ledger["entries"] = entries
-            ledger["open_positions"] = open_positions
+            ledger["open_positions"] = self._rebuild_open_positions_from_entries(entries)
             ledger["activity_guard"] = activity_guard
             save_trade_ledger(ledger)
             return {"ok": True, "entry": rec}

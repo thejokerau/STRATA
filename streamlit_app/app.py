@@ -2082,6 +2082,11 @@ def _reconcile_fills_for_profile_sync(profile: str, quote_pref: str = "USDT") ->
                 if not isinstance(v, dict):
                     continue
                 sym = str(v.get("symbol", "")).strip().upper()
+                if not sym:
+                    asset = str(v.get("asset", "")).strip().upper()
+                    quote = str(v.get("quote_currency", qpref)).strip().upper() or qpref
+                    if asset:
+                        sym = f"{asset}{quote}"
                 if sym:
                     syms_set.add(sym)
     except Exception:
@@ -2389,15 +2394,23 @@ def _apply_signal_controls(
 
 
 def _confirmed_execution_rows(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _norm_text(v: Any) -> str:
+        if pd.isna(v):
+            return ""
+        s = str(v or "").strip()
+        if s.lower() in ("nan", "none", "null"):
+            return ""
+        return s
+
     rows: List[Dict[str, Any]] = []
     for e in entries:
         if not isinstance(e, dict):
             continue
         if not bool(e.get("is_execution", False)):
             continue
-        panel = str(e.get("panel", "") or "").strip().lower()
-        ex_trade_id = str(e.get("exchange_trade_id", "") or "").strip()
-        note = str(e.get("note", "") or "").strip().lower()
+        panel = _norm_text(e.get("panel", "")).lower()
+        ex_trade_id = _norm_text(e.get("exchange_trade_id", ""))
+        note = _norm_text(e.get("note", "")).lower()
         is_confirmed_fill = bool(panel == "binance_reconcile" or ex_trade_id or ("reconciled binance fill" in note))
         if not is_confirmed_fill:
             continue
@@ -2411,10 +2424,10 @@ def _confirmed_execution_rows(entries: List[Dict[str, Any]]) -> List[Dict[str, A
             qty, px = 0.0, 0.0
         if qty <= 0 or px <= 0:
             continue
-        sym = str(e.get("exchange_symbol", "")).strip().upper()
+        sym = _norm_text(e.get("exchange_symbol", "")).upper()
         if not sym:
-            asset = str(e.get("asset", "")).strip().upper()
-            quote = str(e.get("quote_currency", "USDT")).strip().upper() or "USDT"
+            asset = _norm_text(e.get("asset", "")).upper()
+            quote = _norm_text(e.get("quote_currency", "USDT")).upper() or "USDT"
             if not asset:
                 continue
             sym = f"{asset}{quote}"
@@ -2432,6 +2445,15 @@ def _execution_events_from_ledger_df(
     ledger_df: pd.DataFrame,
     use_confirmed_only: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def _clean_series_str(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+        if col not in df.columns:
+            s = pd.Series([default] * len(df), index=df.index, dtype=object)
+        else:
+            s = df[col]
+        s = s.fillna("").astype(str).str.strip()
+        s = s.mask(s.str.lower().isin(["nan", "none", "null"]), "")
+        return s
+
     base_cols = ["id", "ts", "symbol", "action", "qty", "price", "panel", "exchange_trade_id", "note"]
     if not isinstance(ledger_df, pd.DataFrame) or ledger_df.empty:
         return pd.DataFrame(columns=base_cols), pd.DataFrame(columns=base_cols + ["exclude_reason"])
@@ -2443,15 +2465,16 @@ def _execution_events_from_ledger_df(
     d["qty"] = pd.to_numeric(d.get("qty", 0.0), errors="coerce").fillna(0.0)
     d["price"] = pd.to_numeric(d.get("price", 0.0), errors="coerce").fillna(0.0)
     d["ts"] = pd.to_datetime(d.get("ts"), errors="coerce", utc=True)
-    d["panel"] = d.get("panel", "").astype(str).str.strip().str.lower()
-    d["exchange_trade_id"] = d.get("exchange_trade_id", "").astype(str).str.strip()
-    d["note"] = d.get("note", "").astype(str).str.strip()
+    d["panel"] = _clean_series_str(d, "panel").str.lower()
+    d["exchange_trade_id"] = _clean_series_str(d, "exchange_trade_id")
+    d["note"] = _clean_series_str(d, "note")
     note_l = d["note"].str.lower()
     confirmed = (d["panel"] == "binance_reconcile") | (d["exchange_trade_id"] != "") | (note_l.str.contains("reconciled binance fill", na=False))
 
-    sym = d.get("exchange_symbol", "").astype(str).str.strip().str.upper()
-    asset = d.get("asset", "").astype(str).str.strip().str.upper()
-    quote = d.get("quote_currency", "USDT").astype(str).str.strip().str.upper()
+    sym = _clean_series_str(d, "exchange_symbol").str.upper()
+    asset = _clean_series_str(d, "asset").str.upper()
+    quote = _clean_series_str(d, "quote_currency", "USDT").str.upper()
+    quote = quote.mask(quote == "", "USDT")
     fallback = asset + quote
     d["symbol"] = sym.where(sym != "", fallback)
     if "id" not in d.columns:
@@ -2476,6 +2499,7 @@ def _fifo_open_close_journal(
     ledger_df: pd.DataFrame,
     profile_name: str = "",
     use_confirmed_only: bool = False,
+    seed_carry_in: bool = False,
 ) -> Dict[str, Any]:
     ev, excluded_df = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=bool(use_confirmed_only))
     if ev.empty:
@@ -2491,12 +2515,60 @@ def _fifo_open_close_journal(
                 "unmatched_sell_rows": 0,
                 "unmatched_sell_qty": 0.0,
                 "excluded_rows": int(len(excluded_df)),
+                "carry_in_seed_qty": 0.0,
+                "carry_in_match_rows": 0,
+                "carry_in_match_qty": 0.0,
+                "realized_quote_known": 0.0,
             },
         }
 
     lots: Dict[str, List[Dict[str, Any]]] = {}
     closed_rows: List[Dict[str, Any]] = []
     unmatched_sell_rows: List[Dict[str, Any]] = []
+    carry_in_seed_qty_by_symbol: Dict[str, float] = {}
+    carry_in_seed_px_by_symbol: Dict[str, float] = {}
+
+    if bool(seed_carry_in):
+        ev_seed = ev.sort_values(["ts", "id"]).reset_index(drop=True)
+        for sym, g in ev_seed.groupby("symbol", dropna=False):
+            run_qty = 0.0
+            min_run_qty = 0.0
+            carry_weighted_notional = 0.0
+            carry_weighted_qty = 0.0
+            for _, sr in g.iterrows():
+                side = str(sr.get("action", "")).upper()
+                qty = float(sr.get("qty", 0.0) or 0.0)
+                px = float(sr.get("price", 0.0) or 0.0)
+                if side == "BUY":
+                    run_qty += qty
+                elif side == "SELL":
+                    prev_run = run_qty
+                    run_qty -= qty
+                    deficit = max(0.0, qty - max(prev_run, 0.0))
+                    if deficit > 1e-12 and px > 0:
+                        carry_weighted_notional += deficit * px
+                        carry_weighted_qty += deficit
+                min_run_qty = min(min_run_qty, run_qty)
+            need_carry = max(0.0, -min_run_qty)
+            if need_carry > 1e-12:
+                sym_s = str(sym or "")
+                carry_in_seed_qty_by_symbol[sym_s] = need_carry
+                if carry_weighted_qty > 1e-12:
+                    carry_in_seed_px_by_symbol[sym_s] = carry_weighted_notional / carry_weighted_qty
+                else:
+                    carry_in_seed_px_by_symbol[sym_s] = 0.0
+                first_ts = pd.to_datetime(g.get("ts"), errors="coerce", utc=True).min()
+                first_id = int(pd.to_numeric(g.get("id"), errors="coerce").min())
+                seed_ts = (first_ts - pd.Timedelta(seconds=1)) if pd.notna(first_ts) else pd.Timestamp(datetime.now(timezone.utc))
+                lots.setdefault(sym_s, []).append(
+                    {
+                        "entry_id": -max(1, first_id),
+                        "entry_ts": seed_ts,
+                        "entry_price": float(carry_in_seed_px_by_symbol.get(sym_s, 0.0) or 0.0),
+                        "qty_remain": need_carry,
+                        "source": "carry_in_seed",
+                    }
+                )
 
     for _, r in ev.iterrows():
         sym = str(r["symbol"])
@@ -2519,8 +2591,9 @@ def _fifo_open_close_journal(
                 continue
             take = min(rem, lq)
             entry_px = float(lot.get("entry_price", 0.0) or 0.0)
-            pnl_q = (px - entry_px) * take
-            pnl_pct = ((px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0
+            is_carry = str(lot.get("source", "")).strip().lower() == "carry_in_seed"
+            pnl_q = float("nan") if is_carry else (px - entry_px) * take
+            pnl_pct = float("nan") if is_carry else (((px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0)
             hold_h = (ts - pd.Timestamp(lot.get("entry_ts"))).total_seconds() / 3600.0
             closed_rows.append(
                 {
@@ -2535,6 +2608,8 @@ def _fifo_open_close_journal(
                     "pnl_quote": pnl_q,
                     "pnl_pct": pnl_pct,
                     "hold_hours": hold_h,
+                    "entry_source": str(lot.get("source", "") or "ledger"),
+                    "pnl_known": not is_carry,
                 }
             )
             lot["qty_remain"] = lq - take
@@ -2589,6 +2664,7 @@ def _fifo_open_close_journal(
                     "current_price": cur,
                     "unrealized_quote": upnl,
                     "unrealized_pct": upnl_pct,
+                    "entry_source": str(lot.get("source", "") or "ledger"),
                 }
             )
     open_df = pd.DataFrame(open_rows)
@@ -2600,7 +2676,14 @@ def _fifo_open_close_journal(
         unmatched_df = unmatched_df.sort_values(["exit_ts", "symbol"]).reset_index(drop=True)
 
     realized_total = float(closed_df["pnl_quote"].sum()) if not closed_df.empty and "pnl_quote" in closed_df.columns else 0.0
+    realized_known = float(pd.to_numeric(closed_df.get("pnl_quote"), errors="coerce").sum()) if not closed_df.empty else 0.0
     unmatched_qty_total = float(unmatched_df["unmatched_qty"].sum()) if not unmatched_df.empty and "unmatched_qty" in unmatched_df.columns else 0.0
+    carry_rows = pd.DataFrame()
+    if not closed_df.empty and "entry_source" in closed_df.columns:
+        carry_rows = closed_df[closed_df["entry_source"].astype(str).str.lower() == "carry_in_seed"].copy()
+    carry_qty = float(carry_rows["qty"].sum()) if not carry_rows.empty and "qty" in carry_rows.columns else 0.0
+    carry_count = int(len(carry_rows))
+    carry_seed_qty_total = float(sum(float(v or 0.0) for v in carry_in_seed_qty_by_symbol.values()))
     return {
         "closed": closed_df,
         "open_lots": open_df,
@@ -2613,8 +2696,114 @@ def _fifo_open_close_journal(
             "unmatched_sell_rows": int(len(unmatched_df)),
             "unmatched_sell_qty": float(unmatched_qty_total),
             "excluded_rows": int(len(excluded_df)),
+            "carry_in_seed_qty": float(carry_seed_qty_total),
+            "carry_in_match_rows": int(carry_count),
+            "carry_in_match_qty": float(carry_qty),
+            "realized_quote_known": float(realized_known),
         },
     }
+
+
+def _df_to_records(df: Any, max_rows: int = 5000) -> List[Dict[str, Any]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    d = df.copy()
+    if max_rows > 0 and len(d) > max_rows:
+        d = d.tail(max_rows)
+    # Normalize datetimes for JSON export readability.
+    for c in list(d.columns):
+        if pd.api.types.is_datetime64_any_dtype(d[c]):
+            try:
+                d[c] = d[c].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+    return d.to_dict(orient="records")
+
+
+def _build_fifo_debug_bundle(ledger_df: pd.DataFrame, profile_name: str = "") -> Dict[str, Any]:
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    ev_all, ex_all = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=False)
+    ev_conf, ex_conf = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=True)
+    fifo_all = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=False, seed_carry_in=False)
+    fifo_conf = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=True, seed_carry_in=False)
+    fifo_all_seeded = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=False, seed_carry_in=True)
+
+    d = ledger_df.copy() if isinstance(ledger_df, pd.DataFrame) else pd.DataFrame()
+    if not d.empty:
+        d["action"] = d.get("action", "").astype(str).str.upper()
+        d["panel"] = d.get("panel", "").astype(str).str.strip().str.lower()
+        d["exchange_trade_id"] = d.get("exchange_trade_id", "").fillna("").astype(str).str.strip()
+        d["exchange_symbol"] = d.get("exchange_symbol", "").fillna("").astype(str).str.strip().str.upper()
+        d["exchange_trade_id"] = d["exchange_trade_id"].mask(d["exchange_trade_id"].str.lower().isin(["nan", "none", "null"]), "")
+        d["exchange_symbol"] = d["exchange_symbol"].mask(d["exchange_symbol"].str.lower().isin(["nan", "none", "null"]), "")
+        d["qty"] = pd.to_numeric(d.get("qty", 0.0), errors="coerce").fillna(0.0)
+        d["price"] = pd.to_numeric(d.get("price", 0.0), errors="coerce").fillna(0.0)
+        d["ts_parsed"] = pd.to_datetime(d.get("ts"), errors="coerce", utc=True)
+
+    exec_df = pd.DataFrame()
+    if not d.empty:
+        exec_df = d[d.get("is_execution", False) == True].copy()  # noqa: E712
+        exec_df = exec_df[exec_df["action"].isin(["BUY", "SELL"])]
+
+    missing_trade_id = exec_df[exec_df["exchange_trade_id"] == ""] if not exec_df.empty else pd.DataFrame()
+    missing_symbol = exec_df[exec_df["exchange_symbol"] == ""] if not exec_df.empty else pd.DataFrame()
+    zero_price_qty = exec_df[(exec_df["qty"] <= 0) | (exec_df["price"] <= 0)] if not exec_df.empty else pd.DataFrame()
+    invalid_ts = exec_df[exec_df["ts_parsed"].isna()] if not exec_df.empty else pd.DataFrame()
+
+    dup_trade = pd.DataFrame()
+    if not exec_df.empty:
+        non_blank_trade = exec_df[exec_df["exchange_trade_id"] != ""]
+        if not non_blank_trade.empty:
+            dup_ids = non_blank_trade["exchange_trade_id"].value_counts()
+            dup_ids = dup_ids[dup_ids > 1].index.tolist()
+            if dup_ids:
+                dup_trade = non_blank_trade[non_blank_trade["exchange_trade_id"].isin(dup_ids)].copy()
+
+    open_pos = {}
+    try:
+        led_out = bridge.get_trade_ledger()
+        if led_out.get("ok"):
+            ldg = led_out.get("ledger", {}) if isinstance(led_out.get("ledger"), dict) else {}
+            open_pos = ldg.get("open_positions", {}) if isinstance(ldg.get("open_positions"), dict) else {}
+    except Exception:
+        open_pos = {}
+
+    out = {
+        "generated_at_utc": now_utc,
+        "profile_name": str(profile_name or ""),
+        "stats": {
+            "ledger_rows": int(len(d)) if isinstance(d, pd.DataFrame) else 0,
+            "execution_rows_buy_sell": int(len(exec_df)),
+            "fifo_ledger_truth_closed_rows": int((fifo_all.get("summary", {}) or {}).get("closed_rows", 0) or 0),
+            "fifo_ledger_truth_unmatched_sell_rows": int((fifo_all.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "fifo_confirmed_only_closed_rows": int((fifo_conf.get("summary", {}) or {}).get("closed_rows", 0) or 0),
+            "fifo_confirmed_only_unmatched_sell_rows": int((fifo_conf.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "fifo_ledger_truth_seeded_unmatched_sell_rows": int((fifo_all_seeded.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "missing_exchange_trade_id_rows": int(len(missing_trade_id)),
+            "missing_exchange_symbol_rows": int(len(missing_symbol)),
+            "zero_price_or_qty_rows": int(len(zero_price_qty)),
+            "invalid_ts_rows": int(len(invalid_ts)),
+            "duplicate_exchange_trade_id_rows": int(len(dup_trade)),
+            "open_positions_count": int(len(open_pos) if isinstance(open_pos, dict) else 0),
+        },
+        "fifo_ledger_truth_summary": dict(fifo_all.get("summary", {}) or {}),
+        "fifo_confirmed_only_summary": dict(fifo_conf.get("summary", {}) or {}),
+        "fifo_ledger_truth_seeded_summary": dict(fifo_all_seeded.get("summary", {}) or {}),
+        "open_positions_snapshot": open_pos,
+        "samples": {
+            "missing_exchange_trade_id": _df_to_records(missing_trade_id, max_rows=1000),
+            "missing_exchange_symbol": _df_to_records(missing_symbol, max_rows=1000),
+            "zero_price_or_qty": _df_to_records(zero_price_qty, max_rows=1000),
+            "invalid_ts": _df_to_records(invalid_ts, max_rows=1000),
+            "duplicate_exchange_trade_id": _df_to_records(dup_trade, max_rows=2000),
+            "fifo_unmatched_sells_ledger_truth": _df_to_records(fifo_all.get("unmatched_sells"), max_rows=2000),
+            "fifo_excluded_ledger_truth": _df_to_records(fifo_all.get("excluded"), max_rows=2000),
+            "fifo_unmatched_sells_confirmed_only": _df_to_records(fifo_conf.get("unmatched_sells"), max_rows=2000),
+            "fifo_excluded_confirmed_only": _df_to_records(fifo_conf.get("excluded"), max_rows=2000),
+        },
+        "ledger_tail": _df_to_records(d if isinstance(d, pd.DataFrame) else pd.DataFrame(), max_rows=5000),
+    }
+    return out
 
 
 def _fifo_cost_basis_by_symbol(entries: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -4917,11 +5106,21 @@ with tab_portfolio:
             "ON: only reconciled/confirmed rows are used.",
         )
     )
+    fifo_seed_carry_in = bool(
+        fifo_mode_col2.checkbox(
+            "Seed carry-in lots for pre-ledger inventory",
+            value=bool(st.session_state.get("fifo_seed_carry_in", True)),
+            key="fifo_seed_carry_in",
+            help="When ON, FIFO infers minimum starting inventory for symbols where the ledger begins mid-position. "
+            "Those seeded lots are marked as carry-in and their realized PnL is treated as unknown basis.",
+        )
+    )
     fifo_mode_col2.caption("Ledger-truth mode treats ledger execution rows as source of truth.")
     fifo = _fifo_open_close_journal(
         st.session_state.last_ledger_df,
         profile_name=str(fifo_profile or ""),
         use_confirmed_only=bool(fifo_confirmed_only),
+        seed_carry_in=bool(fifo_seed_carry_in),
     )
     fs = fifo.get("summary", {}) if isinstance(fifo.get("summary"), dict) else {}
     fc = fifo.get("closed", pd.DataFrame())
@@ -4931,12 +5130,35 @@ with tab_portfolio:
     f1, f2, f3, f4 = st.columns(4)
     f1.metric("Closed matches (FIFO)", f"{int(fs.get('closed_rows', 0) or 0)}")
     f2.metric("Open lots (FIFO)", f"{int(fs.get('open_lots', 0) or 0)}")
-    f3.metric("Realized PnL (quote)", f"{float(fs.get('realized_quote', 0.0) or 0.0):,.6f}")
+    f3.metric("Realized PnL (known basis)", f"{float(fs.get('realized_quote_known', fs.get('realized_quote', 0.0)) or 0.0):,.6f}")
     f4.metric("Unmatched SELL rows", f"{int(fs.get('unmatched_sell_rows', 0) or 0)}")
     st.caption(
         f"Excluded execution rows: {int(fs.get('excluded_rows', 0) or 0)} | "
-        f"Unmatched SELL qty total: {float(fs.get('unmatched_sell_qty', 0.0) or 0.0):.8f}"
+        f"Unmatched SELL qty total: {float(fs.get('unmatched_sell_qty', 0.0) or 0.0):.8f} | "
+        f"Carry-in seeded qty: {float(fs.get('carry_in_seed_qty', 0.0) or 0.0):.8f} | "
+        f"Carry-in matched rows: {int(fs.get('carry_in_match_rows', 0) or 0)} "
+        f"({float(fs.get('carry_in_match_qty', 0.0) or 0.0):.8f} qty)"
     )
+    dbg_c1, dbg_c2 = st.columns([1, 3])
+    if dbg_c1.button("Build FIFO Debug Bundle", key="fifo_build_debug_bundle"):
+        try:
+            bundle = _build_fifo_debug_bundle(
+                st.session_state.last_ledger_df if isinstance(st.session_state.last_ledger_df, pd.DataFrame) else pd.DataFrame(),
+                profile_name=str(fifo_profile or ""),
+            )
+            st.session_state.fifo_debug_bundle_text = json.dumps(bundle, indent=2, default=str)
+            st.success("FIFO debug bundle generated.")
+        except Exception as ex:
+            st.error(f"Could not build FIFO debug bundle: {ex}")
+    dbg_txt = str(st.session_state.get("fifo_debug_bundle_text", "") or "")
+    if dbg_txt:
+        dbg_c2.download_button(
+            "Download FIFO Debug Bundle (JSON)",
+            data=dbg_txt,
+            file_name=f"fifo_debug_bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="fifo_debug_bundle_download",
+        )
     if isinstance(st.session_state.last_ledger_df, pd.DataFrame) and not st.session_state.last_ledger_df.empty and "ts" in st.session_state.last_ledger_df.columns:
         try:
             _mx = pd.to_datetime(st.session_state.last_ledger_df["ts"], errors="coerce", utc=True).max()

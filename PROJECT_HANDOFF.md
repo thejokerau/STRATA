@@ -31,9 +31,18 @@
   - prevents fragile near-minimum recommendations that can fail after price drift
 - Reworked FIFO Open-to-Close tracker toward ledger-truth:
   - added `Use reconciled-only rows` toggle (default OFF = ledger-truth mode)
+  - added `Seed carry-in lots for pre-ledger inventory` toggle (default ON) to handle symbols where local ledger starts mid-position
+  - carry-in matches are now explicit (`entry_source=carry_in_seed`) and excluded from known-basis realized PnL
+  - FIFO summary now reports carry-in seeded qty and carry-in matched rows/qty
   - FIFO now surfaces diagnostics tabs for `Unmatched SELL` and `Excluded Rows`
   - summary now includes excluded-row count and unmatched SELL quantity
+  - added one-click `Build FIFO Debug Bundle` JSON export in Portfolio tab for deep correlation/debug analysis
+  - hardened execution-row normalization for FIFO (`NaN/None/null` handling for trade-id/symbol fields)
+  - queue placeholder rows (`panel=ai_trade_queue` with missing trade-id or non-positive price) are now auto-demoted from execution truth during ledger load
+  - open-position cleanup now drops invalid rows with non-positive qty or entry_price
   - reconcile placeholder upgrades now clear stale `closed_entry_id`/`pnl_*` fields before applying reconciled fill data
+  - fixed reconcile symbol discovery for zero-balance exits (derives symbols from `open_positions` asset+quote when `symbol` field missing, so symbols like DOGEUSDT are still queried after full exit)
+  - added engine-level `open_positions` rebuild from execution ledger rows after record/reconcile/prune/load flows to prevent stale portfolio state drift
 - Fixed worker-thread session-state violations in async protection/unified paths:
   - background workers now return payload-only results
   - pending recommendations and shared UI/session updates are now applied in main thread after `_consume_bg_job(...)`
