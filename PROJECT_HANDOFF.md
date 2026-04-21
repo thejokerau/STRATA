@@ -23,6 +23,7 @@
   - portfolio bundle stage timing with soft-timeout signal (`CTMT_PORTFOLIO_STAGE_SOFT_TIMEOUT_SEC`)
   - prefetch UI now surfaces per-stage timings and soft-timeout warnings
   - settings now display Binance portfolio circuit-breaker state (`OPEN/retry/failure streak`)
+  - open-position MTF review now merges ledger open positions with live portfolio holdings, so review is not undercounted when ledger state is stale/incomplete
 - Added configurable min-notional safety buffer for AI recommendation execution:
   - new controls in AI Signal Test Controls:
     - `MinNotional buffer %`
@@ -31,14 +32,44 @@
   - prevents fragile near-minimum recommendations that can fail after price drift
 - Reworked FIFO Open-to-Close tracker toward ledger-truth:
   - added `Use reconciled-only rows` toggle (default OFF = ledger-truth mode)
+  - added `Seed carry-in lots for pre-ledger inventory` toggle (default ON) to handle symbols where local ledger starts mid-position
+  - carry-in matches are now explicit (`entry_source=carry_in_seed`) and excluded from known-basis realized PnL
+  - FIFO summary now reports carry-in seeded qty and carry-in matched rows/qty
   - FIFO now surfaces diagnostics tabs for `Unmatched SELL` and `Excluded Rows`
   - summary now includes excluded-row count and unmatched SELL quantity
+  - added one-click `Build FIFO Debug Bundle` JSON export in Portfolio tab for deep correlation/debug analysis
+  - hardened execution-row normalization for FIFO (`NaN/None/null` handling for trade-id/symbol fields)
+  - queue placeholder rows (`panel=ai_trade_queue` with missing trade-id or non-positive price) are now auto-demoted from execution truth during ledger load
+  - open-position cleanup now drops invalid rows with non-positive qty or entry_price
   - reconcile placeholder upgrades now clear stale `closed_entry_id`/`pnl_*` fields before applying reconciled fill data
+  - fixed reconcile symbol discovery for zero-balance exits (derives symbols from `open_positions` asset+quote when `symbol` field missing, so symbols like DOGEUSDT are still queried after full exit)
+  - added engine-level `open_positions` rebuild from execution ledger rows after record/reconcile/prune/load flows to prevent stale portfolio state drift
 - Fixed worker-thread session-state violations in async protection/unified paths:
   - background workers now return payload-only results
   - pending recommendations and shared UI/session updates are now applied in main thread after `_consume_bg_job(...)`
   - removed `st.session_state` captures from async job lambdas by snapshotting inputs before launch
 - Added open-position freshness gating with configurable TTL (`open_pos_review_ttl_sec`) and optional force-refresh toggle in UI.
+- Added review-cache auto-sync in Portfolio tab:
+  - when FIFO `Open Lots` symbols differ from cached Open Position Review symbols, app now triggers a forced background review refresh
+  - avoids stale `last_review_df` undercount where cached review lags ledger/open-lot state
+- Hardened open-position MTF review row retention:
+  - analyzer now keeps holdings in output even when symbol metadata/market data is unavailable
+  - such rows are surfaced as `DATA_UNAVAILABLE` with `N/A` action/score instead of being silently dropped
+- Added Streamlit bridge/cache invalidation safeguards for review fixes:
+  - `get_bridge(...)` cache key now includes `engine_bridge.py` mtime so patched backend logic reloads without manual cache purges
+  - open-position review cache key now includes backend code version to avoid stale one-row payload reuse after code changes
+- Added recommendation order-type normalization guardrails:
+  - AI/free-form `order_type` values are now validated and normalized before submit (invalid SELL with SL/TP -> `OCO_BRACKET`, otherwise -> `MARKET`)
+  - prevents submit failures like `order_type must be MARKET, LIMIT, STOP_LOSS_LIMIT, or TAKE_PROFIT_LIMIT` from malformed textual order-type fields
+- Improved Pending Recommendations multi-order UX/perf:
+  - `Submit Selected` now runs as an async background batch job with progress lines, keeping UI responsive during multi-order sends
+  - added quick selection actions: `Select All`, `Select BUY`, `Select SELL`, `Clear Selection`
+  - submit results are applied back on main thread after job completion, followed by one status sync/queue compact pass
+- Hardened Binance SELL OCO submit constraints:
+  - engine now enforces relationship guards before OCO submit (`TP limit > last > stop trigger > stop-limit`)
+  - prevents Binance `-2010 The relationship of the prices for the orders is not correct` failures when normalized/derived order fields are borderline or malformed
+  - Streamlit OCO submit now caps SELL quantity to free (unlocked) base balance before send
+  - insufficient-balance auto-recovery now also applies to SELL `OCO_BRACKET` (cancel conflicting open SELL orders, then retry once)
 - Added global prefetch throttling while heavy jobs are running (Unified, Protect Live>BT>AI, Live Dashboard, Backtest, Pipeline), with visible defer status/logging.
 - Added live panel cache TTL control (`live_panel_cache_ttl_sec`) and set a higher default live cache TTL for better repeat-hit chances.
 - Improved stage visibility for long protection flows with explicit `[STAGE] ...` progress lines in worker logs.
@@ -52,6 +83,10 @@
   - in-tab active process monitor
   - in-session research run history (status/duration/summary/output size)
   - clear history control
+- Expanded Graph tab analytics:
+  - added win/loss and expectancy metrics from realized SELL history
+  - added profit-factor, gross/avg win-loss, and run-rate diagnostics
+  - added projected earnings table/chart for 7/14/30/60/90/180/365-day horizons using configurable lookback baseline
 - Addressed remaining heavy sync hotspots identified in Streamlit:
   - Graph PnL bootstrap no longer does direct synchronous ledger fetch
   - Reconcile no longer does synchronous open-position analyzer fallback

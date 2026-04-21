@@ -37,12 +37,18 @@ st.caption("Experimental Streamlit branch: `streamlit-nightly`")
 
 
 @st.cache_resource
-def get_bridge(repo_root: str) -> EngineBridge:
+def get_bridge(repo_root: str, bridge_code_version: int = 0) -> EngineBridge:
+    _ = int(bridge_code_version or 0)
     return EngineBridge(Path(repo_root))
 
 
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
-bridge = get_bridge(REPO_ROOT)
+_BRIDGE_CODE_VERSION = 0
+try:
+    _BRIDGE_CODE_VERSION = int((Path(REPO_ROOT) / "gui_app" / "engine_bridge.py").stat().st_mtime_ns)
+except Exception:
+    _BRIDGE_CODE_VERSION = 0
+bridge = get_bridge(REPO_ROOT, _BRIDGE_CODE_VERSION)
 diag = RuntimeDiagLogger(Path(REPO_ROOT))
 _DEFAULT_BG_WORKERS = max(1, min(16, int(os.environ.get("CTMT_STREAMLIT_BG_WORKERS", "4") or "4")))
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_DEFAULT_BG_WORKERS)
@@ -325,7 +331,7 @@ def _analyze_open_positions_cached(
     force_refresh: bool = False,
 ) -> Dict[str, Any]:
     tf_key = ",".join(str(x).strip().lower() for x in timeframes if str(x).strip())
-    cache_key = f"{str(profile).strip().lower()}::{tf_key}::{str(display_currency).strip().upper()}"
+    cache_key = f"{str(profile).strip().lower()}::{tf_key}::{str(display_currency).strip().upper()}::v{int(_BRIDGE_CODE_VERSION or 0)}"
     now = time.time()
     max_age = max(0.0, float(ttl_sec or 0.0))
     if not force_refresh and max_age > 0:
@@ -709,6 +715,7 @@ def _init_state() -> None:
         "bg_live_running_id": "",
         "bg_pipeline_running_id": "",
         "bg_unified_running_id": "",
+        "bg_submit_selected_job_id": "",
         "unified_monitor_enabled": False,
         "unified_monitor_interval_min": 30,
         "unified_monitor_next_epoch": 0.0,
@@ -1345,6 +1352,15 @@ def _latest_stage_label(lines: List[str]) -> str:
 
 
 def _extract_trade_recs(ai_text: str, default_tf: str = "4h") -> List[Dict[str, Any]]:
+    def _normalize_order_type(raw_type: Any, side: str, sl: float, tp: float) -> Tuple[str, str]:
+        valid = {"MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "OCO_BRACKET"}
+        raw = str(raw_type or "").strip().upper()
+        if raw in valid:
+            return raw, ""
+        if str(side or "").strip().upper() == "SELL" and float(sl or 0.0) > 0 and float(tp or 0.0) > 0:
+            return "OCO_BRACKET", f"normalized invalid order_type '{raw or 'EMPTY'}' -> OCO_BRACKET"
+        return "MARKET", f"normalized invalid order_type '{raw or 'EMPTY'}' -> MARKET"
+
     obj = _extract_json_block(ai_text, "BEGIN_STRATA_TRADE_PLAN_JSON", "END_STRATA_TRADE_PLAN_JSON")
     recs: List[Dict[str, Any]] = []
     if isinstance(obj, dict):
@@ -1357,22 +1373,28 @@ def _extract_trade_recs(ai_text: str, default_tf: str = "4h") -> List[Dict[str, 
                 sym = str(t.get("symbol", "")).strip().upper()
                 if side not in ("BUY", "SELL") or not sym:
                     continue
+                sl = float(t.get("stop_loss_price", 0.0) or 0.0)
+                tp = float(t.get("take_profit_price", 0.0) or 0.0)
+                typ, typ_note = _normalize_order_type(t.get("order_type", "MARKET"), side=side, sl=sl, tp=tp)
+                reason = str(t.get("reason", "AI structured recommendation") or "AI structured recommendation")
+                if typ_note:
+                    reason = f"{reason} | {typ_note}"
                 recs.append(
                     {
                         "symbol": sym,
                         "asset": re.sub(r"(USDT|USDC|BUSD|FDUSD|USD|BTC|ETH|BNB)$", "", sym),
                         "side": side,
-                        "order_type": str(t.get("order_type", "MARKET") or "MARKET").upper(),
+                        "order_type": typ,
                         "quantity": float(t.get("quantity", 0.0) or 0.0),
                         "quote_notional": float(t.get("quote_notional", 0.0) or 0.0),
-                        "stop_loss_price": float(t.get("stop_loss_price", 0.0) or 0.0),
-                        "take_profit_price": float(t.get("take_profit_price", 0.0) or 0.0),
+                        "stop_loss_price": sl,
+                        "take_profit_price": tp,
                         "limit_price": float(t.get("limit_price", 0.0) or 0.0),
                         "take_profit_limit_price": float(t.get("take_profit_limit_price", 0.0) or 0.0),
                         "timeframe": str(t.get("timeframe", default_tf) or default_tf),
                         "confidence": int(float(t.get("confidence", 70) or 70)),
                         "status": "PENDING",
-                        "reason": str(t.get("reason", "AI structured recommendation") or "AI structured recommendation"),
+                        "reason": reason,
                     }
                 )
     return recs
@@ -1400,13 +1422,25 @@ def _pending_df() -> pd.DataFrame:
 
 
 def _submit_pending_rec(profile: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_order_type(raw_type: Any, side: str, sl: float, tp: float) -> Tuple[str, str]:
+        valid = {"MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT", "OCO_BRACKET"}
+        raw = str(raw_type or "").strip().upper()
+        if raw in valid:
+            return raw, ""
+        if str(side or "").strip().upper() == "SELL" and float(sl or 0.0) > 0 and float(tp or 0.0) > 0:
+            return "OCO_BRACKET", f"normalized invalid order_type '{raw or 'EMPTY'}' -> OCO_BRACKET"
+        return "MARKET", f"normalized invalid order_type '{raw or 'EMPTY'}' -> MARKET"
+
     sym = str(rec.get("symbol", "")).strip().upper()
     side = str(rec.get("side", "BUY")).strip().upper()
-    typ = str(rec.get("order_type", "MARKET")).strip().upper()
     qty = float(rec.get("quantity", 0.0) or 0.0)
     q_notional = float(rec.get("quote_notional", 0.0) or 0.0)
     sl = float(rec.get("stop_loss_price", 0.0) or 0.0)
     tp = float(rec.get("take_profit_price", 0.0) or 0.0)
+    typ, typ_note = _normalize_order_type(rec.get("order_type", "MARKET"), side=side, sl=sl, tp=tp)
+    rec["order_type"] = typ
+    if typ_note:
+        rec["reason"] = str(rec.get("reason", "") or "").strip() + f" | {typ_note}"
     lp = float(rec.get("limit_price", 0.0) or 0.0)
     tp_lp = float(rec.get("take_profit_limit_price", 0.0) or 0.0)
 
@@ -1415,13 +1449,27 @@ def _submit_pending_rec(profile: str, rec: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "error": "OCO_BRACKET is SELL-only."}
         if qty <= 0 or sl <= 0 or tp <= 0:
             return {"ok": False, "error": "OCO_BRACKET requires qty, stop_loss and take_profit > 0."}
+        # OCO SELL must use currently free (unlocked) base balance.
+        base_asset = str(rec.get("asset", "")).strip().upper()
+        if not base_asset:
+            m = re.match(r"^([A-Z0-9]+?)(USDT|USDC|FDUSD|BUSD|USD|BTC|ETH|BNB)$", sym)
+            base_asset = m.group(1) if m else ""
+        if base_asset and profile:
+            free_qty = _get_asset_free_balance(profile, base_asset)
+            if free_qty > 0:
+                qty = min(float(qty), float(free_qty))
+                rec["quantity"] = float(qty)
+            if qty <= 0:
+                return {"ok": False, "error": f"No free balance available to place OCO SELL for {sym}."}
+        # EngineBridge.submit_binance_oco_sell uses a single take_profit_price
+        # for the TP limit leg; map optional take_profit_limit_price onto it.
+        tp_submit = (tp_lp if tp_lp > 0 else tp)
         return bridge.submit_binance_oco_sell(
             symbol=sym,
             quantity=qty,
-            take_profit_price=tp,
+            take_profit_price=tp_submit,
             stop_price=sl,
             stop_limit_price=(lp if lp > 0 else sl * 0.999),
-            take_profit_limit_price=(tp_lp if tp_lp > 0 else tp * 0.999),
             profile_name=profile,
         )
 
@@ -1577,7 +1625,7 @@ def _submit_with_recovery(profile: str, rec: Dict[str, Any], enable_recovery: bo
     typ = str(rec.get("order_type", "")).strip().upper()
     side = str(rec.get("side", "")).strip().upper()
     sym = str(rec.get("symbol", "")).strip().upper()
-    if not (typ == "MARKET" and side == "SELL" and sym):
+    if not (typ in ("MARKET", "OCO_BRACKET") and side == "SELL" and sym):
         return out
     if not _is_insufficient_balance_error(out.get("error", "")):
         return out
@@ -1596,6 +1644,56 @@ def _submit_with_recovery(profile: str, rec: Dict[str, Any], enable_recovery: bo
     else:
         retry["error"] = f"{retry.get('error', 'retry failed')} | canceled {canceled} open SELL order(s) but retry still failed"
     return retry
+
+
+def _submit_selected_pending_batch_sync(
+    profile: str,
+    selected_rows: List[Dict[str, Any]],
+    enable_recovery: bool = True,
+    max_workers: int = 3,
+) -> Dict[str, Any]:
+    rows = [dict(x) for x in (selected_rows or []) if isinstance(x, dict)]
+    total = len(rows)
+    if not profile:
+        return {"ok": False, "error": "No Binance profile selected.", "results": {}}
+    if total <= 0:
+        return {"ok": True, "results": {}, "ok_n": 0, "fail_n": 0, "total": 0}
+
+    workers = max(1, min(6, int(max_workers or 3), total))
+    print(f"[BATCH] submit-selected start total={total} workers={workers}", flush=True)
+
+    def _run_one(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        rid = int(row.get("id", -1) or -1)
+        rec = dict(row.get("rec", {}) if isinstance(row.get("rec"), dict) else {})
+        out = _submit_with_recovery(profile, rec, enable_recovery=bool(enable_recovery))
+        return rid, out if isinstance(out, dict) else {"ok": False, "error": "Invalid submit result"}
+
+    results: Dict[int, Dict[str, Any]] = {}
+    done = 0
+    if workers <= 1:
+        for row in rows:
+            rid, out = _run_one(row)
+            if rid > 0:
+                results[rid] = out
+            done += 1
+            print(f"[BATCH] submit-selected progress {done}/{total}", flush=True)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_run_one, row) for row in rows]
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    rid, out = fut.result()
+                except Exception as ex1:
+                    rid, out = -1, {"ok": False, "error": str(ex1)}
+                if rid > 0:
+                    results[rid] = out
+                done += 1
+                print(f"[BATCH] submit-selected progress {done}/{total}", flush=True)
+
+    ok_n = sum(1 for v in results.values() if isinstance(v, dict) and bool(v.get("ok")))
+    fail_n = max(0, int(total - ok_n))
+    print(f"[BATCH] submit-selected done ok={ok_n} fail={fail_n}", flush=True)
+    return {"ok": True, "results": results, "ok_n": int(ok_n), "fail_n": int(fail_n), "total": int(total)}
 
 
 def _extract_order_ids_from_submit(out_sub: Dict[str, Any]) -> List[str]:
@@ -2082,6 +2180,11 @@ def _reconcile_fills_for_profile_sync(profile: str, quote_pref: str = "USDT") ->
                 if not isinstance(v, dict):
                     continue
                 sym = str(v.get("symbol", "")).strip().upper()
+                if not sym:
+                    asset = str(v.get("asset", "")).strip().upper()
+                    quote = str(v.get("quote_currency", qpref)).strip().upper() or qpref
+                    if asset:
+                        sym = f"{asset}{quote}"
                 if sym:
                     syms_set.add(sym)
     except Exception:
@@ -2389,15 +2492,23 @@ def _apply_signal_controls(
 
 
 def _confirmed_execution_rows(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _norm_text(v: Any) -> str:
+        if pd.isna(v):
+            return ""
+        s = str(v or "").strip()
+        if s.lower() in ("nan", "none", "null"):
+            return ""
+        return s
+
     rows: List[Dict[str, Any]] = []
     for e in entries:
         if not isinstance(e, dict):
             continue
         if not bool(e.get("is_execution", False)):
             continue
-        panel = str(e.get("panel", "") or "").strip().lower()
-        ex_trade_id = str(e.get("exchange_trade_id", "") or "").strip()
-        note = str(e.get("note", "") or "").strip().lower()
+        panel = _norm_text(e.get("panel", "")).lower()
+        ex_trade_id = _norm_text(e.get("exchange_trade_id", ""))
+        note = _norm_text(e.get("note", "")).lower()
         is_confirmed_fill = bool(panel == "binance_reconcile" or ex_trade_id or ("reconciled binance fill" in note))
         if not is_confirmed_fill:
             continue
@@ -2411,10 +2522,10 @@ def _confirmed_execution_rows(entries: List[Dict[str, Any]]) -> List[Dict[str, A
             qty, px = 0.0, 0.0
         if qty <= 0 or px <= 0:
             continue
-        sym = str(e.get("exchange_symbol", "")).strip().upper()
+        sym = _norm_text(e.get("exchange_symbol", "")).upper()
         if not sym:
-            asset = str(e.get("asset", "")).strip().upper()
-            quote = str(e.get("quote_currency", "USDT")).strip().upper() or "USDT"
+            asset = _norm_text(e.get("asset", "")).upper()
+            quote = _norm_text(e.get("quote_currency", "USDT")).upper() or "USDT"
             if not asset:
                 continue
             sym = f"{asset}{quote}"
@@ -2432,6 +2543,15 @@ def _execution_events_from_ledger_df(
     ledger_df: pd.DataFrame,
     use_confirmed_only: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def _clean_series_str(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+        if col not in df.columns:
+            s = pd.Series([default] * len(df), index=df.index, dtype=object)
+        else:
+            s = df[col]
+        s = s.fillna("").astype(str).str.strip()
+        s = s.mask(s.str.lower().isin(["nan", "none", "null"]), "")
+        return s
+
     base_cols = ["id", "ts", "symbol", "action", "qty", "price", "panel", "exchange_trade_id", "note"]
     if not isinstance(ledger_df, pd.DataFrame) or ledger_df.empty:
         return pd.DataFrame(columns=base_cols), pd.DataFrame(columns=base_cols + ["exclude_reason"])
@@ -2443,15 +2563,16 @@ def _execution_events_from_ledger_df(
     d["qty"] = pd.to_numeric(d.get("qty", 0.0), errors="coerce").fillna(0.0)
     d["price"] = pd.to_numeric(d.get("price", 0.0), errors="coerce").fillna(0.0)
     d["ts"] = pd.to_datetime(d.get("ts"), errors="coerce", utc=True)
-    d["panel"] = d.get("panel", "").astype(str).str.strip().str.lower()
-    d["exchange_trade_id"] = d.get("exchange_trade_id", "").astype(str).str.strip()
-    d["note"] = d.get("note", "").astype(str).str.strip()
+    d["panel"] = _clean_series_str(d, "panel").str.lower()
+    d["exchange_trade_id"] = _clean_series_str(d, "exchange_trade_id")
+    d["note"] = _clean_series_str(d, "note")
     note_l = d["note"].str.lower()
     confirmed = (d["panel"] == "binance_reconcile") | (d["exchange_trade_id"] != "") | (note_l.str.contains("reconciled binance fill", na=False))
 
-    sym = d.get("exchange_symbol", "").astype(str).str.strip().str.upper()
-    asset = d.get("asset", "").astype(str).str.strip().str.upper()
-    quote = d.get("quote_currency", "USDT").astype(str).str.strip().str.upper()
+    sym = _clean_series_str(d, "exchange_symbol").str.upper()
+    asset = _clean_series_str(d, "asset").str.upper()
+    quote = _clean_series_str(d, "quote_currency", "USDT").str.upper()
+    quote = quote.mask(quote == "", "USDT")
     fallback = asset + quote
     d["symbol"] = sym.where(sym != "", fallback)
     if "id" not in d.columns:
@@ -2476,6 +2597,7 @@ def _fifo_open_close_journal(
     ledger_df: pd.DataFrame,
     profile_name: str = "",
     use_confirmed_only: bool = False,
+    seed_carry_in: bool = False,
 ) -> Dict[str, Any]:
     ev, excluded_df = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=bool(use_confirmed_only))
     if ev.empty:
@@ -2491,12 +2613,60 @@ def _fifo_open_close_journal(
                 "unmatched_sell_rows": 0,
                 "unmatched_sell_qty": 0.0,
                 "excluded_rows": int(len(excluded_df)),
+                "carry_in_seed_qty": 0.0,
+                "carry_in_match_rows": 0,
+                "carry_in_match_qty": 0.0,
+                "realized_quote_known": 0.0,
             },
         }
 
     lots: Dict[str, List[Dict[str, Any]]] = {}
     closed_rows: List[Dict[str, Any]] = []
     unmatched_sell_rows: List[Dict[str, Any]] = []
+    carry_in_seed_qty_by_symbol: Dict[str, float] = {}
+    carry_in_seed_px_by_symbol: Dict[str, float] = {}
+
+    if bool(seed_carry_in):
+        ev_seed = ev.sort_values(["ts", "id"]).reset_index(drop=True)
+        for sym, g in ev_seed.groupby("symbol", dropna=False):
+            run_qty = 0.0
+            min_run_qty = 0.0
+            carry_weighted_notional = 0.0
+            carry_weighted_qty = 0.0
+            for _, sr in g.iterrows():
+                side = str(sr.get("action", "")).upper()
+                qty = float(sr.get("qty", 0.0) or 0.0)
+                px = float(sr.get("price", 0.0) or 0.0)
+                if side == "BUY":
+                    run_qty += qty
+                elif side == "SELL":
+                    prev_run = run_qty
+                    run_qty -= qty
+                    deficit = max(0.0, qty - max(prev_run, 0.0))
+                    if deficit > 1e-12 and px > 0:
+                        carry_weighted_notional += deficit * px
+                        carry_weighted_qty += deficit
+                min_run_qty = min(min_run_qty, run_qty)
+            need_carry = max(0.0, -min_run_qty)
+            if need_carry > 1e-12:
+                sym_s = str(sym or "")
+                carry_in_seed_qty_by_symbol[sym_s] = need_carry
+                if carry_weighted_qty > 1e-12:
+                    carry_in_seed_px_by_symbol[sym_s] = carry_weighted_notional / carry_weighted_qty
+                else:
+                    carry_in_seed_px_by_symbol[sym_s] = 0.0
+                first_ts = pd.to_datetime(g.get("ts"), errors="coerce", utc=True).min()
+                first_id = int(pd.to_numeric(g.get("id"), errors="coerce").min())
+                seed_ts = (first_ts - pd.Timedelta(seconds=1)) if pd.notna(first_ts) else pd.Timestamp(datetime.now(timezone.utc))
+                lots.setdefault(sym_s, []).append(
+                    {
+                        "entry_id": -max(1, first_id),
+                        "entry_ts": seed_ts,
+                        "entry_price": float(carry_in_seed_px_by_symbol.get(sym_s, 0.0) or 0.0),
+                        "qty_remain": need_carry,
+                        "source": "carry_in_seed",
+                    }
+                )
 
     for _, r in ev.iterrows():
         sym = str(r["symbol"])
@@ -2519,8 +2689,9 @@ def _fifo_open_close_journal(
                 continue
             take = min(rem, lq)
             entry_px = float(lot.get("entry_price", 0.0) or 0.0)
-            pnl_q = (px - entry_px) * take
-            pnl_pct = ((px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0
+            is_carry = str(lot.get("source", "")).strip().lower() == "carry_in_seed"
+            pnl_q = float("nan") if is_carry else (px - entry_px) * take
+            pnl_pct = float("nan") if is_carry else (((px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0)
             hold_h = (ts - pd.Timestamp(lot.get("entry_ts"))).total_seconds() / 3600.0
             closed_rows.append(
                 {
@@ -2535,6 +2706,8 @@ def _fifo_open_close_journal(
                     "pnl_quote": pnl_q,
                     "pnl_pct": pnl_pct,
                     "hold_hours": hold_h,
+                    "entry_source": str(lot.get("source", "") or "ledger"),
+                    "pnl_known": not is_carry,
                 }
             )
             lot["qty_remain"] = lq - take
@@ -2589,6 +2762,7 @@ def _fifo_open_close_journal(
                     "current_price": cur,
                     "unrealized_quote": upnl,
                     "unrealized_pct": upnl_pct,
+                    "entry_source": str(lot.get("source", "") or "ledger"),
                 }
             )
     open_df = pd.DataFrame(open_rows)
@@ -2600,7 +2774,14 @@ def _fifo_open_close_journal(
         unmatched_df = unmatched_df.sort_values(["exit_ts", "symbol"]).reset_index(drop=True)
 
     realized_total = float(closed_df["pnl_quote"].sum()) if not closed_df.empty and "pnl_quote" in closed_df.columns else 0.0
+    realized_known = float(pd.to_numeric(closed_df.get("pnl_quote"), errors="coerce").sum()) if not closed_df.empty else 0.0
     unmatched_qty_total = float(unmatched_df["unmatched_qty"].sum()) if not unmatched_df.empty and "unmatched_qty" in unmatched_df.columns else 0.0
+    carry_rows = pd.DataFrame()
+    if not closed_df.empty and "entry_source" in closed_df.columns:
+        carry_rows = closed_df[closed_df["entry_source"].astype(str).str.lower() == "carry_in_seed"].copy()
+    carry_qty = float(carry_rows["qty"].sum()) if not carry_rows.empty and "qty" in carry_rows.columns else 0.0
+    carry_count = int(len(carry_rows))
+    carry_seed_qty_total = float(sum(float(v or 0.0) for v in carry_in_seed_qty_by_symbol.values()))
     return {
         "closed": closed_df,
         "open_lots": open_df,
@@ -2613,8 +2794,114 @@ def _fifo_open_close_journal(
             "unmatched_sell_rows": int(len(unmatched_df)),
             "unmatched_sell_qty": float(unmatched_qty_total),
             "excluded_rows": int(len(excluded_df)),
+            "carry_in_seed_qty": float(carry_seed_qty_total),
+            "carry_in_match_rows": int(carry_count),
+            "carry_in_match_qty": float(carry_qty),
+            "realized_quote_known": float(realized_known),
         },
     }
+
+
+def _df_to_records(df: Any, max_rows: int = 5000) -> List[Dict[str, Any]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    d = df.copy()
+    if max_rows > 0 and len(d) > max_rows:
+        d = d.tail(max_rows)
+    # Normalize datetimes for JSON export readability.
+    for c in list(d.columns):
+        if pd.api.types.is_datetime64_any_dtype(d[c]):
+            try:
+                d[c] = d[c].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+    return d.to_dict(orient="records")
+
+
+def _build_fifo_debug_bundle(ledger_df: pd.DataFrame, profile_name: str = "") -> Dict[str, Any]:
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    ev_all, ex_all = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=False)
+    ev_conf, ex_conf = _execution_events_from_ledger_df(ledger_df, use_confirmed_only=True)
+    fifo_all = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=False, seed_carry_in=False)
+    fifo_conf = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=True, seed_carry_in=False)
+    fifo_all_seeded = _fifo_open_close_journal(ledger_df, profile_name=profile_name, use_confirmed_only=False, seed_carry_in=True)
+
+    d = ledger_df.copy() if isinstance(ledger_df, pd.DataFrame) else pd.DataFrame()
+    if not d.empty:
+        d["action"] = d.get("action", "").astype(str).str.upper()
+        d["panel"] = d.get("panel", "").astype(str).str.strip().str.lower()
+        d["exchange_trade_id"] = d.get("exchange_trade_id", "").fillna("").astype(str).str.strip()
+        d["exchange_symbol"] = d.get("exchange_symbol", "").fillna("").astype(str).str.strip().str.upper()
+        d["exchange_trade_id"] = d["exchange_trade_id"].mask(d["exchange_trade_id"].str.lower().isin(["nan", "none", "null"]), "")
+        d["exchange_symbol"] = d["exchange_symbol"].mask(d["exchange_symbol"].str.lower().isin(["nan", "none", "null"]), "")
+        d["qty"] = pd.to_numeric(d.get("qty", 0.0), errors="coerce").fillna(0.0)
+        d["price"] = pd.to_numeric(d.get("price", 0.0), errors="coerce").fillna(0.0)
+        d["ts_parsed"] = pd.to_datetime(d.get("ts"), errors="coerce", utc=True)
+
+    exec_df = pd.DataFrame()
+    if not d.empty:
+        exec_df = d[d.get("is_execution", False) == True].copy()  # noqa: E712
+        exec_df = exec_df[exec_df["action"].isin(["BUY", "SELL"])]
+
+    missing_trade_id = exec_df[exec_df["exchange_trade_id"] == ""] if not exec_df.empty else pd.DataFrame()
+    missing_symbol = exec_df[exec_df["exchange_symbol"] == ""] if not exec_df.empty else pd.DataFrame()
+    zero_price_qty = exec_df[(exec_df["qty"] <= 0) | (exec_df["price"] <= 0)] if not exec_df.empty else pd.DataFrame()
+    invalid_ts = exec_df[exec_df["ts_parsed"].isna()] if not exec_df.empty else pd.DataFrame()
+
+    dup_trade = pd.DataFrame()
+    if not exec_df.empty:
+        non_blank_trade = exec_df[exec_df["exchange_trade_id"] != ""]
+        if not non_blank_trade.empty:
+            dup_ids = non_blank_trade["exchange_trade_id"].value_counts()
+            dup_ids = dup_ids[dup_ids > 1].index.tolist()
+            if dup_ids:
+                dup_trade = non_blank_trade[non_blank_trade["exchange_trade_id"].isin(dup_ids)].copy()
+
+    open_pos = {}
+    try:
+        led_out = bridge.get_trade_ledger()
+        if led_out.get("ok"):
+            ldg = led_out.get("ledger", {}) if isinstance(led_out.get("ledger"), dict) else {}
+            open_pos = ldg.get("open_positions", {}) if isinstance(ldg.get("open_positions"), dict) else {}
+    except Exception:
+        open_pos = {}
+
+    out = {
+        "generated_at_utc": now_utc,
+        "profile_name": str(profile_name or ""),
+        "stats": {
+            "ledger_rows": int(len(d)) if isinstance(d, pd.DataFrame) else 0,
+            "execution_rows_buy_sell": int(len(exec_df)),
+            "fifo_ledger_truth_closed_rows": int((fifo_all.get("summary", {}) or {}).get("closed_rows", 0) or 0),
+            "fifo_ledger_truth_unmatched_sell_rows": int((fifo_all.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "fifo_confirmed_only_closed_rows": int((fifo_conf.get("summary", {}) or {}).get("closed_rows", 0) or 0),
+            "fifo_confirmed_only_unmatched_sell_rows": int((fifo_conf.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "fifo_ledger_truth_seeded_unmatched_sell_rows": int((fifo_all_seeded.get("summary", {}) or {}).get("unmatched_sell_rows", 0) or 0),
+            "missing_exchange_trade_id_rows": int(len(missing_trade_id)),
+            "missing_exchange_symbol_rows": int(len(missing_symbol)),
+            "zero_price_or_qty_rows": int(len(zero_price_qty)),
+            "invalid_ts_rows": int(len(invalid_ts)),
+            "duplicate_exchange_trade_id_rows": int(len(dup_trade)),
+            "open_positions_count": int(len(open_pos) if isinstance(open_pos, dict) else 0),
+        },
+        "fifo_ledger_truth_summary": dict(fifo_all.get("summary", {}) or {}),
+        "fifo_confirmed_only_summary": dict(fifo_conf.get("summary", {}) or {}),
+        "fifo_ledger_truth_seeded_summary": dict(fifo_all_seeded.get("summary", {}) or {}),
+        "open_positions_snapshot": open_pos,
+        "samples": {
+            "missing_exchange_trade_id": _df_to_records(missing_trade_id, max_rows=1000),
+            "missing_exchange_symbol": _df_to_records(missing_symbol, max_rows=1000),
+            "zero_price_or_qty": _df_to_records(zero_price_qty, max_rows=1000),
+            "invalid_ts": _df_to_records(invalid_ts, max_rows=1000),
+            "duplicate_exchange_trade_id": _df_to_records(dup_trade, max_rows=2000),
+            "fifo_unmatched_sells_ledger_truth": _df_to_records(fifo_all.get("unmatched_sells"), max_rows=2000),
+            "fifo_excluded_ledger_truth": _df_to_records(fifo_all.get("excluded"), max_rows=2000),
+            "fifo_unmatched_sells_confirmed_only": _df_to_records(fifo_conf.get("unmatched_sells"), max_rows=2000),
+            "fifo_excluded_confirmed_only": _df_to_records(fifo_conf.get("excluded"), max_rows=2000),
+        },
+        "ledger_tail": _df_to_records(d if isinstance(d, pd.DataFrame) else pd.DataFrame(), max_rows=5000),
+    }
+    return out
 
 
 def _fifo_cost_basis_by_symbol(entries: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -3070,6 +3357,98 @@ def _compute_pnl_breakdown(last_graph_df: pd.DataFrame, ledger_df: pd.DataFrame)
     monthly = r.groupby("month", as_index=False)["pnl_quote"].sum().rename(columns={"month": "period", "pnl_quote": "realized_quote"})
     yearly = r.groupby("year", as_index=False)["pnl_quote"].sum().rename(columns={"year": "period", "pnl_quote": "realized_quote"})
     return {"summary": summary, "daily": daily, "weekly": weekly, "monthly": monthly, "yearly": yearly}
+
+
+def _compute_graph_performance_metrics(
+    last_graph_df: pd.DataFrame,
+    ledger_df: pd.DataFrame,
+    projection_lookback_days: int = 30,
+) -> Dict[str, Any]:
+    lookback_days = max(1, min(3650, int(projection_lookback_days or 30)))
+    now = pd.Timestamp.now(tz="UTC")
+
+    unrealized_total = 0.0
+    open_positions = 0
+    if isinstance(last_graph_df, pd.DataFrame) and not last_graph_df.empty:
+        open_positions = int(len(last_graph_df))
+        if "pnl_quote" in last_graph_df.columns:
+            unrealized_total = float(pd.to_numeric(last_graph_df["pnl_quote"], errors="coerce").fillna(0.0).sum())
+
+    sells = pd.DataFrame(columns=["ts", "pnl_quote"])
+    if isinstance(ledger_df, pd.DataFrame) and not ledger_df.empty:
+        d = ledger_df.copy()
+        if "is_execution" in d.columns:
+            d = d[d["is_execution"] == True]  # noqa: E712
+        if "action" in d.columns:
+            d["action"] = d["action"].astype(str).str.upper()
+            d = d[d["action"] == "SELL"]
+        if "pnl_quote" in d.columns:
+            d["pnl_quote"] = pd.to_numeric(d["pnl_quote"], errors="coerce")
+            d = d[d["pnl_quote"].notna()]
+        else:
+            d = d.iloc[0:0]
+        if "ts" in d.columns and not d.empty:
+            d["ts"] = pd.to_datetime(d["ts"], errors="coerce", utc=True)
+            d = d[d["ts"].notna()]
+            sells = d[["ts", "pnl_quote"]].copy()
+
+    closed_trades = int(len(sells))
+    wins = int((sells["pnl_quote"] > 0).sum()) if closed_trades > 0 else 0
+    losses = int((sells["pnl_quote"] < 0).sum()) if closed_trades > 0 else 0
+    breakeven = max(0, closed_trades - wins - losses)
+
+    gross_profit = float(sells.loc[sells["pnl_quote"] > 0, "pnl_quote"].sum()) if closed_trades > 0 else 0.0
+    gross_loss_abs = abs(float(sells.loc[sells["pnl_quote"] < 0, "pnl_quote"].sum())) if closed_trades > 0 else 0.0
+    avg_win = float(sells.loc[sells["pnl_quote"] > 0, "pnl_quote"].mean()) if wins > 0 else 0.0
+    avg_loss = float(sells.loc[sells["pnl_quote"] < 0, "pnl_quote"].mean()) if losses > 0 else 0.0
+    realized_total = float(sells["pnl_quote"].sum()) if closed_trades > 0 else 0.0
+    win_rate_pct = (wins / closed_trades * 100.0) if closed_trades > 0 else 0.0
+    expectancy = (realized_total / closed_trades) if closed_trades > 0 else 0.0
+    if gross_loss_abs <= 1e-12:
+        profit_factor = float("inf") if gross_profit > 0 else 0.0
+    else:
+        profit_factor = gross_profit / gross_loss_abs
+
+    cutoff = now - pd.Timedelta(days=lookback_days)
+    realized_lookback = float(sells.loc[sells["ts"] >= cutoff, "pnl_quote"].sum()) if closed_trades > 0 else 0.0
+    run_rate_daily = realized_lookback / float(lookback_days)
+
+    horizons = [7, 14, 30, 60, 90, 180, 365]
+    proj_rows: List[Dict[str, Any]] = []
+    for d in horizons:
+        p_realized = run_rate_daily * float(d)
+        proj_rows.append(
+            {
+                "horizon_days": int(d),
+                "projected_realized_quote": float(p_realized),
+                "projected_total_quote_including_unrealized": float(p_realized + unrealized_total),
+            }
+        )
+    projections_df = pd.DataFrame(proj_rows)
+
+    return {
+        "metrics": {
+            "closed_trades": int(closed_trades),
+            "wins": int(wins),
+            "losses": int(losses),
+            "breakeven": int(breakeven),
+            "win_rate_pct": float(win_rate_pct),
+            "gross_profit_quote": float(gross_profit),
+            "gross_loss_quote_abs": float(gross_loss_abs),
+            "avg_win_quote": float(avg_win),
+            "avg_loss_quote": float(avg_loss),
+            "realized_total_quote": float(realized_total),
+            "unrealized_total_quote": float(unrealized_total),
+            "combined_total_quote": float(realized_total + unrealized_total),
+            "expectancy_quote_per_trade": float(expectancy),
+            "profit_factor": float(profit_factor),
+            "projection_lookback_days": int(lookback_days),
+            "realized_lookback_quote": float(realized_lookback),
+            "run_rate_daily_quote": float(run_rate_daily),
+            "open_positions": int(open_positions),
+        },
+        "projections": projections_df,
+    }
 
 
 def _protect_open_positions_simple(
@@ -4846,16 +5225,52 @@ with tab_portfolio:
             selected = []
         st.session_state.selected_pending_ids = selected
         st.caption(f"Selected: {len(selected)} of {len(all_ids)}")
-        pc = st.columns(6)
-        if pc[0].button("Submit Selected", disabled=not bool(profile)):
+        selc = st.columns(4)
+        if selc[0].button("Select All", key="pending_select_all"):
+            st.session_state.selected_pending_ids = list(all_ids)
+            st.rerun()
+        if selc[1].button("Select BUY", key="pending_select_buy"):
+            buy_ids = [
+                int(x)
+                for x in pdf.loc[pdf.get("side", "").astype(str).str.upper() == "BUY", "id"].tolist()
+                if str(x).strip().isdigit()
+            ]
+            st.session_state.selected_pending_ids = buy_ids
+            st.rerun()
+        if selc[2].button("Select SELL", key="pending_select_sell"):
+            sell_ids = [
+                int(x)
+                for x in pdf.loc[pdf.get("side", "").astype(str).str.upper() == "SELL", "id"].tolist()
+                if str(x).strip().isdigit()
+            ]
+            st.session_state.selected_pending_ids = sell_ids
+            st.rerun()
+        if selc[3].button("Clear Selection", key="pending_select_clear"):
+            st.session_state.selected_pending_ids = []
+            st.rerun()
+
+        _sub_job = _consume_bg_job("bg_submit_selected_job_id")
+        _sub_state = str(_sub_job.get("state", "") or "")
+        _submit_running = _sub_state == "running"
+        if _submit_running:
+            _sub_elapsed = float((_sub_job.get("job", {}) or {}).get("elapsed_sec", 0.0) or 0.0)
+            st.caption(f"Submitting selected orders... {_sub_elapsed:.1f}s")
+        elif _sub_state == "done":
+            _sub_res = (_sub_job.get("job", {}) or {}).get("result", {})
+            _sub_out = _sub_res if isinstance(_sub_res, dict) else {}
+            _res_map = _sub_out.get("results", {}) if isinstance(_sub_out.get("results"), dict) else {}
             ok_n = 0
             fail_n = 0
-            for rid in selected:
-                rec = next((r for r in st.session_state.pending_recs if int(r.get("id", -1)) == int(rid)), None)
-                if not rec:
+            for _rid_raw, _out_sub in _res_map.items():
+                try:
+                    _rid = int(_rid_raw)
+                except Exception:
                     continue
-                out_sub = _submit_with_recovery(profile, rec, enable_recovery=bool(st.session_state.get("auto_retry_locked_sell", True)))
-                if _apply_submit_result_to_rec(rec, out_sub):
+                _rec = next((r for r in st.session_state.pending_recs if int(r.get("id", -1)) == _rid), None)
+                if not isinstance(_rec, dict):
+                    continue
+                _ok = _apply_submit_result_to_rec(_rec, _out_sub if isinstance(_out_sub, dict) else {"ok": False, "error": "Invalid submit payload"})
+                if _ok:
                     ok_n += 1
                 else:
                     fail_n += 1
@@ -4863,6 +5278,35 @@ with tab_portfolio:
                 _sync_pending_statuses(profile)
                 _compact_pending_queue()
             st.success(f"Submitted={ok_n}, failed={fail_n}")
+            st.rerun()
+        elif _sub_state == "failed":
+            st.error(str((_sub_job.get("job", {}) or {}).get("error", "") or "Submit Selected async failed"))
+
+        pc = st.columns(6)
+        if pc[0].button("Submit Selected", disabled=(not bool(profile) or _submit_running)):
+            rows_submit: List[Dict[str, Any]] = []
+            for rid in selected:
+                rec = next((r for r in st.session_state.pending_recs if int(r.get("id", -1)) == int(rid)), None)
+                if not isinstance(rec, dict):
+                    continue
+                rec_cp = dict(rec)
+                rec_cp.setdefault("min_notional_buffer_pct", float(st.session_state.get("sig_min_notional_buffer_pct", 0.0) or 0.0))
+                rec_cp.setdefault("min_notional_buffer_abs", float(st.session_state.get("sig_min_notional_buffer_abs", 0.0) or 0.0))
+                rows_submit.append({"id": int(rid), "rec": rec_cp})
+            if not rows_submit:
+                st.warning("No selected rows to submit.")
+            else:
+                jid = _start_bg_job(
+                    "Submit Selected Pending (async)",
+                    lambda p=str(profile), rows=rows_submit, ar=bool(st.session_state.get("auto_retry_locked_sell", True)): _submit_selected_pending_batch_sync(
+                        profile=p,
+                        selected_rows=rows,
+                        enable_recovery=ar,
+                        max_workers=3,
+                    ),
+                )
+                st.session_state.bg_submit_selected_job_id = str(jid)
+                st.info(f"Submitting {len(rows_submit)} selected recommendation(s) in background.")
         if pc[1].button("Remove Selected"):
             ids = set(int(x) for x in selected)
             st.session_state.pending_recs = [r for r in st.session_state.pending_recs if int(r.get("id", -1)) not in ids]
@@ -4917,11 +5361,21 @@ with tab_portfolio:
             "ON: only reconciled/confirmed rows are used.",
         )
     )
+    fifo_seed_carry_in = bool(
+        fifo_mode_col2.checkbox(
+            "Seed carry-in lots for pre-ledger inventory",
+            value=bool(st.session_state.get("fifo_seed_carry_in", True)),
+            key="fifo_seed_carry_in",
+            help="When ON, FIFO infers minimum starting inventory for symbols where the ledger begins mid-position. "
+            "Those seeded lots are marked as carry-in and their realized PnL is treated as unknown basis.",
+        )
+    )
     fifo_mode_col2.caption("Ledger-truth mode treats ledger execution rows as source of truth.")
     fifo = _fifo_open_close_journal(
         st.session_state.last_ledger_df,
         profile_name=str(fifo_profile or ""),
         use_confirmed_only=bool(fifo_confirmed_only),
+        seed_carry_in=bool(fifo_seed_carry_in),
     )
     fs = fifo.get("summary", {}) if isinstance(fifo.get("summary"), dict) else {}
     fc = fifo.get("closed", pd.DataFrame())
@@ -4931,12 +5385,35 @@ with tab_portfolio:
     f1, f2, f3, f4 = st.columns(4)
     f1.metric("Closed matches (FIFO)", f"{int(fs.get('closed_rows', 0) or 0)}")
     f2.metric("Open lots (FIFO)", f"{int(fs.get('open_lots', 0) or 0)}")
-    f3.metric("Realized PnL (quote)", f"{float(fs.get('realized_quote', 0.0) or 0.0):,.6f}")
+    f3.metric("Realized PnL (known basis)", f"{float(fs.get('realized_quote_known', fs.get('realized_quote', 0.0)) or 0.0):,.6f}")
     f4.metric("Unmatched SELL rows", f"{int(fs.get('unmatched_sell_rows', 0) or 0)}")
     st.caption(
         f"Excluded execution rows: {int(fs.get('excluded_rows', 0) or 0)} | "
-        f"Unmatched SELL qty total: {float(fs.get('unmatched_sell_qty', 0.0) or 0.0):.8f}"
+        f"Unmatched SELL qty total: {float(fs.get('unmatched_sell_qty', 0.0) or 0.0):.8f} | "
+        f"Carry-in seeded qty: {float(fs.get('carry_in_seed_qty', 0.0) or 0.0):.8f} | "
+        f"Carry-in matched rows: {int(fs.get('carry_in_match_rows', 0) or 0)} "
+        f"({float(fs.get('carry_in_match_qty', 0.0) or 0.0):.8f} qty)"
     )
+    dbg_c1, dbg_c2 = st.columns([1, 3])
+    if dbg_c1.button("Build FIFO Debug Bundle", key="fifo_build_debug_bundle"):
+        try:
+            bundle = _build_fifo_debug_bundle(
+                st.session_state.last_ledger_df if isinstance(st.session_state.last_ledger_df, pd.DataFrame) else pd.DataFrame(),
+                profile_name=str(fifo_profile or ""),
+            )
+            st.session_state.fifo_debug_bundle_text = json.dumps(bundle, indent=2, default=str)
+            st.success("FIFO debug bundle generated.")
+        except Exception as ex:
+            st.error(f"Could not build FIFO debug bundle: {ex}")
+    dbg_txt = str(st.session_state.get("fifo_debug_bundle_text", "") or "")
+    if dbg_txt:
+        dbg_c2.download_button(
+            "Download FIFO Debug Bundle (JSON)",
+            data=dbg_txt,
+            file_name=f"fifo_debug_bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="fifo_debug_bundle_download",
+        )
     if isinstance(st.session_state.last_ledger_df, pd.DataFrame) and not st.session_state.last_ledger_df.empty and "ts" in st.session_state.last_ledger_df.columns:
         try:
             _mx = pd.to_datetime(st.session_state.last_ledger_df["ts"], errors="coerce", utc=True).max()
@@ -4969,6 +5446,55 @@ with tab_portfolio:
             st.download_button("Export FIFO Excluded Rows CSV", data=fe.to_csv(index=False), file_name="fifo_excluded_rows.csv", mime="text/csv", key="fifo_excluded_export")
         else:
             st.info("No excluded execution rows.")
+
+    # Keep review cache aligned with ledger/FIFO open lots.
+    try:
+        open_syms = set()
+        if isinstance(fo, pd.DataFrame) and not fo.empty and "symbol" in fo.columns:
+            open_syms = {str(x).strip().upper() for x in fo["symbol"].tolist() if str(x).strip()}
+
+        review_syms = set()
+        rdf = st.session_state.last_review_df if isinstance(st.session_state.get("last_review_df"), pd.DataFrame) else pd.DataFrame()
+        if isinstance(rdf, pd.DataFrame) and not rdf.empty:
+            if "symbol" in rdf.columns:
+                review_syms = {str(x).strip().upper() for x in rdf["symbol"].tolist() if str(x).strip()}
+            elif "asset" in rdf.columns:
+                review_syms = {f"{str(x).strip().upper()}USDT" for x in rdf["asset"].tolist() if str(x).strip()}
+
+        missing_review_syms = sorted(list(open_syms - review_syms))
+        if missing_review_syms and profile:
+            review_job_id = str(st.session_state.get("bg_review_job_id", "") or "")
+            jobs = st.session_state.bg_jobs if isinstance(st.session_state.get("bg_jobs"), dict) else {}
+            review_running = False
+            if review_job_id and isinstance(jobs, dict):
+                j = jobs.get(review_job_id, {})
+                review_running = isinstance(j, dict) and str(j.get("status", "")).lower() == "running"
+
+            sig = ",".join(missing_review_syms[:40])
+            last_sig = str(st.session_state.get("review_sync_missing_sig", "") or "")
+            last_epoch = float(st.session_state.get("review_sync_last_epoch", 0.0) or 0.0)
+            can_trigger = (sig != last_sig) or ((time.time() - last_epoch) > 60.0)
+            if (not review_running) and can_trigger:
+                jid = _start_bg_job(
+                    "Open Position Review Auto-Sync (async)",
+                    lambda p=str(profile): _analyze_open_positions_cached(
+                        profile=p,
+                        timeframes=["4h", "8h", "12h", "1d"],
+                        display_currency="USD",
+                        ttl_sec=float(st.session_state.get("open_pos_review_ttl_sec", 300) or 300),
+                        force_refresh=True,
+                    ),
+                )
+                st.session_state.bg_review_job_id = str(jid)
+                st.session_state.review_sync_missing_sig = sig
+                st.session_state.review_sync_last_epoch = time.time()
+            st.caption(
+                "Review cache sync in progress for missing symbols: "
+                + ", ".join(missing_review_syms[:6])
+                + (" ..." if len(missing_review_syms) > 6 else "")
+            )
+    except Exception:
+        pass
 
 with tab_graph:
     st.subheader("Position Graph Data")
@@ -5105,6 +5631,80 @@ with tab_graph:
                 st.rerun()
 
     if isinstance(st.session_state.last_graph_df, pd.DataFrame) and not st.session_state.last_graph_df.empty:
+        st.markdown("### Performance Metrics & Projections")
+        pmc1, pmc2 = st.columns([1, 4])
+        proj_lookback_days = int(
+            pmc1.number_input(
+                "Projection lookback (days)",
+                min_value=7,
+                max_value=365,
+                value=int(st.session_state.get("graph_projection_lookback_days", 30) or 30),
+                step=1,
+                key="graph_projection_lookback_days",
+                help="Run-rate baseline for projected realized PnL.",
+            )
+        )
+        pmc2.caption(
+            "Projections are linear extrapolations from recent realized SELL PnL and "
+            "are shown in quote currency."
+        )
+        perf = _compute_graph_performance_metrics(
+            st.session_state.last_graph_df,
+            led_df,
+            projection_lookback_days=int(proj_lookback_days),
+        )
+        ms = perf.get("metrics", {}) if isinstance(perf.get("metrics"), dict) else {}
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        p1.metric("Closed Trades", f"{int(ms.get('closed_trades', 0) or 0)}")
+        p2.metric("Win Rate", f"{float(ms.get('win_rate_pct', 0.0) or 0.0):.1f}%")
+        _pf = float(ms.get("profit_factor", 0.0) or 0.0)
+        p3.metric("Profit Factor", ("inf" if _pf > 1e9 else f"{_pf:.2f}"))
+        p4.metric("Expectancy / Trade", f"{float(ms.get('expectancy_quote_per_trade', 0.0) or 0.0):,.6f}")
+        p5.metric("Realized PnL (All)", f"{float(ms.get('realized_total_quote', 0.0) or 0.0):,.6f}")
+        p6.metric("Unrealized PnL (Open)", f"{float(ms.get('unrealized_total_quote', 0.0) or 0.0):,.6f}")
+        p7, p8, p9, p10, p11, p12 = st.columns(6)
+        p7.metric("Wins / Losses", f"{int(ms.get('wins', 0) or 0)} / {int(ms.get('losses', 0) or 0)}")
+        p8.metric("Avg Win", f"{float(ms.get('avg_win_quote', 0.0) or 0.0):,.6f}")
+        p9.metric("Avg Loss", f"{float(ms.get('avg_loss_quote', 0.0) or 0.0):,.6f}")
+        p10.metric("Gross Profit", f"{float(ms.get('gross_profit_quote', 0.0) or 0.0):,.6f}")
+        p11.metric("Gross Loss (abs)", f"{float(ms.get('gross_loss_quote_abs', 0.0) or 0.0):,.6f}")
+        p12.metric(
+            f"Run-rate / day ({int(ms.get('projection_lookback_days', 0) or 0)}d)",
+            f"{float(ms.get('run_rate_daily_quote', 0.0) or 0.0):,.6f}",
+        )
+        st.caption(
+            f"Lookback realized PnL: {float(ms.get('realized_lookback_quote', 0.0) or 0.0):,.6f} | "
+            f"Open positions tracked: {int(ms.get('open_positions', 0) or 0)}"
+        )
+
+        pr = perf.get("projections", pd.DataFrame())
+        if isinstance(pr, pd.DataFrame) and not pr.empty:
+            _show_df(pr, width="stretch", hide_index=True)
+            fig_proj = go.Figure()
+            fig_proj.add_trace(
+                go.Bar(
+                    name="Projected Realized",
+                    x=pr["horizon_days"],
+                    y=pr["projected_realized_quote"],
+                )
+            )
+            fig_proj.add_trace(
+                go.Scatter(
+                    name="Projected Total (+Unrealized)",
+                    x=pr["horizon_days"],
+                    y=pr["projected_total_quote_including_unrealized"],
+                    mode="lines+markers",
+                )
+            )
+            fig_proj.update_layout(
+                title="Projected Earnings by Horizon (Quote)",
+                height=330,
+                margin=dict(l=20, r=20, t=50, b=20),
+                xaxis_title="Horizon (days)",
+                yaxis_title="Projected PnL (quote)",
+            )
+            st.plotly_chart(fig_proj, width="stretch")
+
         pb = _compute_pnl_breakdown(st.session_state.last_graph_df, led_df)
         s = pb.get("summary", pd.DataFrame())
         if isinstance(s, pd.DataFrame) and not s.empty:
